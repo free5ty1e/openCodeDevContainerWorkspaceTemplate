@@ -34,15 +34,16 @@ Fork it, rename it, strip it down or build on top — this is your base project.
 
 ### Prerequisites
 
-> **Pick ONE editor** (all support Dev Containers):
-> - [VS Code](https://code.visualstudio.com/) + [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
+> **Install ONE code editor** (all support Dev Containers):
+(For ease of use, VS Code is recommended.  Especially in Windows; it will even automatically install docker WSL for you.)
+> - [VS Code](https://code.visualstudio.com/) + [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) + [WSL extension (Windows)](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-wsl) (Windows: [install WSL first](https://aka.ms/wsl), VS Code will auto-enable Docker in WSL)
 > - [Cursor](https://cursor.sh/)
 > - [Google Antigravity](https://antigravity.google.com/download)
 > - [Zed](https://zed.dev/) (via [zed-devcontainer](https://github.com/zed-industries/zed/tree/main/crates/zed_devcontainer) extension)
 > - [IntelliJ IDEA](https://www.jetbrains.com/idea/) / [PyCharm](https://www.jetbrains.com/pycharm/) (via [Dev Containers plugin](https://plugins.jetbrains.com/plugin/21962-dev-containers))
 > - [GNOME Builder](https://apps.gnome.org/Builder/) (built-in)
 
-> **Pick ONE container runtime**:
+> **Install ONE container runtime**: (only if not using VS Code with WSL on Windows)
 > - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows/Mac)
 > - [Docker CLI](https://docs.docker.com/engine/install/) + [Docker Compose plugin](https://docs.docker.com/compose/install/) (Linux)
 > - [Rancher Desktop](https://rancherdesktop.io/) (Windows/Mac/Linux alternative)
