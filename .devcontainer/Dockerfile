@@ -89,7 +89,7 @@ RUN npm install -g prettier
 
 # ── OpenCode CLI (anomalyco/opencode — Linux x64) ─────────────────────────────
 # OpenCode is used for various Rock Band modding and exploration tasks via CLI.
-RUN curl -fsSL -o /tmp/opencode.tar.gz https://github.com/anomalyco/opencode/releases/download/v1.3.13/opencode-linux-x64.tar.gz \
+RUN curl -fsSL -o /tmp/opencode.tar.gz https://github.com/anomalyco/opencode/releases/download/v1.4.0/opencode-linux-x64.tar.gz \
     && tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin \
     && chmod +x /usr/local/bin/opencode \
     && rm /tmp/opencode.tar.gz
