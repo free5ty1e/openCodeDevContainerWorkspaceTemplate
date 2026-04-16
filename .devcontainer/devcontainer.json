@@ -30,14 +30,22 @@
     }
   },
   "forwardPorts": [
-    3000
+    3000,
+    11434
   ],
   "portsAttributes": {
     "3000": {
       "label": "Preview",
       "onAutoForward": "notify"
+    },
+    "11434": {
+      "label": "Ollama",
+      "onAutoForward": "notify"
     }
   },
   "postCreateCommand": "bash .devcontainer/setup_devcontainer.sh",
+  "containerEnv": {
+    "OLLAMA_MODELS": "qwen2.5-coder:7b codellama:13b llama3.2:3b"
+  },
   "remoteUser": "vscode"
 }

@@ -18,13 +18,68 @@
     {
       "label": "Opencode: Launch Fresh",
       "type": "shell",
-      "command": "opencode /workspace",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace",
       "problemMatcher": [],
       "presentation": {
         "reveal": "always",
         "panel": "new"
       },
       "group": "opencode"
+    },
+    {
+      "label": "Opencode + Ollama: qwen2.5-coder:7b (code)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/qwen2.5-coder:7b",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "ollama"
+    },
+    {
+      "label": "Opencode + Ollama: codellama:13b (code)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/codellama:13b",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "ollama"
+    },
+    {
+      "label": "Opencode + Ollama: llama3.2:3b (general)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/llama3.2:3b",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "ollama"
+    },
+    {
+      "label": "Ollama: Pull Models",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/setup_ollama.sh",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "ollama"
+    },
+    {
+      "label": "Ollama: Start Server",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "ollama"
     }
   ]
 }

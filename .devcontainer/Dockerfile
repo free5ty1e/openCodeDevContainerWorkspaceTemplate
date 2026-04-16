@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     zsh \
     p7zip-full \
+    zstd \
     # ── Critical dependencies for Onyx & OpenCode (do not remove) ──────────────
     libgl1 \
     libglu1-mesa \
@@ -94,6 +95,11 @@ RUN curl -fsSL -o /tmp/opencode.tar.gz https://github.com/anomalyco/opencode/rel
     && chmod +x /usr/local/bin/opencode \
     && rm /tmp/opencode.tar.gz
 
+# ── Ollama (local LLM inference) ──────────────────────────────────────────────
+# Ollama runs locally-hosted AI models (e.g., qwen2.5-coder) without cloud API.
+RUN curl -fsSL https://ollama.com/install.sh | sh \
+    && ln -s /usr/local/bin/ollama /usr/local/bin/ollama || true
+
 # ── Smoke tests ───────────────────────────────────────────────────────────────
 # RUN onyx 2>&1 | grep "Onyx Music Game Toolkit" || echo "⚠️  Onyx version check failed"
 # RUN DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 PkgTool.Core version 2>&1 | grep -i "pkgtool\|0\." || echo "⚠️  PkgTool version check failed"
@@ -110,7 +116,9 @@ RUN if getent passwd $USER_UID > /dev/null; then \
     && groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
     && echo "$USERNAME ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
-    && chmod 0440 /etc/sudoers.d/$USERNAME
+    && chmod 0440 /etc/sudoers.d/$USERNAME \
+    && mkdir -p /home/$USERNAME/.ollama/models \
+    && chown -R $USERNAME:$USERNAME /home/$USERNAME/.ollama
 RUN usermod -s /usr/bin/zsh $USERNAME \
     && sudo -u $USERNAME sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
 
