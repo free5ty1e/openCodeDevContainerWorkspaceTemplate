@@ -1,11 +1,13 @@
 # OpenCode DevContainer Project
 
-A ready-to-use devcontainer template with [opencode](https://github.com/anomalyco/opencode) pre-installed, plus VS Code tasks to automatically launch or resume your last session.
+A ready-to-use devcontainer template with [opencode](https://github.com/anomalyco/opencode) pre-installed, with built-in support for local AI models via [Ollama](https://ollama.com/). VS Code tasks let you launch opencode with any configured local model — fully offline, private, and ready to go.
 
 ## What's Inside
 
 - **DevContainer** — Ubuntu 24.04 with Node.js 22, Python 3, and opencode CLI pre-installed with a workspace-mounted ai_working directory for persistent opencode sessions between rebuilds
-- **VS Code Tasks** — Will auto resume the most recent session automatically on folder open, with another task to start a fresh session
+- **Ollama Integration** — Local AI models (qwen2.5-coder, deepseek-coder-v2, qwen3, mistral-nemo) with one-click startup via VS Code tasks
+- **VS Code Tasks** — Auto resume sessions on folder open, or launch fresh with your choice of local model
+- **Persistent Data** — Sessions and model storage survive container rebuilds
 
 ## Get Started
 
@@ -89,34 +91,98 @@ An easy way to point to a file is to drag it from the left sidebar to the chat w
 - **Command Palette**: `Tasks: Run Task` → `Opencode: Resume Last Session`
 - Automatically finds the most recent session and resumes it
 - Runs automatically when you open the folder in VS Code
+- Also auto-starts Ollama server if installed
 
 ### Task: Launch Fresh
 - **Command Palette**: `Tasks: Run Task` → `Opencode: Launch Fresh`
 - Starts a fresh opencode session in `/workspace`
+- Also auto-starts Ollama server if installed
 
-### Manual Usage
+### Local Ollama Models
+
+This project includes support for running local AI models via [Ollama](https://ollama.com/). This keeps your code local and private — no data leaves your machine.
+
+#### Available Models
+
+The following agent-capable models are configured (support tool calling):
+
+| Model | Size | Purpose |
+|-------|------|---------|
+| qwen2.5-coder:7b | ~4.4GB | Fast code generation |
+| deepseek-coder-v2:16b | ~9GB | GPT4-Turbo class coding |
+| qwen3:8b | ~8GB | General purpose |
+| mistral-nemo:12b | ~12GB | Reasoning and analysis |
+
+**Total: ~33GB** (all models)
+
+#### Adding/Changing Models
+
+Models are defined in one place: [`.devcontainer/ollama_models.conf`](.devcontainer/ollama_models.conf)
+
+To add or change models:
+1. Edit `.devcontainer/ollama_models.conf` (format: `["model:name"]="description|size"`)
+2. Update [`.vscode/tasks.json`](.vscode/tasks.json) tasks for new models
+3. Update [`opencode.json`](opencode.json) with new model entries
+4. Run `bash .devcontainer/check_models.sh` to verify sync
+
+#### Checking Config Sync
+
+Run the validation script to ensure all configs are consistent:
 ```bash
-# Start a new session
-opencode /workspace
-
-# Resume a specific session
-opencode /workspace -c -s <session-id>
-
-# List all sessions
-opencode session list
+bash .devcontainer/check_models.sh
 ```
+
+This checks that every model in `ollama_models.conf` exists in both `tasks.json` and `opencode.json`.
+
+#### Ollama Tasks
+
+- **`Ollama: Pull Models`** — Downloads selected models (~33GB total)
+  - First prompt: Install all models? (A/n)
+  - If 'n': individual prompts for each model with size/description
+  - Can also set via env var: `OLLAMA_MODELS='model1 model2' bash .devcontainer/setup_ollama.sh`
+
+- **`Ollama: Start Server`** — Starts Ollama server (idempotent — safe to run multiple times)
+
+- **`Opencode + Ollama: <model>`** — Starts server + launches opencode with that model
+  - Auto-selects any installed model as your coding assistant
+  - Run from VS Code: `Tasks: Run Task` → select the model you want
+
+#### Manual Ollama Usage
+```bash
+# Start Ollama server
+bash .devcontainer/start_ollama.sh
+
+# Pull specific model
+ollama pull qwen2.5-coder:7b
+
+# Run opencode with local model
+opencode /workspace --model ollama/qwen2.5-coder:7b
+
+# List installed models
+ollama list
+```
+
+#### Notes
+- Ollama downloads are cached — if a model fails mid-download, re-running will resume
+- Models persist in Ollama storage, not in the container — survives rebuilds
+- Port 11434 is forwarded for Ollama API access
 
 ## Project Structure
 
 ```
 .devcontainer/
-  ├── Dockerfile          # Container image definition
-  ├── devcontainer.json  # Devcontainer config
-  ├── setup_devcontainer.sh
-  ├── launch_opencode.sh
-  └── ...
+  ├── Dockerfile             # Container image definition
+  ├── devcontainer.json     # Devcontainer config
+  ├── ollama_models.conf    # Central model list (edit here to add/change models)
+  ├── setup_devcontainer.sh # Post-create setup
+  ├── setup_ollama.sh       # Model pulling script
+  ├── start_ollama.sh      # Idempotent server startup
+  ├── check_models.sh       # Verify configs are in sync
+  └── launch_opencode.sh    # Launch/resume opencode
 .vscode/
-  └── tasks.json         # VS Code tasks for opencode
+  └── tasks.json            # VS Code tasks for opencode + Ollama
+opencode.json               # OpenCode Ollama provider config
+.gitattributes              # Enforce LF line endings
 ```
 
 ## License

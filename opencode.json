@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "name": "Qwen 2.5 Coder 7B (code)"
+        },
+        "deepseek-coder-v2:16b": {
+          "name": "DeepSeek Coder V2 16B (code)"
+        },
+        "qwen3:8b": {
+          "name": "Qwen 3 8B (general)"
+        },
+        "mistral-nemo:12b": {
+          "name": "Mistral Nemo 12B (reasoning)"
+        }
+      }
+    }
+  }
+}

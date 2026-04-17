@@ -38,9 +38,9 @@
       "group": "ollama"
     },
     {
-      "label": "Opencode + Ollama: codellama:13b (code)",
+      "label": "Opencode + Ollama: qwen3:8b (general)",
       "type": "shell",
-      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/codellama:13b",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/qwen3:8b",
       "problemMatcher": [],
       "presentation": {
         "reveal": "always",
@@ -49,9 +49,20 @@
       "group": "ollama"
     },
     {
-      "label": "Opencode + Ollama: llama3.2:3b (general)",
+      "label": "Opencode + Ollama: deepseek-coder-v2:16b (code)",
       "type": "shell",
-      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/llama3.2:3b",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/deepseek-coder-v2:16b",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "ollama"
+    },
+    {
+      "label": "Opencode + Ollama: mistral-nemo:12b (reasoning)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/start_ollama.sh && opencode /workspace --model ollama/mistral-nemo:12b",
       "problemMatcher": [],
       "presentation": {
         "reveal": "always",

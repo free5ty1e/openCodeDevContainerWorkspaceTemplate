@@ -44,8 +44,5 @@
     }
   },
   "postCreateCommand": "bash .devcontainer/setup_devcontainer.sh",
-  "containerEnv": {
-    "OLLAMA_MODELS": "qwen2.5-coder:7b codellama:13b llama3.2:3b"
-  },
   "remoteUser": "vscode"
 }
