@@ -92,5 +92,18 @@
       },
       "group": "ollama"
     }
+    },
+    {
+      "label": "Opencode: Fix Sessions After Rebuild",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/.devcontainer/fix-sessions.sh",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "group": "build",
+      "detail": "Migrate opencode sessions to current project ID after container rebuild"
+    }    
   ]
 }
