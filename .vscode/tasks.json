@@ -13,7 +13,7 @@
       "runOptions": {
         "runOn": "folderOpen"
       },
-      "group": "opencode"
+      "group": "build"
     },
     {
       "label": "Opencode: Launch Fresh",
@@ -24,7 +24,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "opencode"
+      "group": "build"
     },
     {
       "label": "Opencode + Ollama: qwen2.5-coder:7b (code)",
@@ -35,7 +35,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "ollama"
+      "group": "build"
     },
     {
       "label": "Opencode + Ollama: qwen3:8b (general)",
@@ -46,7 +46,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "ollama"
+      "group": "build"
     },
     {
       "label": "Opencode + Ollama: deepseek-coder-v2:16b (code)",
@@ -57,7 +57,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "ollama"
+      "group": "build"
     },
     {
       "label": "Opencode + Ollama: mistral-nemo:12b (reasoning)",
@@ -68,7 +68,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "ollama"
+      "group": "build"
     },
     {
       "label": "Ollama: Pull Models",
@@ -79,7 +79,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "ollama"
+      "group": "build"
     },
     {
       "label": "Ollama: Start Server",
@@ -90,8 +90,7 @@
         "reveal": "always",
         "panel": "new"
       },
-      "group": "ollama"
-    }
+      "group": "build"
     },
     {
       "label": "Opencode: Fix Sessions After Rebuild",
