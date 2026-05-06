@@ -12,7 +12,10 @@
         "apiKey": "ollama"
       },
       "models": {
-        "qwen2.5-coder:32b-ctx16384": { "name": "Qwen 2.5 Coder 32B — ctx 16384 (default)", "tools": true },
+        "gemma4:e4b": { "name": "Gemma4 Chat E4B VibeCoder (default)", "tools": true },
+        "gemma4:e2b": { "name": "Gemma4 Chat E2B VibeCoder", "tools": true },
+
+        "qwen2.5-coder:32b-ctx16384": { "name": "Qwen 2.5 Coder 32B — ctx 16384", "tools": true },
         "qwen3-coder:30b-ctx16384": { "name": "Qwen 3 Coder 30B — ctx 16384", "tools": true },
         "codellama:34b-ctx16384": { "name": "CodeLlama 34B — ctx 16384" },
         "starcoder:15b-ctx32768": { "name": "StarCoder 15B — ctx 32768" },

@@ -189,6 +189,8 @@ BASE_MODELS=(
   "qwen3-coder:30b"
   "codellama:34b"
   "starcoder:15b"
+  "gemma4:e4b"
+  "gemma4:e2b"
 
   # Reasoning
   "deepseek-r1:32b"
@@ -292,7 +294,10 @@ else
         "apiKey": "ollama"
       },
       "models": {
-        "qwen2.5-coder:32b-ctx${ctx_large}": { "name": "Qwen 2.5 Coder 32B — ctx ${ctx_large} (default)", "tools": true },
+        "gemma4:e4b": { "name": "Gemma4 Chat E4B VibeCoder (default)", "tools": true },
+        "gemma4:e2b": { "name": "Gemma4 Chat E2B VibeCoder", "tools": true },
+
+        "qwen2.5-coder:32b-ctx16384": { "name": "Qwen 2.5 Coder 32B — ctx 16384", "tools": true },
         "qwen3-coder:30b-ctx${ctx_large}": { "name": "Qwen 3 Coder 30B — ctx ${ctx_large}", "tools": true },
         "codellama:34b-ctx${ctx_large}": { "name": "CodeLlama 34B — ctx ${ctx_large}" },
         "starcoder:15b-ctx${starcoder_ctx}": { "name": "StarCoder 15B — ctx ${starcoder_ctx}" },
