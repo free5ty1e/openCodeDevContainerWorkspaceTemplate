@@ -1,0 +1,6 @@
+# OpenCode runtime files - don't commit these
+/db/
+/cache/
+.env
+node_modules/
+*.log
