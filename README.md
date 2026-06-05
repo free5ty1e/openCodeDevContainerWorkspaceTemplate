@@ -167,6 +167,62 @@ ollama list
 - Models persist in Ollama storage, not in the container — survives rebuilds
 - Port 11434 is forwarded for Ollama API access
 
+## Claude CLI with Ollama
+
+This project includes a setup script for using [Anthropic's Claude CLI](https://docs.anthropic.com/en/docs/claude-code/overview) with local Ollama models running on the host machine (instead of using Anthropic's cloud API).
+
+### Script: `setup_claude_ollama_local_in_devcontainer.sh`
+
+Installs and configures Claude CLI inside the devcontainer to connect to an Ollama instance on the host. All sessions, settings, and history are persisted to the workspace so they survive container rebuilds.
+
+#### Usage
+
+```bash
+./setup_claude_ollama_local_in_devcontainer.sh
+```
+
+Run with no arguments to get an interactive menu:
+
+```
+ 1) Devcontainer (default - host.docker.internal)
+ 2) Localhost
+ 3) Enter custom IP/hostname
+```
+
+Or pass an argument directly:
+
+```bash
+# Connect to Ollama on the host (default for devcontainers)
+./setup_claude_ollama_local_in_devcontainer.sh host.docker.internal
+
+# Connect to Ollama running locally
+./setup_claude_ollama_local_in_devcontainer.sh localhost
+
+# Connect to a custom host on your network
+./setup_claude_ollama_local_in_devcontainer.sh 192.168.1.100
+```
+
+#### What It Does
+
+1. **Installs Ollama CLI** inside the container
+2. **Installs Node.js** (if missing) and the **Claude CLI** npm package
+3. **Links config** at `~/.config/claude-cli` → `/workspace/.claude_config/`
+4. **Persists Claude data** — `~/.claude/` (sessions, history, cache) and `~/.claude.json` (settings, onboarding state) are symlinked into `/workspace/.claude_config/` so they survive container rebuilds
+5. **Adds shell wrappers** to `~/.bashrc` and `~/.zshrc` with convenient commands
+
+#### Commands
+
+After setup, source your shell rc file (`source ~/.zshrc`) and use:
+
+| Command | Description |
+|---------|-------------|
+| `c` | Pick an Ollama model from the host and launch Claude |
+| `c-new` | Same as `c` |
+| `c-cloud` | Launch the installed Claude CLI directly (cloud API) |
+| `cc` | Continue the most recent Claude cloud session |
+| `ollama-model` | Select a different Ollama model |
+| `ollama-model-current` | Show the currently selected model |
+
 ## Project Structure
 
 ```
