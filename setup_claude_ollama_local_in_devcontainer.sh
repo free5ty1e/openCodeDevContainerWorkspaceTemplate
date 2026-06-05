@@ -178,7 +178,7 @@ ensure_persistence_link() {
         mv "${HOME}/.claude.json" "${persisted_claude_json}"
         ln -s "${persisted_claude_json}" "${HOME}/.claude.json"
     else
-        touch "${persisted_claude_json}"
+        printf '%s\n' '{}' > "${persisted_claude_json}"
         ln -sfn "${persisted_claude_json}" "${HOME}/.claude.json"
     fi
     log "✅ ~/.claude.json linked -> ${persisted_claude_json}"
