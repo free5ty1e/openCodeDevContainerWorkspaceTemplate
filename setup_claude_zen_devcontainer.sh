@@ -151,6 +151,7 @@ MARKER_END="# <<< claude-zen-devcontainer <<<"
 NPM_GLOBAL_DIR="${HOME}/.npm-global"
 
 have() { command -v "$1" >/dev/null 2>&1; }
+export PATH="${NPM_GLOBAL_DIR}/bin:${PATH}"
 
 # ─── 1. Prerequisites: pip packages ───────────────────────────────────────────
 printf '\n%s\n' "=== Step 1: Prerequisites ==="
@@ -160,16 +161,33 @@ pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1 | ta
     pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken
 }
 
-# ─── 2. Persistence dir ───────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 2: Persistence dir ==="
+# ─── 2. Claude CLI ─────────────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 2: Claude CLI ==="
+if have claude; then
+    printf '  Found: %s\n' "$(command -v claude)"
+else
+    printf '  Installing @anthropic-ai/claude-code via npm...\n'
+    mkdir -p "${NPM_GLOBAL_DIR}"
+    npm config set prefix "${NPM_GLOBAL_DIR}" 2>/dev/null || true
+    npm install -g @anthropic-ai/claude-code 2>&1 || {
+        printf '  WARNING: npm install failed.\n'
+        printf '  Install Claude CLI manually: npm install -g @anthropic-ai/claude-code\n' >&2
+    }
+    if have claude; then
+        printf '  Installed: %s\n' "$(command -v claude)"
+    else
+        printf '  Warning: claude not in PATH yet. It may be at %s/bin/claude\n' "${NPM_GLOBAL_DIR}"
+        printf '  Restart your shell or run: export PATH="%s/bin:\${PATH}"\n' "${NPM_GLOBAL_DIR}"
+    fi
+fi
+
+# ─── 3. Persistence dir ───────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 3: Persistence dir ==="
 mkdir -p "${PERSISTENCE_DIR}"
 
 # ─── 3. Proxy script ──────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 3: Proxy script ==="
-if [ -f "${PROXY_SCRIPT}" ]; then
-    printf '  Already exists: %s\n' "${PROXY_SCRIPT}"
-else
-    cat > "${PROXY_SCRIPT}" << 'PYEOF'
+printf '\n%s\n' "=== Step 4: Proxy script ==="
+cat > "${PROXY_SCRIPT}" << 'PYEOF'
 """Lightweight Anthropic-to-OpenAI translation proxy.
 
 Usage:
@@ -211,9 +229,8 @@ class Backend:
     model: str
     provider_name: str = ""
 
-
 # ---------------------------------------------------------------------------
-# Anthropic -> OpenAI request conversion
+# Anthropic → OpenAI request conversion (adapted from claude-code-proxy)
 # ---------------------------------------------------------------------------
 
 def set_if_not_none(d: dict, key: str, value: Any) -> None:
@@ -222,6 +239,7 @@ def set_if_not_none(d: dict, key: str, value: Any) -> None:
 
 
 def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
+    """Convert Anthropic messages to OpenAI chat format."""
     openai_messages = []
     system_content = None
 
@@ -238,18 +256,25 @@ def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
                 text_parts = []
                 tool_calls = []
                 for block in content:
-                    t = block.get("type")
-                    if t == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif t == "thinking":
-                        text_parts.append(block.get("signature", "") or block.get("text", ""))
-                    elif t == "tool_use":
-                        func_args = json.dumps(block.get("input", {}))
-                        tool_calls.append({
-                            "id": block.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
-                            "type": "function",
-                            "function": {"name": block.get("name", "unknown"), "arguments": func_args},
-                        })
+                    match block.get("type"):
+                        case "text":
+                            text_parts.append(block.get("text", ""))
+                        case "thinking":
+                            text_parts.append(
+                                block.get("signature", "") or block.get("text", "")
+                            )
+                        case "tool_use":
+                            func_args = json.dumps(block.get("input", {}))
+                            tool_calls.append({
+                                "id": block.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", "unknown"),
+                                    "arguments": func_args,
+                                },
+                            })
+                        case "tool_result":
+                            pass
                 msg_dict = {"role": "assistant"}
                 if text_parts:
                     msg_dict["content"] = "\n".join(text_parts)
@@ -285,6 +310,7 @@ def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
 
 
 def convert_tools(anthropic_tools: list[dict] | None) -> list[dict]:
+    """Convert Anthropic tool format to OpenAI function format."""
     if not anthropic_tools:
         return []
     tools = []
@@ -301,7 +327,7 @@ def convert_tools(anthropic_tools: list[dict] | None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# OpenAI -> Anthropic SSE stream conversion
+# OpenAI → Anthropic SSE conversion
 # ---------------------------------------------------------------------------
 
 _enc = tiktoken.get_encoding("cl100k_base")
@@ -311,37 +337,64 @@ def _estimate_tokens(text: str) -> int:
     return len(_enc.encode(text))
 
 
-def _make_anthropic_sse(
+async def make_anthropic_stream(
     openai_stream: AsyncIterator[dict],
     model: str,
+    allow_thinking: bool = False,
 ) -> AsyncIterator[str]:
+    """Convert an OpenAI streaming response to Anthropic SSE format."""
+
     message_id = f"msg_{uuid.uuid4().hex}"
     input_tokens = 0
     finish_reason = None
 
-    yield f'event: message_start\ndata: {json.dumps({"type":"message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":model,"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}})}\n\n'
+    yield f'event: message_start\ndata: {json.dumps({"type": "message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":model,"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}})}\n\n'
 
     text_buffer = ""
     tool_calls: dict[int, dict] = {}
+    thinking_block_open = False
+    text_block_open = False
 
     async for chunk in openai_stream:
         choices = chunk.get("choices", [])
         if not choices:
+            usage = chunk.get("usage")
+            if usage:
+                input_tokens = usage.get("prompt_tokens", 0) or input_tokens
             continue
+
         delta = choices[0].get("delta", {})
         finish = choices[0].get("finish_reason")
         if finish:
             finish_reason = finish
 
+        # Reasoning content
         reasoning = delta.get("reasoning_content")
         if reasoning:
-            yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":reasoning}})}\n\n'
+            if allow_thinking:
+                if not thinking_block_open:
+                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})}\n\n'
+                    thinking_block_open = True
+                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":reasoning}})}\n\n'
+            else:
+                if not text_block_open:
+                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})}\n\n'
+                    text_block_open = True
+                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":reasoning}})}\n\n'
+            text_buffer += reasoning
 
+        # Text content
         text = delta.get("content", "")
         if text:
-            yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":text}})}\n\n'
+            if not text_block_open:
+                idx = 1 if thinking_block_open else 0
+                yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})}\n\n'
+                text_block_open = True
+            idx = 1 if thinking_block_open else 0
+            yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":text}})}\n\n'
             text_buffer += text
 
+        # Tool calls
         tc_list = delta.get("tool_calls", [])
         for tc in tc_list:
             idx = tc.get("index", 0)
@@ -351,19 +404,26 @@ def _make_anthropic_sse(
                     "name": tc.get("function", {}).get("name", ""),
                     "arguments": "",
                 }
-                yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx+3,"content_block":{"type":"tool_use","id":tool_calls[idx]["id"],"name":tool_calls[idx]["name"]}})}\n\n'
+                yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx+2,"content_block":{"type":"tool_use","id":tool_calls[idx]["id"],"name":tool_calls[idx]["name"]}})}\n\n'
             args_delta = tc.get("function", {}).get("arguments", "")
             if args_delta:
                 tool_calls[idx]["arguments"] += args_delta
-                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx+3,"delta":{"type":"input_json_delta","partial_json":args_delta}})}\n\n'
+                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx+2,"delta":{"type":"input_json_delta","partial_json":args_delta}})}\n\n'
 
         usage = chunk.get("usage")
         if usage:
             input_tokens = usage.get("prompt_tokens", 0) or input_tokens
 
+    # Close content blocks
+    if thinking_block_open:
+        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
+    if text_block_open:
+        idx = 1 if thinking_block_open else 0
+        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx})}\n\n'
     for idx in sorted(tool_calls.keys()):
-        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx+3})}\n\n'
+        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx+2})}\n\n'
 
+    # Estimate output tokens
     output_tokens = _estimate_tokens(text_buffer)
     for tc in tool_calls.values():
         output_tokens += _estimate_tokens(tc.get("arguments", ""))
@@ -387,12 +447,9 @@ class MessagesRequest(BaseModel):
     tools: list[dict] | None = None
     temperature: float | None = None
     top_p: float | None = None
+    stream: bool = True
 
     model_config = {"extra": "allow"}
-
-
-def _probe_response() -> Response:
-    return Response(status_code=204, headers={"Allow": "GET, POST, HEAD, OPTIONS"})
 
 
 backends: dict[str, Backend] = {}
@@ -405,9 +462,9 @@ def load_backends(path: Path) -> dict[str, Backend]:
         data = json.load(f)
     result = {}
     for pid, info in data.items():
-        if not isinstance(info, dict) or "base_url" not in info:
-            continue
-        api_key = info.get("api_key") or os.environ.get(info.get("api_key_env", ""), "")
+        api_key = info.get("api_key") or os.environ.get(
+            info.get("api_key_env", ""), ""
+        )
         result[pid] = Backend(
             provider_id=pid,
             base_url=info["base_url"].rstrip("/"),
@@ -419,13 +476,17 @@ def load_backends(path: Path) -> dict[str, Backend]:
 
 
 def get_backend(request: Request) -> Backend:
+    """Select backend based on x-api-key suffix."""
     global default_provider_id, backends
+
     auth = request.headers.get("x-api-key") or request.headers.get("authorization") or ""
     pid = default_provider_id
+
     if ":" in auth:
         suffix = auth.split(":", 1)[1].strip()
         if suffix and suffix in backends:
             pid = suffix
+
     if pid not in backends:
         raise HTTPException(status_code=400, detail=f"Unknown backend: {pid}. Available: {list(backends)}")
     return backends[pid]
@@ -443,6 +504,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _get_client() -> httpx.AsyncClient:
+    if http_client is None:
+        raise RuntimeError("HTTP client not initialized")
+    return http_client
+
+
+def _probe_response() -> Response:
+    return Response(status_code=204, headers={"Allow": "GET, POST, HEAD, OPTIONS"})
+
+
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
@@ -454,7 +525,7 @@ async def root():
     return {
         "status": "ok",
         "provider": default_provider_id,
-        "model": f"{default_provider_id}/{be.model}" if be else "",
+        "model": f"{default_provider_id}/{backends[default_provider_id].model}" if default_provider_id in backends else "",
     }
 
 
@@ -470,13 +541,17 @@ async def probe_messages():
 
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "data": [
-            {"id": "claude-opus-4-20250514", "display_name": "Claude Opus 4", "created_at": "2025-05-14T00:00:00Z", "type": "model"},
-            {"id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4", "created_at": "2025-05-14T00:00:00Z", "type": "model"},
-            {"id": "claude-haiku-4-20250514", "display_name": "Claude Haiku 4", "created_at": "2025-05-14T00:00:00Z", "type": "model"},
-        ]
-    }
+    models = []
+    for pid, be in backends.items():
+        model_id = be.model or f"{pid}/default"
+        display = be.provider_name or pid
+        models.append({
+            "id": model_id,
+            "display_name": f"{display} ({model_id})",
+            "created_at": "2025-01-01T00:00:00Z",
+            "type": "model",
+        })
+    return {"data": models}
 
 
 @app.post("/v1/messages")
@@ -484,6 +559,9 @@ async def create_message(request: Request):
     body = await request.json()
     req = MessagesRequest(**body)
     be = get_backend(request)
+
+    anthropic_beta = request.headers.get("anthropic-beta", "")
+    allow_thinking = "thinking-2025-01-02" in anthropic_beta
 
     openai_messages = convert_messages(req.messages)
     if req.system is not None:
@@ -497,7 +575,7 @@ async def create_message(request: Request):
             openai_messages.insert(0, {"role": "system", "content": req.system})
 
     openai_tools = convert_tools(req.tools)
-    upstream_model = be.model or (req.model.split("/")[-1] if "/" in req.model else req.model)
+    upstream_model = be.model or req.model.split("/")[-1] if "/" in req.model else req.model
 
     payload = {
         "model": upstream_model,
@@ -511,14 +589,11 @@ async def create_message(request: Request):
     if openai_tools:
         payload["tools"] = openai_tools
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {be.api_key}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if be.api_key:
+        headers["Authorization"] = f"Bearer {be.api_key}"
 
-    client = http_client
-    if client is None:
-        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+    client = _get_client()
 
     try:
         upstream_resp = await client.post(
@@ -530,26 +605,104 @@ async def create_message(request: Request):
     except httpx.HTTPStatusError as e:
         detail = f"Upstream error: {e.response.status_code}"
         try:
-            body_text = await e.response.aread()
-            detail += f" - {body_text[:200].decode()}"
+            detail += f" - {e.response.text[:200]}"
         except Exception:
             pass
         raise HTTPException(status_code=502, detail=detail)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
 
-    return StreamingResponse(
-        _make_anthropic_sse(_iter_openai_sse(upstream_resp), req.model),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    if req.stream:
+        return StreamingResponse(
+            make_anthropic_stream(_iter_openai_sse(upstream_resp), req.model, allow_thinking),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Non-streaming: collect chunks and build single response
+    content_parts: list[dict] = []
+    thinking_text = ""
+    text_buffer = ""
+    tool_calls: dict[int, dict] = {}
+    finish_reason: str | None = None
+    input_tokens = 0
+
+    async for chunk in _iter_openai_sse(upstream_resp):
+        choices = chunk.get("choices", [])
+        if not choices:
+            usage = chunk.get("usage")
+            if usage:
+                input_tokens = usage.get("prompt_tokens", 0) or input_tokens
+            continue
+        delta = choices[0].get("delta", {})
+        finish = choices[0].get("finish_reason")
+        if finish:
+            finish_reason = finish
+
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            thinking_text += reasoning
+
+        text = delta.get("content", "")
+        if text:
+            text_buffer += text
+
+        for tc in delta.get("tool_calls", []):
+            idx = tc.get("index", 0)
+            if idx not in tool_calls:
+                tool_calls[idx] = {
+                    "id": tc.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
+                    "name": tc.get("function", {}).get("name", ""),
+                    "arguments": "",
+                }
+            tool_calls[idx]["arguments"] += tc.get("function", {}).get("arguments", "")
+
+        usage = chunk.get("usage")
+        if usage:
+            input_tokens = usage.get("prompt_tokens", 0) or input_tokens
+
+    if allow_thinking and thinking_text:
+        content_parts.append({"type": "thinking", "thinking": thinking_text})
+    text_buffer = thinking_text + text_buffer if not allow_thinking and thinking_text else text_buffer
+    if text_buffer:
+        content_parts.append({"type": "text", "text": text_buffer})
+    for idx in sorted(tool_calls.keys()):
+        tc = tool_calls[idx]
+        content_parts.append({
+            "type": "tool_use",
+            "id": tc["id"],
+            "name": tc["name"],
+            "input": json.loads(tc["arguments"]) if tc["arguments"] else {},
+        })
+
+    if not content_parts:
+        content_parts = [{"type": "text", "text": ""}]
+
+    output_tokens = _estimate_tokens(text_buffer)
+    for tc in tool_calls.values():
+        output_tokens += _estimate_tokens(tc.get("arguments", ""))
+
+    stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+    anthropic_stop = stop_map.get(finish_reason, "end_turn")
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "content": content_parts,
+        "model": req.model,
+        "stop_reason": anthropic_stop,
+        "stop_sequence": None,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
 
 
 async def _iter_openai_sse(resp: httpx.Response) -> AsyncIterator[dict]:
+    """Iterate over an OpenAI streaming response, yielding parsed JSON chunks."""
     async for line in resp.aiter_lines():
         line = line.strip()
         if not line or line.startswith(":"):
@@ -576,13 +729,14 @@ async def count_tokens(request: Request):
             for block in c:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text += block.get("text", "")
-    return {"input_tokens": _estimate_tokens(text)}
+    tokens = _estimate_tokens(text)
+    return {"input_tokens": tokens}
 
 
 def main():
     global default_provider_id, backends
 
-    parser = argparse.ArgumentParser(description="Anthropic-to-OpenAI translation proxy")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--backends", default=os.environ.get("ZEN_BACKENDS", "backends.json"))
     parser.add_argument("--host", default=os.environ.get("ZEN_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("ZEN_PORT", "8083")))
@@ -612,12 +766,11 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
-    chmod +x "${PROXY_SCRIPT}"
-    printf '  Created %s\n' "${PROXY_SCRIPT}"
-fi
+chmod +x "${PROXY_SCRIPT}"
+printf '  Created %s\n' "${PROXY_SCRIPT}"
 
 # ─── 4. Backends config ───────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 4: Backends config ==="
+printf '\n%s\n' "=== Step 5: Backends config ==="
 if [ ! -f "${BACKENDS_FILE}" ]; then
     cat > "${BACKENDS_FILE}" << JSONEOF
 {
@@ -650,7 +803,7 @@ else
 fi
 
 # ─── 5. Shell wrappers ────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 5: Shell wrappers ==="
+printf '\n%s\n' "=== Step 6: Shell wrappers ==="
 
 _wrapper_block() {
     cat << 'WRAPEOF' | sed \
@@ -679,7 +832,7 @@ unset -f cz cz_new ccz claude_zen_launch claude_zen_cloud_launch \
 _claude_zen_pick() {
     python3 - "$@" << 'PY'
 import json, os, sys
-f = os.environ.get("ZEN_BACKENDS", "__BACKENDS_FILE__") or "__BACKENDS_FILE__"
+f = os.environ.get("ZEN_BACKENDS") or "__BACKENDS_FILE__"
 try:
     with open(f) as fh:
         cfg = json.load(fh)
@@ -707,21 +860,30 @@ PY
 
 # ── Proxy lifecycle ───────────────────────────────────────────────────────────
 _claude_zen_ensure_proxy() {
-    local pidf="${CLAUDE_ZEN_CONFIG_DIR}/proxy.pid"
-    local logf="${CLAUDE_ZEN_CONFIG_DIR}/proxy.log"
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local pidf="${dir}/proxy.pid"
+    local logf="${dir}/proxy.log"
+    local proxy_script="${dir}/proxy.py"
+    local backends_file="${ZEN_BACKENDS:-${dir}/backends.json}"
+    local port="${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}"
+    mkdir -p "$dir"
     if [ -f "$pidf" ]; then
         local pid; pid=$(cat "$pidf")
         kill -0 "$pid" 2>/dev/null && return 0
         rm -f "$pidf"
     fi
-    python3 "__PROXY_SCRIPT__" \
-        --backends "${ZEN_BACKENDS:-__BACKENDS_FILE__}" \
-        --port "${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+    if [ ! -f "$proxy_script" ]; then
+        printf '\nProxy script not found at %s\n' "$proxy_script" >&2
+        return 1
+    fi
+    python3 "$proxy_script" \
+        --backends "$backends_file" \
+        --port "$port" \
         >> "$logf" 2>&1 &
     echo $! > "$pidf"
     sleep 2
     if kill -0 $! 2>/dev/null; then
-        printf '\nProxy started (PID %s), port %s\n' "$!" "${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}"
+        printf '\nProxy started (PID %s), port %s\n' "$!" "$port"
         return 0
     fi
     printf '\nWarning: proxy may not have started. Check %s\n' "$logf" >&2
@@ -729,44 +891,73 @@ _claude_zen_ensure_proxy() {
 }
 
 # ── Launch Claude via the proxy ──────────────────────────────────────────────
+_claude_zen_find_claude() {
+    local cmd
+    cmd="$(command -v claude 2>/dev/null)" && { echo "$cmd"; return 0; }
+    # Common locations in devcontainers
+    for p in \
+        /home/vscode/.npm-global/bin/claude \
+        /root/.npm-global/bin/claude \
+        /usr/local/bin/claude \
+        /usr/bin/claude; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    # VS Code extension bundled binary (common in devcontainers)
+    cmd="$(find /home/vscode/.vscode-server/extensions -maxdepth 4 -path '*/anthropic.claude-code-*/resources/native-binary/claude' -type f -executable 2>/dev/null | head -1)"
+    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
+    # Broader search within node_modules
+    cmd="$(find /home/vscode /root /usr/local -maxdepth 8 -name claude -type f -executable 2>/dev/null | head -1)"
+    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
+    printf '\nError: claude binary not found. Install it with:\n  npm install -g @anthropic-ai/claude-code\n\n' >&2
+    return 1
+}
+
 claude_zen_launch() {
-    local sel model_name
+    local sel model_name claude_bin dir
     sel="$(_claude_zen_pick)" || return 1
-    mkdir -p "$(dirname "${CLAUDE_ZEN_MODEL_FILE:-__SELECTED_MODEL_FILE__}")"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-__SELECTED_MODEL_FILE__}"
+    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    mkdir -p "$dir"
+    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
     model_name=$(python3 -c "
 import json
-with open('${ZEN_BACKENDS:-__BACKENDS_FILE__}') as f:
+with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
     cfg = json.load(f)
 bc = cfg.get('$sel', {})
 print(bc.get('model', '') or bc.get('provider_name', '$sel'))
 " 2>/dev/null)
     printf 'Backend: %s  (%s)\n' "$sel" "$model_name"
     _claude_zen_ensure_proxy || true
+    claude_bin="$(_claude_zen_find_claude)"
     ZEN_DEFAULT_PROVIDER="$sel" \
     ANTHROPIC_API_KEY="freecc" \
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-    claude --model "$model_name" "$@"
+    "$claude_bin" --model "$model_name" "$@"
 }
 
-claude_zen_cloud_launch() { claude "$@"; }
+claude_zen_cloud_launch() {
+    local b; b="$(_claude_zen_find_claude)"
+    "$b" "$@"
+}
 
 claude_zen_pick_model() {
-    local sel; sel="$(_claude_zen_pick)" || return 1
-    mkdir -p "$(dirname "${CLAUDE_ZEN_MODEL_FILE:-__SELECTED_MODEL_FILE__}")"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-__SELECTED_MODEL_FILE__}"
+    local sel dir
+    sel="$(_claude_zen_pick)" || return 1
+    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    mkdir -p "$dir"
+    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
     printf 'Backend: %s\n' "$sel"
 }
 
 claude_zen_current_model() {
-    local f="${CLAUDE_ZEN_MODEL_FILE:-__SELECTED_MODEL_FILE__}"
+    local f="${CLAUDE_ZEN_MODEL_FILE:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}/selected-model}"
     [ -f "$f" ] && cat "$f" || echo "No model selected (run cz-model)"
 }
 
 claude_zen_proxy_start() { _claude_zen_ensure_proxy; }
 
 claude_zen_proxy_stop() {
-    local pidf="${CLAUDE_ZEN_CONFIG_DIR}/proxy.pid"
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local pidf="${dir}/proxy.pid"
     [ ! -f "$pidf" ] && echo "Proxy not running." && return 0
     local pid; pid=$(cat "$pidf")
     kill "$pid" 2>/dev/null && echo "Stopped PID $pid" || echo "Not running."
@@ -774,7 +965,8 @@ claude_zen_proxy_stop() {
 }
 
 claude_zen_proxy_status() {
-    local pidf="${CLAUDE_ZEN_CONFIG_DIR}/proxy.pid"
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local pidf="${dir}/proxy.pid"
     if [ -f "$pidf" ]; then
         local pid; pid=$(cat "$pidf")
         kill -0 "$pid" 2>/dev/null && echo "Proxy running: PID $pid, port ${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" && return 0
@@ -786,7 +978,7 @@ claude_zen_proxy_status() {
 alias cz='claude_zen_launch'
 alias cz-new='claude_zen_launch'
 alias cz-cloud='claude_zen_cloud_launch'
-alias ccz='claude --continue'
+ccz() { local b; b="$(_claude_zen_find_claude)"; "$b" --continue "$@"; }
 alias cz-model='claude_zen_pick_model'
 alias cz-model-current='claude_zen_current_model'
 alias cz-proxy-start='claude_zen_proxy_start'
@@ -820,12 +1012,16 @@ PY
 _install_shell_wrappers
 
 # ─── 6. Verify ────────────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 6: Smoke test ==="
-python3 -c "
+printf '\n%s\n' "=== Step 7: Smoke test ==="
+if python3 -c "
 import sys; sys.path.insert(0, '${PERSISTENCE_DIR}')
 from proxy import app
 print('  Proxy module: OK')
-" 2>&1 || printf '  Warning: smoke test failed\n'
+" 2>&1; then
+    printf '  Proxy module loaded OK\n'
+else
+    printf '  Warning: smoke test failed (proxy module may have syntax errors)\n'
+fi
 
 # ─── 7. Summary ───────────────────────────────────────────────────────────────
 SHELL_RC=".bashrc"; case "${SHELL:-}" in *zsh) SHELL_RC=".zshrc" ;; esac
