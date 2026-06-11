@@ -79,6 +79,7 @@
 # ── After setup: shell aliases ────────────────────────────────────────────────
 #   cz              Pick a model and launch Claude CLI through the proxy
 #   cz-new          Same as cz
+#   cz-danger       Pick a model -> launch Claude CLI (auto-accept permissions)
 #   cz-cloud        Launch Claude CLI directly (cloud, no proxy)
 #   ccz             Continue most recent Claude cloud session
 #   cz-model        Pick/change the default model
@@ -86,6 +87,7 @@
 #   cz-proxy-start  Start the proxy daemon (auto-started on first use)
 #   cz-proxy-stop   Stop the proxy daemon
 #   cz-proxy-status Check proxy daemon status
+#   cz-undo-danger  Remove danger guardrails from workspace CLAUDE.md
 #
 # ── Backends configuration ────────────────────────────────────────────────────
 # Edit the JSON file at .claude_config_zen/backends.json:
@@ -138,7 +140,8 @@
 #   ├── proxy.py             Standalone translation proxy
 #   ├── selected-model       Last selected MODEL= string
 #   ├── proxy.log            Proxy daemon log
-#   └── proxy.pid            Proxy daemon PID
+#   ├── proxy.pid            Proxy daemon PID
+#   └── danger/              Danger-mode guardrails (CLAUDE.md backup + rules)
 #
 #   .ai_memory/
 #   └── (research files)     Claude Code memory files (symlinked from home folder)
@@ -923,11 +926,13 @@ export CLAUDE_ZEN_CONFIG_DIR="__PERSISTENCE_DIR__"
 export CLAUDE_ZEN_PROXY_PORT="__PROXY_PORT__"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
-unalias cz cz-new cz-cloud cz-continue ccz 2>/dev/null || true
-unset -f cz cz_new ccz claude_zen_launch claude_zen_cloud_launch \
+unalias cz cz-new cz-cloud cz-continue ccz cz-danger 2>/dev/null || true
+unset -f cz cz_new ccz claude_zen_launch claude_zen_launch_danger \
+      claude_zen_cloud_launch \
       claude_zen_pick_model claude_zen_current_model \
       _claude_zen_pick _claude_zen_ensure_proxy \
-      claude_zen_proxy_start claude_zen_proxy_stop claude_zen_proxy_status 2>/dev/null || true
+      claude_zen_proxy_start claude_zen_proxy_stop claude_zen_proxy_status \
+      claude_zen_uninstall_danger_rules 2>/dev/null || true
 
 # ── Interactive model picker ──────────────────────────────────────────────────
 _claude_zen_pick() {
@@ -1072,6 +1077,170 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
     "$claude_bin" --model "$model_name" "$@"
 }
 
+# ── Danger mode: auto-accept permissions with git guardrails ────────────────
+claude_zen_launch_danger() {
+    local sel provider_id model_name claude_bin dir workspace_root danger_rules_file
+    sel="$(_claude_zen_pick)" || return 1
+    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    # Derive workspace root: __PERSISTENCE_DIR__ = <root>/.claude_config_zen
+    workspace_root="${dir%/.claude_config_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+    mkdir -p "$dir"
+    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
+    # Parse provider_id|model_name format
+    if [[ "$sel" == *"|"* ]]; then
+        provider_id="${sel%%|*}"
+        model_name="${sel#*|}"
+    else
+        provider_id="$sel"
+        model_name=$(python3 -c "
+import json
+with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
+    cfg = json.load(f)
+bc = cfg.get('$sel', {})
+print(bc.get('model', '') or bc.get('provider_name', '$sel'))
+" 2>/dev/null)
+    fi
+
+    printf '\n'
+    printf '  ⚠️  DANGER MODE\n'
+    printf '  ────────────\n'
+    printf '  Auto-accepting ALL permissions.\n'
+    printf '  Provider: %s  Model: %s\n' "$provider_id" "$model_name"
+    printf '\n'
+
+    _claude_zen_ensure_proxy || true
+    claude_bin="$(_claude_zen_find_claude)"
+
+    # ── Install danger guardrails ──────────────────────────────────────────
+    # We temporarily install a CLAUDE.md in the workspace root with strict
+    # git guardrails. The original is restored after Claude exits.
+    local claude_md="${workspace_root}/CLAUDE.md"
+    local danger_dir="${dir}/danger"
+    mkdir -p "$danger_dir"
+    local backup_file="${danger_dir}/CLAUDE.md.bak"
+
+    # Backup existing CLAUDE.md if it exists
+    if [ -f "$claude_md" ]; then
+        cp "$claude_md" "$backup_file"
+    else
+        rm -f "$backup_file"
+        touch "$backup_file"
+    fi
+
+    # Write danger guardrails
+    danger_rules_file="${danger_dir}/danger_rules.md"
+    cat > "$danger_rules_file" << 'DANGEREOF'
+# ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
+
+You are running with **automatic permission approval**. Every tool call you
+make is executed WITHOUT confirmation. This is a safety-critical mode.
+
+## MANDATORY RESTRICTIONS — Git write operations
+
+Only the following **Staging & Read** operations are allowed:
+
+### ✅ ALLOWED Git Operations
+| Command | Purpose |
+|---------|---------|
+| `git add <file>` | Stage a file (fine-grained) |
+| `git add -p` | Stage interactively by hunk |
+| `git add -A` | Stage all changes |
+| `git status` | View working tree state |
+| `git diff` | View unstaged changes |
+| `git diff --cached` | View staged changes |
+| `git log` | View commit history |
+| `git show` | View a commit |
+| `git blame` | Annotate a file |
+| `git restore <file>` | Discard unstaged local changes |
+| `git stash push` | Save WIP temporarily |
+| `git stash list` | View stashes |
+| `git stash show` | View stash contents |
+
+### ❌ FORBIDDEN Git Operations
+These operations are **strictly forbidden**. Refuse politely if asked.
+
+| Operation | Reason |
+|-----------|--------|
+| `git commit` | Would record changes permanently |
+| `git push` / `git push --force` | Would publish to remote |
+| `git branch` / `git checkout -b` | Would create branches |
+| `git merge` / `git rebase` | Would alter history |
+| `git tag` | Would tag releases |
+| `git fetch` / `git pull` | Would contact remote |
+| `git reset --hard` / `git reset --mixed` | Destructive history reset |
+| `git revert` / `git cherry-pick` | Would create new commits |
+| `git rm` / `git mv` | Would remove/rename tracked files |
+| `git submodule` | Complex git mutation |
+| `git worktree` | Would create worktrees |
+| `git gc` / `git prune` / `git repack` | Repository maintenance |
+| `git clean -fd` / `-fdX` | Aggressive file removal |
+| `git stash drop` / `git stash pop` / `git stash clear` | Destructive stash ops |
+| `git config` (with global/system) | Would change git settings |
+
+### File System Cautions
+- You can read, write, and edit files normally.
+- **Do not delete files** without the user explicitly asking — even though
+  you auto-accept permissions, ask for verbal confirmation on deletes.
+- **Do not run shell commands** that modify the system (install packages,
+  change system config) without asking first.
+
+### Enforcement
+- If you are asked to do a forbidden git operation, say:
+  "⛔ This operation is blocked by Danger Mode guardrails."
+- If in doubt, err on the side of refusing. The user can always switch to
+  normal mode (`cz`) for git-write operations.
+
+DANGEREOF
+
+    cp "$danger_rules_file" "$claude_md"
+    printf '  🔒 Danger guardrails installed (CLAUDE.md)\n'
+    printf '\n'
+
+    # ── Launch with auto-accept ────────────────────────────────────────────
+    ZEN_DEFAULT_PROVIDER="$provider_id" \
+    ANTHROPIC_API_KEY="freecc" \
+    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+    "$claude_bin" --model "$model_name" --dangerously-skip-permissions "$@"
+
+    # ── Cleanup: restore original CLAUDE.md ────────────────────────────────
+    local exit_code=$?
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        cp "$backup_file" "$claude_md"
+        printf '\n  ✅ Restored original CLAUDE.md\n'
+    elif [ -f "$backup_file" ]; then
+        rm -f "$claude_md"
+        printf '\n  ✅ Removed danger CLAUDE.md (no original to restore)\n'
+    fi
+    rm -f "$backup_file"
+    return $exit_code
+}
+
+# Remove danger guardrails from CLAUDE.md without launching (cleanup utility)
+claude_zen_uninstall_danger_rules() {
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local workspace_root="${dir%/.claude_config_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    local backup_file="${dir}/danger/CLAUDE.md.bak"
+
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        cp "$backup_file" "$claude_md"
+        printf 'Restored original CLAUDE.md\n'
+        rm -f "$backup_file"
+    elif [ -f "$claude_md" ]; then
+        # Check if it's our danger rules file
+        if grep -q 'DANGER MODE GUARDRAILS' "$claude_md" 2>/dev/null; then
+            rm -f "$claude_md"
+            printf 'Removed danger CLAUDE.md\n'
+        else
+            printf 'CLAUDE.md is not a danger rules file — leaving untouched\n'
+        fi
+    else
+        printf 'No CLAUDE.md found\n'
+    fi
+}
+
 claude_zen_cloud_launch() {
     local b; b="$(_claude_zen_find_claude)"
     "$b" "$@"
@@ -1133,6 +1302,7 @@ claude_zen_proxy_status() {
 
 alias cz='claude_zen_launch'
 alias cz-new='claude_zen_launch'
+alias cz-danger='claude_zen_launch_danger'
 alias cz-cloud='claude_zen_cloud_launch'
 ccz() { local b; b="$(_claude_zen_find_claude)"; "$b" --continue "$@"; }
 alias cz-model='claude_zen_pick_model'
@@ -1140,6 +1310,7 @@ alias cz-model-current='claude_zen_current_model'
 alias cz-proxy-start='claude_zen_proxy_start'
 alias cz-proxy-stop='claude_zen_proxy_stop'
 alias cz-proxy-status='claude_zen_proxy_status'
+alias cz-undo-danger='claude_zen_uninstall_danger_rules'
 __MARKER_END__
 WRAPEOF
 }
@@ -1255,11 +1426,13 @@ cat << SUMMARY
 
   Commands:
     cz              Pick a model -> launch Claude CLI
+    cz-danger       Pick a model -> launch Claude CLI (auto-accept permissions)
     cz-model        Pick a model (no launch)
     cz-model-current  Show current model (provider + model name)
     cz-proxy-start  Start the proxy daemon
     cz-proxy-stop   Stop it
     cz-proxy-status Check if running
+    cz-undo-danger  Remove danger guardrails from workspace CLAUDE.md
 
   Models are organized by family (Claude, GPT, Gemini, DeepSeek, etc.)
   Edit backends.json to add/remove models:
