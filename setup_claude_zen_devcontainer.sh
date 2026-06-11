@@ -11,9 +11,12 @@
 #  2. Creates a standalone translation proxy (proxy.py)
 #  3. Creates a JSON backends configuration file
 #  4. Creates shell aliases for launching Claude CLI through the proxy
-#  5. Creates a symlink so Claude Code's memory persists across devcontainer rebuilds:
+#  5. Migrates ~/.claude/ to the workspace ($SCRIPT_DIR/.claude_persist/) for full
+#     session/config persistence across devcontainer rebuilds via symlink
+#  6. Creates a symlink so Claude Code's memory survives rebuilds:
 #     $HOME/.claude/projects/<slug>/memory/ → $SCRIPT_DIR/.ai_memory/
-#  6. All state lives in .claude_config_zen/ or .ai_memory/ — does NOT touch .claude_config/
+#  7. All state lives in .claude_config_zen/, .ai_memory/, or .claude_persist/
+#     — critical data is never lost on rebuild
 #
 # ── How the proxy works ───────────────────────────────────────────────────────
 #   Claude CLI speaks the Anthropic Messages API (POST /v1/messages with SSE).
@@ -141,6 +144,10 @@
 #   └── (research files)     Claude Code memory files (symlinked from home folder)
 #                            Persists across devcontainer rebuilds
 #
+#   .claude_persist/
+#   └── (full ~/.claude copy) Migrated Claude config, sessions, tasks, history
+#                              Survives devcontainer rebuild via symlink:
+#                              ~/.claude -> .claude_persist/
 # ==============================================================================
 set -euo pipefail
 
@@ -1160,17 +1167,49 @@ PY
 
 _install_shell_wrappers
 
-# ─── 7. Claude Memory persistence ────────────────────────────────────────────
-printf '\n%s\n' "=== Step 7: Claude Memory persistence ==="
+# ─── 7. Claude Code persistence (survives devcontainer rebuild) ─────────────
+printf '\n%s\n' "=== Step 7: Claude Code persistence ==="
+# The home directory (overlay) is wiped on devcontainer rebuild, but /workspace
+# (host-mounted volume) persists. We migrate Claude Code's entire ~/.claude/
+# config directory to the workspace and symlink it back, then also link the
+# .ai_memory/ research files into the per-project memory slot.
+
+CLAUDE_PERSIST_DIR="${SCRIPT_DIR}/.claude_persist"
+CLAUDE_MEMORY_DIR="${SCRIPT_DIR}/.ai_memory"
+mkdir -p "${CLAUDE_MEMORY_DIR}"
+
+# ── 7a. Migrate ~/.claude → workspace ──────────────────────────────────────
+if [ -L "${HOME}/.claude" ]; then
+    CURRENT_TARGET="$(readlink "${HOME}/.claude")"
+    if [ "${CURRENT_TARGET}" = "${CLAUDE_PERSIST_DIR}" ]; then
+        printf '  ~/.claude already symlinked to workspace: %s\n' "${CLAUDE_PERSIST_DIR}"
+    else
+        printf '  ~/.claude symlinked to: %s (unexpected, leaving as-is)\n' "${CURRENT_TARGET}"
+    fi
+elif [ -d "${HOME}/.claude" ]; then
+    if [ -d "${CLAUDE_PERSIST_DIR}" ]; then
+        printf '  WARNING: Both ~/.claude and %s exist. Remove one manually.\n' "${CLAUDE_PERSIST_DIR}"
+    else
+        printf '  Migrating ~/.claude to %s ...\n' "${CLAUDE_PERSIST_DIR}"
+        cp -a "${HOME}/.claude" "${CLAUDE_PERSIST_DIR}" && \
+        rm -rf "${HOME}/.claude" && \
+        ln -s "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude" && \
+        printf '  Done: ~/.claude -> %s\n' "${CLAUDE_PERSIST_DIR}"
+    fi
+else
+    # ~/.claude doesn't exist yet; just create the symlink so future runs store data
+    # in the workspace. Claude Code will create the directory structure on first use.
+    if [ ! -d "${CLAUDE_PERSIST_DIR}" ]; then
+        mkdir -p "${CLAUDE_PERSIST_DIR}"
+    fi
+    ln -s "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
+    printf '  Created: ~/.claude -> %s (empty, populated on first Claude launch)\n' "${CLAUDE_PERSIST_DIR}"
+fi
+
+# ── 7b. Symlink per-project memory into .ai_memory ──────────────────────────
 # Claude Code stores memory at $HOME/.claude/projects/<workspace-slug>/memory/
 # The slug is the absolute workspace path with '/' replaced by '-'
 # e.g. /workspace -> -workspace
-# This directory is in the home folder which is wiped on devcontainer rebuild.
-# We symlink it to the workspace's .ai_memory/ so research survives rebuilds.
-CLAUDE_MEMORY_TARGET="${SCRIPT_DIR}/.ai_memory"
-mkdir -p "${CLAUDE_MEMORY_TARGET}"
-
-# Derive the workspace slug from the git root (or script dir if not a git repo)
 WORKSPACE_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || realpath "${SCRIPT_DIR}")"
 WORKSPACE_SLUG="$(echo "${WORKSPACE_ROOT}" | tr '/' '-')"
 CLAUDE_MEMORY_LINK="${HOME}/.claude/projects/${WORKSPACE_SLUG}/memory"
@@ -1179,15 +1218,11 @@ mkdir -p "$(dirname "${CLAUDE_MEMORY_LINK}")"
 if [ -e "${CLAUDE_MEMORY_LINK}" ] && [ ! -L "${CLAUDE_MEMORY_LINK}" ]; then
     printf '  WARNING: %s exists and is not a symlink. Skipping.\n' "${CLAUDE_MEMORY_LINK}"
 elif [ -L "${CLAUDE_MEMORY_LINK}" ]; then
-    ln -sfn "${CLAUDE_MEMORY_TARGET}" "${CLAUDE_MEMORY_LINK}"
-    printf '  Updated symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_TARGET}"
+    ln -sfn "${CLAUDE_MEMORY_DIR}" "${CLAUDE_MEMORY_LINK}"
+    printf '  Updated memory symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_DIR}"
 else
-    ln -s "${CLAUDE_MEMORY_TARGET}" "${CLAUDE_MEMORY_LINK}"
-    printf '  Created symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_TARGET}"
-fi
-# Also ensure the .ai_memory has a MEMORY.md index visible through the symlink
-if [ ! -f "${CLAUDE_MEMORY_TARGET}/MEMORY.md" ]; then
-    printf '  Note: Create ${CLAUDE_MEMORY_TARGET}/MEMORY.md to catalog research files.\n'
+    ln -s "${CLAUDE_MEMORY_DIR}" "${CLAUDE_MEMORY_LINK}"
+    printf '  Created memory symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_DIR}"
 fi
 
 # ─── 8. Verify ────────────────────────────────────────────────────────────────
@@ -1212,7 +1247,8 @@ cat << SUMMARY
   Persistence:  ${PERSISTENCE_DIR}
   Backends:     ${BACKENDS_FILE}
   Proxy port:   ${PROXY_PORT}
-  Memory:       ${CLAUDE_MEMORY_TARGET}
+  Claude home:  ${CLAUDE_PERSIST_DIR} (symlinked to ~/.claude)
+  Memory files: ${CLAUDE_MEMORY_DIR}
   Memory link:  ${CLAUDE_MEMORY_LINK}
 
   Activate:     source ~/${SHELL_RC}
