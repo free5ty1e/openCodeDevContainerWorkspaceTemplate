@@ -1326,42 +1326,29 @@ _claude_zen_persist_dir() {
     readlink -f "${HOME}/.claude" 2>/dev/null || echo "${workspace_root}/.claude_persist"
 }
 
-# ── Model helper: read the last-selected model ──────────────────────────
-# Returns the model name (e.g. "big-pickle") from selected-model file.
-# The file stores "provider_id|model_name". If no model saved, prompts.
-_claude_zen_get_current_model() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local f="${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    if [ -f "$f" ]; then
-        local sel
-        read -r sel < "$f"
-        if [[ "$sel" == *"|"* ]]; then
-            echo "${sel#*|}"
-            return 0
-        else
-            echo "$sel"
-            return 0
-        fi
-    fi
-    # No model saved — prompt user to pick one
-    local picked
-    picked="$(_claude_zen_pick)" || return 1
-    # Save it
-    mkdir -p "$dir"
-    printf '%s\n' "$picked" > "$f"
-    if [[ "$picked" == *"|"* ]]; then
-        echo "${picked#*|}"
-    else
-        echo "$picked"
-    fi
-}
-
 claude_zen_list_recent() {
-    local persist claude_bin danger_mode dir workspace_root backup_file
+    local persist claude_bin danger_mode dir workspace_root backup_file sel provider_id model_name
     danger_mode=0
     if [ "${1:-}" = "--danger" ]; then
         danger_mode=1
         shift
+    fi
+    sel="$(_claude_zen_pick)" || return 1
+    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    mkdir -p "$dir"
+    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
+    if [[ "$sel" == *"|"* ]]; then
+        provider_id="${sel%%|*}"
+        model_name="${sel#*|}"
+    else
+        provider_id="$sel"
+        model_name=$(python3 -c "
+    import json
+    with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
+        cfg = json.load(f)
+    bc = cfg.get('$sel', {})
+    print(bc.get('model', '') or bc.get('provider_name', '$sel'))
+    " 2>/dev/null)
     fi
     persist="$(_claude_zen_persist_dir)"
     if [ ! -f "${persist}/history.jsonl" ]; then
@@ -1415,8 +1402,6 @@ else:
     sys.exit(1)
 PY
 ) || { printf 'Invalid choice.\n' >&2; return 1; }
-            local model_name
-            model_name="$(_claude_zen_get_current_model)" || model_name=""
             _claude_zen_ensure_proxy || true
             printf 'Resuming session %s...\n' "${sid}"
             if [ "$danger_mode" -eq 1 ]; then
@@ -1424,12 +1409,14 @@ PY
                 workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
                 backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
                 printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
-                env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+                env ZEN_DEFAULT_PROVIDER="${provider_id}" \
+                    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
                     ANTHROPIC_API_KEY="freecc" \
                     "${claude_bin}" --model "${model_name}" --resume "${sid}" --dangerously-skip-permissions "$@"
                 _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
             else
-                exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+                exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
+                    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
                     ANTHROPIC_API_KEY="freecc" \
                     "${claude_bin}" --model "${model_name}" --resume "${sid}" "$@"
             fi
@@ -1444,21 +1431,39 @@ claude_zen_resume_last() {
         danger_mode=1
         shift
     fi
+    local sel provider_id model_name
+    sel="$(_claude_zen_pick)" || return 1
+    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    mkdir -p "$dir"
+    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
+    if [[ "$sel" == *"|"* ]]; then
+        provider_id="${sel%%|*}"
+        model_name="${sel#*|}"
+    else
+        provider_id="$sel"
+        model_name=$(python3 -c "
+    import json
+    with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
+        cfg = json.load(f)
+    bc = cfg.get('$sel', {})
+    print(bc.get('model', '') or bc.get('provider_name', '$sel'))
+    " 2>/dev/null)
+    fi
     claude_bin="$(_claude_zen_find_claude)" || return 1
-    local model_name
-    model_name="$(_claude_zen_get_current_model)" || model_name=""
     _claude_zen_ensure_proxy || true
     if [ "$danger_mode" -eq 1 ]; then
         dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
         workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
         backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
         printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
-        env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+        env ZEN_DEFAULT_PROVIDER="${provider_id}" \
+            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
             "${claude_bin}" --model "${model_name}" --continue --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
     else
-        exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+        exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
+            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
             "${claude_bin}" --model "${model_name}" --continue "$@"
     fi
@@ -1474,9 +1479,25 @@ claude_zen_quick_resume() {
         shift
     fi
     sid="$1"; shift
+    local sel provider_id model_name
     claude_bin="$(_claude_zen_find_claude)" || return 1
-    local model_name
-    model_name="$(_claude_zen_get_current_model)" || model_name=""
+    sel="$(_claude_zen_pick)" || return 1
+    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    mkdir -p "$dir"
+    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
+    if [[ "$sel" == *"|"* ]]; then
+        provider_id="${sel%%|*}"
+        model_name="${sel#*|}"
+    else
+        provider_id="$sel"
+        model_name=$(python3 -c "
+    import json
+    with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
+        cfg = json.load(f)
+    bc = cfg.get('$sel', {})
+    print(bc.get('model', '') or bc.get('provider_name', '$sel'))
+    " 2>/dev/null)
+    fi
     _claude_zen_ensure_proxy || true
     # Find the session file and extract the sessionId from its first line
     target=""
@@ -1501,12 +1522,14 @@ claude_zen_quick_resume() {
         workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
         backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
         printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
-        env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+        env ZEN_DEFAULT_PROVIDER="${provider_id}" \
+            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
             "${claude_bin}" --model "${model_name}" --resume "$session_id" --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
     else
-        exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+        exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
+            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
             "${claude_bin}" --model "${model_name}" --resume "$session_id" "$@"
     fi
