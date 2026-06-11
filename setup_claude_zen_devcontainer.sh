@@ -1326,6 +1326,36 @@ _claude_zen_persist_dir() {
     readlink -f "${HOME}/.claude" 2>/dev/null || echo "${workspace_root}/.claude_persist"
 }
 
+# ── Model helper: read the last-selected model ──────────────────────────
+# Returns the model name (e.g. "big-pickle") from selected-model file.
+# The file stores "provider_id|model_name". If no model saved, prompts.
+_claude_zen_get_current_model() {
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local f="${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
+    if [ -f "$f" ]; then
+        local sel
+        read -r sel < "$f"
+        if [[ "$sel" == *"|"* ]]; then
+            echo "${sel#*|}"
+            return 0
+        else
+            echo "$sel"
+            return 0
+        fi
+    fi
+    # No model saved — prompt user to pick one
+    local picked
+    picked="$(_claude_zen_pick)" || return 1
+    # Save it
+    mkdir -p "$dir"
+    printf '%s\n' "$picked" > "$f"
+    if [[ "$picked" == *"|"* ]]; then
+        echo "${picked#*|}"
+    else
+        echo "$picked"
+    fi
+}
+
 claude_zen_list_recent() {
     local persist claude_bin danger_mode dir workspace_root backup_file
     danger_mode=0
@@ -1385,6 +1415,9 @@ else:
     sys.exit(1)
 PY
 ) || { printf 'Invalid choice.\n' >&2; return 1; }
+            local model_name
+            model_name="$(_claude_zen_get_current_model)" || model_name=""
+            _claude_zen_ensure_proxy || true
             printf 'Resuming session %s...\n' "${sid}"
             if [ "$danger_mode" -eq 1 ]; then
                 dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
@@ -1393,12 +1426,12 @@ PY
                 printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
                 env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
                     ANTHROPIC_API_KEY="freecc" \
-                    "${claude_bin}" --resume "${sid}" --dangerously-skip-permissions "$@"
+                    "${claude_bin}" --model "${model_name}" --resume "${sid}" --dangerously-skip-permissions "$@"
                 _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
             else
                 exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
                     ANTHROPIC_API_KEY="freecc" \
-                    "${claude_bin}" --resume "${sid}" "$@"
+                    "${claude_bin}" --model "${model_name}" --resume "${sid}" "$@"
             fi
             ;;
     esac
@@ -1412,6 +1445,9 @@ claude_zen_resume_last() {
         shift
     fi
     claude_bin="$(_claude_zen_find_claude)" || return 1
+    local model_name
+    model_name="$(_claude_zen_get_current_model)" || model_name=""
+    _claude_zen_ensure_proxy || true
     if [ "$danger_mode" -eq 1 ]; then
         dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
         workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
@@ -1419,12 +1455,12 @@ claude_zen_resume_last() {
         printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
         env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
-            "${claude_bin}" --continue --dangerously-skip-permissions "$@"
+            "${claude_bin}" --model "${model_name}" --continue --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
     else
         exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
-            "${claude_bin}" --continue "$@"
+            "${claude_bin}" --model "${model_name}" --continue "$@"
     fi
 }
 
@@ -1439,6 +1475,9 @@ claude_zen_quick_resume() {
     fi
     sid="$1"; shift
     claude_bin="$(_claude_zen_find_claude)" || return 1
+    local model_name
+    model_name="$(_claude_zen_get_current_model)" || model_name=""
+    _claude_zen_ensure_proxy || true
     # Find the session file and extract the sessionId from its first line
     target=""
     for f in "$(_claude_zen_persist_dir)/projects/-workspace/"*.jsonl; do
@@ -1464,12 +1503,12 @@ claude_zen_quick_resume() {
         printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
         env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
-            "${claude_bin}" --resume "$session_id" --dangerously-skip-permissions "$@"
+            "${claude_bin}" --model "${model_name}" --resume "$session_id" --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
     else
         exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
-            "${claude_bin}" --resume "$session_id" "$@"
+            "${claude_bin}" --model "${model_name}" --resume "$session_id" "$@"
     fi
 }
 
