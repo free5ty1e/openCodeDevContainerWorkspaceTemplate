@@ -11,7 +11,9 @@
 #  2. Creates a standalone translation proxy (proxy.py)
 #  3. Creates a JSON backends configuration file
 #  4. Creates shell aliases for launching Claude CLI through the proxy
-#  5. All state lives in .claude_config_zen/ — does NOT touch .claude_config/
+#  5. Creates a symlink so Claude Code's memory persists across devcontainer rebuilds:
+#     $HOME/.claude/projects/<slug>/memory/ → $SCRIPT_DIR/.ai_memory/
+#  6. All state lives in .claude_config_zen/ or .ai_memory/ — does NOT touch .claude_config/
 #
 # ── How the proxy works ───────────────────────────────────────────────────────
 #   Claude CLI speaks the Anthropic Messages API (POST /v1/messages with SSE).
@@ -124,6 +126,10 @@
 #   ├── proxy.log            Proxy daemon log
 #   └── proxy.pid            Proxy daemon PID
 #
+#   .ai_memory/
+#   └── (research files)     Claude Code memory files (symlinked from home folder)
+#                            Persists across devcontainer rebuilds
+#
 # ==============================================================================
 set -euo pipefail
 
@@ -185,7 +191,7 @@ fi
 printf '\n%s\n' "=== Step 3: Persistence dir ==="
 mkdir -p "${PERSISTENCE_DIR}"
 
-# ─── 3. Proxy script ──────────────────────────────────────────────────────────
+# ─── 4. Proxy script ──────────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 4: Proxy script ==="
 cat > "${PROXY_SCRIPT}" << 'PYEOF'
 """Lightweight Anthropic-to-OpenAI translation proxy.
@@ -769,7 +775,7 @@ PYEOF
 chmod +x "${PROXY_SCRIPT}"
 printf '  Created %s\n' "${PROXY_SCRIPT}"
 
-# ─── 4. Backends config ───────────────────────────────────────────────────────
+# ─── 5. Backends config ───────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 5: Backends config ==="
 if [ ! -f "${BACKENDS_FILE}" ]; then
     cat > "${BACKENDS_FILE}" << JSONEOF
@@ -802,7 +808,7 @@ else
     printf '  Already exists: %s\n' "${BACKENDS_FILE}"
 fi
 
-# ─── 5. Shell wrappers ────────────────────────────────────────────────────────
+# ─── 6. Shell wrappers ────────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 6: Shell wrappers ==="
 
 _wrapper_block() {
@@ -1011,8 +1017,38 @@ PY
 
 _install_shell_wrappers
 
-# ─── 6. Verify ────────────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 7: Smoke test ==="
+# ─── 7. Claude Memory persistence ────────────────────────────────────────────
+printf '\n%s\n' "=== Step 7: Claude Memory persistence ==="
+# Claude Code stores memory at $HOME/.claude/projects/<workspace-slug>/memory/
+# The slug is the absolute workspace path with '/' replaced by '-'
+# e.g. /workspace -> -workspace
+# This directory is in the home folder which is wiped on devcontainer rebuild.
+# We symlink it to the workspace's .ai_memory/ so research survives rebuilds.
+CLAUDE_MEMORY_TARGET="${SCRIPT_DIR}/.ai_memory"
+mkdir -p "${CLAUDE_MEMORY_TARGET}"
+
+# Derive the workspace slug from the git root (or script dir if not a git repo)
+WORKSPACE_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || realpath "${SCRIPT_DIR}")"
+WORKSPACE_SLUG="$(echo "${WORKSPACE_ROOT}" | tr '/' '-')"
+CLAUDE_MEMORY_LINK="${HOME}/.claude/projects/${WORKSPACE_SLUG}/memory"
+
+mkdir -p "$(dirname "${CLAUDE_MEMORY_LINK}")"
+if [ -e "${CLAUDE_MEMORY_LINK}" ] && [ ! -L "${CLAUDE_MEMORY_LINK}" ]; then
+    printf '  WARNING: %s exists and is not a symlink. Skipping.\n' "${CLAUDE_MEMORY_LINK}"
+elif [ -L "${CLAUDE_MEMORY_LINK}" ]; then
+    ln -sfn "${CLAUDE_MEMORY_TARGET}" "${CLAUDE_MEMORY_LINK}"
+    printf '  Updated symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_TARGET}"
+else
+    ln -s "${CLAUDE_MEMORY_TARGET}" "${CLAUDE_MEMORY_LINK}"
+    printf '  Created symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_TARGET}"
+fi
+# Also ensure the .ai_memory has a MEMORY.md index visible through the symlink
+if [ ! -f "${CLAUDE_MEMORY_TARGET}/MEMORY.md" ]; then
+    printf '  Note: Create ${CLAUDE_MEMORY_TARGET}/MEMORY.md to catalog research files.\n'
+fi
+
+# ─── 8. Verify ────────────────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 8: Smoke test ==="
 if python3 -c "
 import sys; sys.path.insert(0, '${PERSISTENCE_DIR}')
 from proxy import app
@@ -1023,7 +1059,7 @@ else
     printf '  Warning: smoke test failed (proxy module may have syntax errors)\n'
 fi
 
-# ─── 7. Summary ───────────────────────────────────────────────────────────────
+# ─── 9. Summary ───────────────────────────────────────────────────────────────
 SHELL_RC=".bashrc"; case "${SHELL:-}" in *zsh) SHELL_RC=".zshrc" ;; esac
 
 cat << SUMMARY
@@ -1033,6 +1069,8 @@ cat << SUMMARY
   Persistence:  ${PERSISTENCE_DIR}
   Backends:     ${BACKENDS_FILE}
   Proxy port:   ${PROXY_PORT}
+  Memory:       ${CLAUDE_MEMORY_TARGET}
+  Memory link:  ${CLAUDE_MEMORY_LINK}
 
   Activate:     source ~/${SHELL_RC}
 
