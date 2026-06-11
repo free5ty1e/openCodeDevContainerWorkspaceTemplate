@@ -38,7 +38,7 @@
 # ── Quick start ───────────────────────────────────────────────────────────────
 #   ./setup_claude_zen_devcontainer.sh
 #   source ~/.zshrc
-#   cz         # pick a backend model → Claude CLI launches with Big Pickle
+#   cz         # pick a model from any family → Claude CLI launches with it
 #
 # ── Testing / validation ───────────────────────────────────────────────────────
 #   After setup, verify the proxy works end-to-end:
@@ -53,28 +53,28 @@
 #   3. Test non-streaming chat via proxy (single JSON response):
 #        curl -s -X POST http://127.0.0.1:8083/v1/messages \
 #          -H "Content-Type: application/json" -H "x-api-key: test" \
-#          -d '{"model":"big-pickle","max_tokens":50,"messages":[{"role":"user","content":"Say hi in one word"}],"stream":false}' \
+#          -d '{"model":"claude-fable-5","max_tokens":50,"messages":[{"role":"user","content":"Say hi in one word"}],"stream":false}' \
 #          | python3 -m json.tool
 #      Expected: response with content[].text like "Hi"
 #
 #   4. Test streaming chat via proxy (SSE events):
 #        curl -s -N -X POST http://127.0.0.1:8083/v1/messages \
 #          -H "Content-Type: application/json" -H "x-api-key: test" \
-#          -d '{"model":"big-pickle","max_tokens":100,"messages":[{"role":"user","content":"Say hi in one word"}],"stream":true}'
+#          -d '{"model":"claude-fable-5","max_tokens":100,"messages":[{"role":"user","content":"Say hi in one word"}],"stream":true}'
 #      Expected: SSE events: message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop
 #
 #   5. Test end-to-end with Claude Code CLI print mode:
 #        echo "Say hi" | ANTHROPIC_BASE_URL=http://127.0.0.1:8083 ANTHROPIC_API_KEY=test \
-#          /path/to/claude --print --model big-pickle
+#          /path/to/claude --print --model claude-fable-5
 #      Expected: Claude responds via the proxy (exit 0, prints response)
 #
 #   6. Use the shell wrapper (recommended):
 #        source ~/.zshrc
 #        echo "What model are you?" | cz -p
-#      Expected: Claude responds mentioning Big Pickle / zen backend
+#      Expected: Claude responds via the proxy
 #
 # ── After setup: shell aliases ────────────────────────────────────────────────
-#   cz              Pick a backend model and launch Claude CLI through the proxy
+#   cz              Pick a model and launch Claude CLI through the proxy
 #   cz-new          Same as cz
 #   cz-cloud        Launch Claude CLI directly (cloud, no proxy)
 #   ccz             Continue most recent Claude cloud session
@@ -91,8 +91,16 @@
 #     "zen": {
 #       "base_url": "https://opencode.ai/zen/v1",
 #       "api_key_env": "ZEN_API_KEY",
-#       "model": "big-pickle",
-#       "provider_name": "ZEN"
+#       "model": "",
+#       "provider_name": "ZEN",
+#       "models": {
+#         "Claude":     ["claude-fable-5", "claude-opus-4-8", ...],
+#         "GPT":        ["gpt-5.5", "gpt-5.5-pro", ...],
+#         "Gemini":     ["gemini-3.5-flash", ...],
+#         "DeepSeek":   [...],
+#         "Other":      [...],
+#         "Free":       [...]
+#       }
 #     },
 #     "openai": {
 #       "base_url": "https://api.openai.com/v1",
@@ -101,6 +109,9 @@
 #       "provider_name": "OpenAI"
 #     }
 #   }
+#
+# Set "model" to "" for Zen to pass through any model from the picker.
+# Add/remove models under the "models" dict to customize your list.
 #
 # ── Environment variables ─────────────────────────────────────────────────────
 #   CLAUDE_ZEN_CONFIG_DIR   Override persistence dir (default: .claude_config_zen)
@@ -234,6 +245,7 @@ class Backend:
     api_key: str
     model: str
     provider_name: str = ""
+    models: dict | None = None
 
 # ---------------------------------------------------------------------------
 # Anthropic → OpenAI request conversion (adapted from claude-code-proxy)
@@ -477,6 +489,7 @@ def load_backends(path: Path) -> dict[str, Backend]:
             api_key=api_key,
             model=info.get("model", ""),
             provider_name=info.get("provider_name", pid.upper()),
+            models=info.get("models"),
         )
     return result
 
@@ -549,14 +562,25 @@ async def probe_messages():
 async def list_models():
     models = []
     for pid, be in backends.items():
-        model_id = be.model or f"{pid}/default"
         display = be.provider_name or pid
-        models.append({
-            "id": model_id,
-            "display_name": f"{display} ({model_id})",
-            "created_at": "2025-01-01T00:00:00Z",
-            "type": "model",
-        })
+        # If backend has a models dict, list all models from it
+        if be.models:
+            for family, model_list in be.models.items():
+                for m in model_list:
+                    models.append({
+                        "id": m,
+                        "display_name": f"{display} {family} ({m})",
+                        "created_at": "2025-01-01T00:00:00Z",
+                        "type": "model",
+                    })
+        else:
+            model_id = be.model or f"{pid}/default"
+            models.append({
+                "id": model_id,
+                "display_name": f"{display} ({model_id})",
+                "created_at": "2025-01-01T00:00:00Z",
+                "type": "model",
+            })
     return {"data": models}
 
 
@@ -784,8 +808,72 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
         "base_url": "https://opencode.ai/zen/v1",
         "api_key_env": "ZEN_API_KEY",
         "api_key": "",
-        "model": "big-pickle",
-        "provider_name": "ZEN"
+        "model": "",
+        "provider_name": "ZEN",
+        "models": {
+            "Claude": [
+                "claude-fable-5",
+                "claude-opus-4-8",
+                "claude-opus-4-7",
+                "claude-opus-4-6",
+                "claude-opus-4-5",
+                "claude-opus-4-1",
+                "claude-sonnet-4-6",
+                "claude-sonnet-4-5",
+                "claude-sonnet-4",
+                "claude-haiku-4-5"
+            ],
+            "GPT": [
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+                "gpt-5.4-mini",
+                "gpt-5.4-nano",
+                "gpt-5.3-codex-spark",
+                "gpt-5.3-codex",
+                "gpt-5.2",
+                "gpt-5.2-codex",
+                "gpt-5.1",
+                "gpt-5.1-codex-max",
+                "gpt-5.1-codex",
+                "gpt-5.1-codex-mini",
+                "gpt-5",
+                "gpt-5-codex",
+                "gpt-5-nano"
+            ],
+            "Gemini": [
+                "gemini-3.5-flash",
+                "gemini-3.1-pro",
+                "gemini-3-flash"
+            ],
+            "DeepSeek": [
+                "deepseek-v4-pro",
+                "deepseek-v4-flash"
+            ],
+            "xAI": [
+                "grok-build-0.1"
+            ],
+            "Other": [
+                "glm-5.1",
+                "glm-5",
+                "minimax-m2.7",
+                "minimax-m2.5",
+                "kimi-k2.6",
+                "kimi-k2.5",
+                "qwen3.6-plus",
+                "qwen3.5-plus",
+                "big-pickle"
+            ],
+            "Free": [
+                "deepseek-v4-flash-free",
+                "mimo-v2.5-free",
+                "qwen3.6-plus-free",
+                "minimax-m3-free",
+                "nemotron-3-ultra-free",
+                "north-mini-code-free"
+            ]
+        }
     },
     "openai": {
         "base_url": "https://api.openai.com/v1",
@@ -844,23 +932,52 @@ try:
         cfg = json.load(fh)
 except Exception as e:
     print(f"Error loading backends: {e}", file=sys.stderr); sys.exit(1)
+
+# Build model entries list: (label, provider_id, model_name)
 entries = []
 for pid, bc in cfg.items():
     if not isinstance(bc, dict): continue
     pname = bc.get("provider_name", pid)
+
+    # Backend with multiple models grouped by family (e.g. Zen)
+    models_dict = bc.get("models")
+    if models_dict and isinstance(models_dict, dict):
+        for family in sorted(models_dict.keys()):
+            for m in models_dict[family]:
+                entries.append((f"{family} > {m}", pid, m))
+        continue
+
+    # Traditional single-model backend
     model = bc.get("model", "")
     label = f"{model} ({pname})" if model else pname
-    entries.append((label, pid))
+    entries.append((label, pid, model or ""))
+
 entries.sort(key=lambda x: x[0].lower())
-for i, (label, ref) in enumerate(entries, 1):
-    print(f"  {i}) {label}", file=sys.stderr)
-print("Select backend:", file=sys.stderr)
+
+# Show Zen models in a separate section from other providers
+zen_count = sum(1 for e in entries if e[1] == "zen")
+if zen_count > 1:
+    print(f"\n{' ZEN Models ':-^50}", file=sys.stderr)
+    for i, (label, pid, model) in enumerate(entries, 1):
+        if pid == "zen":
+            print(f"  {i:>3}) {label}", file=sys.stderr)
+    print(f"{' Other Providers ':-^50}", file=sys.stderr)
+    for i, (label, pid, model) in enumerate(entries, 1):
+        if pid != "zen":
+            print(f"  {i:>3}) {label}", file=sys.stderr)
+else:
+    for i, (label, pid, model) in enumerate(entries, 1):
+        print(f"  {i:>3}) {label}", file=sys.stderr)
+
+print("\nSelect model:", file=sys.stderr)
 with open("/dev/tty", "r", encoding="utf-8") as tty:
     c = tty.readline().strip()
 if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
 p = int(c) - 1
 if p < 0 or p >= len(entries): print("Out of range.", file=sys.stderr); sys.exit(1)
-print(entries[p][1])
+
+# Output: provider_id|model_name
+print(f"{entries[p][1]}|{entries[p][2]}")
 PY
 }
 
@@ -919,22 +1036,30 @@ _claude_zen_find_claude() {
 }
 
 claude_zen_launch() {
-    local sel model_name claude_bin dir
+    local sel provider_id model_name claude_bin dir
     sel="$(_claude_zen_pick)" || return 1
     dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
     mkdir -p "$dir"
     printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    model_name=$(python3 -c "
+    # Parse provider_id|model_name format
+    if [[ "$sel" == *"|"* ]]; then
+        provider_id="${sel%%|*}"
+        model_name="${sel#*|}"
+    else
+        # Legacy format: just provider_id
+        provider_id="$sel"
+        model_name=$(python3 -c "
 import json
 with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
     cfg = json.load(f)
 bc = cfg.get('$sel', {})
 print(bc.get('model', '') or bc.get('provider_name', '$sel'))
 " 2>/dev/null)
-    printf 'Backend: %s  (%s)\n' "$sel" "$model_name"
+    fi
+    printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
     _claude_zen_ensure_proxy || true
     claude_bin="$(_claude_zen_find_claude)"
-    ZEN_DEFAULT_PROVIDER="$sel" \
+    ZEN_DEFAULT_PROVIDER="$provider_id" \
     ANTHROPIC_API_KEY="freecc" \
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
     "$claude_bin" --model "$model_name" "$@"
@@ -946,17 +1071,35 @@ claude_zen_cloud_launch() {
 }
 
 claude_zen_pick_model() {
-    local sel dir
+    local sel provider_id model_name dir
     sel="$(_claude_zen_pick)" || return 1
     dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
     mkdir -p "$dir"
     printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    printf 'Backend: %s\n' "$sel"
+    if [[ "$sel" == *"|"* ]]; then
+        provider_id="${sel%%|*}"
+        model_name="${sel#*|}"
+        printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
+    else
+        printf 'Backend: %s\n' "$sel"
+    fi
 }
 
 claude_zen_current_model() {
-    local f="${CLAUDE_ZEN_MODEL_FILE:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}/selected-model}"
-    [ -f "$f" ] && cat "$f" || echo "No model selected (run cz-model)"
+    local f provider_id model_name
+    f="${CLAUDE_ZEN_MODEL_FILE:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}/selected-model}"
+    if [ -f "$f" ]; then
+        read -r sel < "$f"
+        if [[ "$sel" == *"|"* ]]; then
+            provider_id="${sel%%|*}"
+            model_name="${sel#*|}"
+            printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
+        else
+            printf 'Backend: %s\n' "$sel"
+        fi
+    else
+        echo "No model selected (run cz-model)"
+    fi
 }
 
 claude_zen_proxy_start() { _claude_zen_ensure_proxy; }
@@ -1075,14 +1218,15 @@ cat << SUMMARY
   Activate:     source ~/${SHELL_RC}
 
   Commands:
-    cz              Pick a backend -> launch Claude CLI
-    cz-model        Pick a backend (no launch)
-    cz-model-current  Show current backend
+    cz              Pick a model -> launch Claude CLI
+    cz-model        Pick a model (no launch)
+    cz-model-current  Show current model (provider + model name)
     cz-proxy-start  Start the proxy daemon
     cz-proxy-stop   Stop it
     cz-proxy-status Check if running
 
-  To add more backends (OpenAI, Groq, Together, etc.):
+  Models are organized by family (Claude, GPT, Gemini, DeepSeek, etc.)
+  Edit backends.json to add/remove models:
     ${BACKENDS_FILE}
 
 SUMMARY
