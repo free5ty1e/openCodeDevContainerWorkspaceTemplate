@@ -64,6 +64,27 @@ else
 fi
 MODEL_FILE="${PERSISTENCE_DIR}/selected-ollama-model"
 NPM_GLOBAL_DIR="${HOME}/.npm-global"
+# NOTE: Claude Code hard-clamps output tokens to 128000 internally; no env var can
+# exceed that. The "output token maximum" error is almost always a runaway model,
+# not a real limit. The actual fix is NUM_CTX below (see comment), which lets the
+# model fit Claude Code's large prompt so it stops naturally instead of rambling.
+# This value is still exported for the direct `claude`/`c-cloud` path.
+MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}"
+# Context window (num_ctx) baked into a derived Ollama model variant at launch.
+# Ollama serves models at a small default context (~4096) regardless of the
+# model's architectural maximum, which truncates Claude Code's large system
+# prompt and makes models ramble until they hit the output-token ceiling. Baking
+# a large num_ctx into a `<model>-ctx<N>` variant fixes this. Override by
+# exporting CLAUDE_OLLAMA_NUM_CTX before running this script. Set to 0 to disable.
+# With 48+ GB VRAM, 262144 (gemma4's max) is safe; tune down for lower VRAM.
+# NOTE: intentionally NOT reading from CLAUDE_OLLAMA_NUM_CTX here — the setup
+# script bakes the default unconditionally so re-running the script always
+# upgrades the wrapper to the latest defaults. Per-launch overrides like
+# 'CLAUDE_OLLAMA_NUM_CTX=131072 c' still work inside the shell.
+NUM_CTX="${CLAUDE_OLLAMA_NUM_CTX_SETUP:-262144}"
+# Thinking token budget and effort defaults. Same baking strategy as NUM_CTX.
+MAX_THINKING_TOKENS_DEFAULT="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS_SETUP:-16384}"
+EFFORT_DEFAULT="${CLAUDE_OLLAMA_EFFORT_SETUP:-low}"
 MARKER_BEGIN="# >>> claude-ollama-devcontainer >>>"
 MARKER_END="# <<< claude-ollama-devcontainer <<<"
 
@@ -204,19 +225,42 @@ build_wrapper_block() {
         -e "s|__MARKER_END__|${MARKER_END}|g" \
         -e "s|__LLM_HOST__|${LLM_HOST}|g" \
         -e "s|__NPM_GLOBAL_DIR__|${NPM_GLOBAL_DIR}|g" \
+        -e "s|__MAX_OUTPUT_TOKENS__|${MAX_OUTPUT_TOKENS}|g" \
+        -e "s|__NUM_CTX__|${NUM_CTX}|g" \
+        -e "s|__MAX_THINKING_TOKENS__|${MAX_THINKING_TOKENS_DEFAULT}|g" \
+        -e "s|__EFFORT_DEFAULT__|${EFFORT_DEFAULT}|g" \
         -e "s|__MODEL_FILE__|${MODEL_FILE}|g"
 __MARKER_BEGIN__
 export OLLAMA_HOST="__LLM_HOST__"
 export CLAUDE_OLLAMA_MODEL_FILE="__MODEL_FILE__"
+# Default num_ctx baked in unconditionally so re-running the script upgrades it.
+# Per-launch override still works: CLAUDE_OLLAMA_NUM_CTX=131072 c
+export CLAUDE_OLLAMA_NUM_CTX="__NUM_CTX__"
+# Local model thinking defaults. Keep thinking enabled by default, but bound the
+# thinking budget to prevent runaway long traces that can trigger output cap
+# errors in Claude Code for broad prompts like "analyze this repo".
+# With 48+ GB VRAM, 16384 thinking tokens is safe; tune down for lower VRAM.
+# Baked unconditionally so re-running the script always upgrades the defaults.
+# Per-launch: CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 c
+export CLAUDE_OLLAMA_THINKING="enabled"
+export CLAUDE_OLLAMA_MAX_THINKING_TOKENS="__MAX_THINKING_TOKENS__"
+# Default Claude effort level for local Ollama launches. Lower effort keeps
+# thinking enabled but curbs runaway long responses on broad prompts.
+# Baked unconditionally; override per-launch: CLAUDE_OLLAMA_EFFORT=medium c
+export CLAUDE_OLLAMA_EFFORT="__EFFORT_DEFAULT__"
+# Claude Code clamps this to 128000 internally; it only matters for the direct
+# `claude`/`c-cloud` path since `ollama launch claude` sets its own value.
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-__MAX_OUTPUT_TOKENS__}"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
 unalias c c-new c-cloud c-continue 2>/dev/null || true
-unset -f c c_new cc claude_launch claude_local_launch claude_cloud_launch claude_pick_ollama_model claude_current_ollama_model _claude_pick_ollama_model_impl 2>/dev/null || true
+unset -f c c_new cc claude_launch claude_local_launch claude_cloud_launch claude_pick_ollama_model claude_current_ollama_model _claude_pick_ollama_model_impl _claude_ensure_ctx_variant _claude_has_effort_flag 2>/dev/null || true
 
 _claude_pick_ollama_model_impl() {
     python3 - <<'PY'
 import json
 import os
+import re
 import sys
 from urllib.request import urlopen
 
@@ -233,7 +277,21 @@ if not models:
     print("No Ollama models returned by host API.", file=sys.stderr)
     sys.exit(1)
 
-for index, model in enumerate(models, start=1):
+# Hide auto-generated "<base>-ctx<N>" variants from the chooser when their base
+# model is also present. The launch logic recreates/uses the ctx variant
+# automatically, so showing both just clutters the list. A "-ctx<N>" model whose
+# base is missing is kept so it stays selectable.
+ctx_suffix = re.compile(r"-ctx\d+$")
+names = {m.get("name", "") for m in models}
+visible = [
+    m
+    for m in models
+    if not (ctx_suffix.search(m.get("name", "")) and ctx_suffix.sub("", m.get("name", "")) in names)
+]
+if not visible:
+    visible = models
+
+for index, model in enumerate(visible, start=1):
     print(f"{index}) {model.get('name', 'unknown')}", file=sys.stderr)
 
 print("Select model number:", file=sys.stderr)
@@ -244,11 +302,11 @@ if not choice.isdigit():
     sys.exit(1)
 
 position = int(choice) - 1
-if position < 0 or position >= len(models):
+if position < 0 or position >= len(visible):
     print("Selection out of range.", file=sys.stderr)
     sys.exit(1)
 
-print(models[position].get("name", "unknown"))
+print(visible[position].get("name", "unknown"))
 PY
 }
 
@@ -271,6 +329,48 @@ claude_current_ollama_model() {
     fi
 }
 
+_claude_ensure_ctx_variant() {
+    # Ensure a large-context variant of the given model exists on the host Ollama,
+    # then echo the model name to actually launch. This is the real fix for the
+    # "output token maximum" error: a roomy num_ctx lets the model fit Claude
+    # Code's prompt and stop naturally instead of rambling until it is truncated.
+    local base="$1"
+    local num_ctx="${CLAUDE_OLLAMA_NUM_CTX:-__NUM_CTX__}"
+    local host="${OLLAMA_HOST:-http://host.docker.internal:11434}"
+
+    # Disabled, or the selected model is already a ctx-tuned variant: use as-is.
+    if [ -z "${num_ctx}" ] || [ "${num_ctx}" = "0" ] || printf '%s' "${base}" | grep -qiE 'ctx[0-9]+'; then
+        printf '%s' "${base}"
+        return 0
+    fi
+
+    local variant="${base}-ctx${num_ctx}"
+    # Create the variant once (idempotent); reuses the base model's blobs.
+    if ! curl -fsS "${host}/api/tags" 2>/dev/null | grep -q "\"${variant}\""; then
+        printf 'Creating Ollama variant %s (num_ctx=%s)...\n' "${variant}" "${num_ctx}" >&2
+        if ! curl -fsS "${host}/api/create" \
+            -d "{\"model\":\"${variant}\",\"from\":\"${base}\",\"parameters\":{\"num_ctx\":${num_ctx}},\"stream\":false}" \
+            >/dev/null 2>&1; then
+            printf 'Warning: could not create %s; launching base model %s instead.\n' "${variant}" "${base}" >&2
+            printf '%s' "${base}"
+            return 0
+        fi
+    fi
+    printf '%s' "${variant}"
+}
+
+_claude_has_effort_flag() {
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --effort|--effort=*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 claude_local_launch() {
     if ! command -v ollama >/dev/null 2>&1; then
         printf '%s\n' "ollama CLI is not installed in this container." >&2
@@ -283,7 +383,20 @@ claude_local_launch() {
     fi
 
     printf '%s\n' "${selected_model}" > "${CLAUDE_OLLAMA_MODEL_FILE}"
-    OLLAMA_HOST="${OLLAMA_HOST}" ollama launch claude --model "${selected_model}" "$@"
+    local launch_model
+    launch_model="$(_claude_ensure_ctx_variant "${selected_model}")"
+    local -a effort_args=()
+    if ! _claude_has_effort_flag "$@"; then
+        case "${CLAUDE_OLLAMA_EFFORT:-low}" in
+            low|medium|high)
+                effort_args=(--effort "${CLAUDE_OLLAMA_EFFORT}")
+                ;;
+        esac
+    fi
+    printf 'Launching Claude on %s\n' "${launch_model}" >&2
+    OLLAMA_HOST="${OLLAMA_HOST}" \
+    MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
+    ollama launch claude --model "${launch_model}" -- "${effort_args[@]}" "$@"
 }
 
 claude_cloud_launch() {
@@ -305,6 +418,9 @@ cc() {
 alias c-new='c_new'
 alias c-cloud='claude_cloud_launch'
 alias c-continue='cc'
+alias c-med='CLAUDE_OLLAMA_EFFORT=medium c'
+alias c-hi='CLAUDE_OLLAMA_EFFORT=high c'
+alias c-max='CLAUDE_OLLAMA_EFFORT=high CLAUDE_OLLAMA_NUM_CTX=262144 CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 c'
 alias ollama-model='claude_pick_ollama_model'
 alias ollama-model-current='claude_current_ollama_model'
 __MARKER_END__
@@ -367,6 +483,19 @@ print_summary() {
     log "4. Use: c-cloud  to launch the installed Claude CLI directly"
     log "5. Use: cc       to continue the most recent Claude cloud session"
     log "6. Config lives at: ${PERSISTENCE_DIR}"
+    log "------------------------------------------------"
+    log "Effort levels (keep thinking enabled, adjust reasoning depth/breadth):"
+    log "  c              (default: low effort, fast, safe for broad analysis)"
+    log "  c-med          (medium effort, slower, deeper reasoning)"
+    log "  c-hi           (high effort, slowest, maximum reasoning depth)"
+    log "  c-max          (high effort + full context/thinking budget)"
+    log "Context window (num_ctx): models launch via '<model>-ctx${NUM_CTX}' variant."
+    log "Default (${NUM_CTX}) tokens; safe for 48+ GB VRAM. Lower VRAM: CLAUDE_OLLAMA_NUM_CTX_SETUP=131072 ./setup..."
+    log "Thinking budget: ${MAX_THINKING_TOKENS_DEFAULT} tokens by default."
+    log "Override: CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 c (for even deeper reasoning)."
+    log "Note: --effort is set at launch time, not a runtime command."
+    log "Output ceiling: Claude Code hard-caps at 128000 tokens. Split work across"
+    log "multiple turns for unlimited effective headroom."
     log "------------------------------------------------"
 }
 
