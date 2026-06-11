@@ -1112,89 +1112,9 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
     _claude_zen_ensure_proxy || true
     claude_bin="$(_claude_zen_find_claude)"
 
-    # ── Install danger guardrails ──────────────────────────────────────────
-    # We temporarily install a CLAUDE.md in the workspace root with strict
-    # git guardrails. The original is restored after Claude exits.
-    local claude_md="${workspace_root}/CLAUDE.md"
-    local danger_dir="${dir}/danger"
-    mkdir -p "$danger_dir"
-    local backup_file="${danger_dir}/CLAUDE.md.bak"
-
-    # Backup existing CLAUDE.md if it exists
-    if [ -f "$claude_md" ]; then
-        cp "$claude_md" "$backup_file"
-    else
-        rm -f "$backup_file"
-        touch "$backup_file"
-    fi
-
-    # Write danger guardrails
-    danger_rules_file="${danger_dir}/danger_rules.md"
-    cat > "$danger_rules_file" << 'DANGEREOF'
-# ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
-
-You are running with **automatic permission approval**. Every tool call you
-make is executed WITHOUT confirmation. This is a safety-critical mode.
-
-## MANDATORY RESTRICTIONS — Git write operations
-
-Only the following **Staging & Read** operations are allowed:
-
-### ✅ ALLOWED Git Operations
-| Command | Purpose |
-|---------|---------|
-| `git add <file>` | Stage a file (fine-grained) |
-| `git add -p` | Stage interactively by hunk |
-| `git add -A` | Stage all changes |
-| `git status` | View working tree state |
-| `git diff` | View unstaged changes |
-| `git diff --cached` | View staged changes |
-| `git log` | View commit history |
-| `git show` | View a commit |
-| `git blame` | Annotate a file |
-| `git restore <file>` | Discard unstaged local changes |
-| `git stash push` | Save WIP temporarily |
-| `git stash list` | View stashes |
-| `git stash show` | View stash contents |
-
-### ❌ FORBIDDEN Git Operations
-These operations are **strictly forbidden**. Refuse politely if asked.
-
-| Operation | Reason |
-|-----------|--------|
-| `git commit` | Would record changes permanently |
-| `git push` / `git push --force` | Would publish to remote |
-| `git branch` / `git checkout -b` | Would create branches |
-| `git merge` / `git rebase` | Would alter history |
-| `git tag` | Would tag releases |
-| `git fetch` / `git pull` | Would contact remote |
-| `git reset --hard` / `git reset --mixed` | Destructive history reset |
-| `git revert` / `git cherry-pick` | Would create new commits |
-| `git rm` / `git mv` | Would remove/rename tracked files |
-| `git submodule` | Complex git mutation |
-| `git worktree` | Would create worktrees |
-| `git gc` / `git prune` / `git repack` | Repository maintenance |
-| `git clean -fd` / `-fdX` | Aggressive file removal |
-| `git stash drop` / `git stash pop` / `git stash clear` | Destructive stash ops |
-| `git config` (with global/system) | Would change git settings |
-
-### File System Cautions
-- You can read, write, and edit files normally.
-- **Do not delete files** without the user explicitly asking — even though
-  you auto-accept permissions, ask for verbal confirmation on deletes.
-- **Do not run shell commands** that modify the system (install packages,
-  change system config) without asking first.
-
-### Enforcement
-- If you are asked to do a forbidden git operation, say:
-  "⛔ This operation is blocked by Danger Mode guardrails."
-- If in doubt, err on the side of refusing. The user can always switch to
-  normal mode (`cz`) for git-write operations.
-
-DANGEREOF
-
-    cp "$danger_rules_file" "$claude_md"
-    printf '  🔒 Danger guardrails installed (CLAUDE.md)\n'
+    # ── Install danger guardrails via helper ──────────────────────────────
+    local backup_file
+    backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
     printf '\n'
 
     # ── Launch with auto-accept ────────────────────────────────────────────
@@ -1203,17 +1123,8 @@ DANGEREOF
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
     "$claude_bin" --model "$model_name" --dangerously-skip-permissions "$@"
 
-    # ── Cleanup: restore original CLAUDE.md ────────────────────────────────
-    local exit_code=$?
-    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
-        cp "$backup_file" "$claude_md"
-        printf '\n  ✅ Restored original CLAUDE.md\n'
-    elif [ -f "$backup_file" ]; then
-        rm -f "$claude_md"
-        printf '\n  ✅ Removed danger CLAUDE.md (no original to restore)\n'
-    fi
-    rm -f "$backup_file"
-    return $exit_code
+    # ── Cleanup via helper ────────────────────────────────────────────────
+    _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
 }
 
 # Remove danger guardrails from CLAUDE.md without launching (cleanup utility)
@@ -1300,6 +1211,268 @@ claude_zen_proxy_status() {
     echo "Proxy not running."; return 1
 }
 
+# ── Danger guardrail helpers (shared by launch and session-resume) ──────────
+# Installs a temporary CLAUDE.md with git-restriction guardrails, backed up
+# from the original so it can be restored after Claude exits.
+_claude_zen_install_danger_guardrails() {
+    local workspace_root="$1" dir="$2" claude_md danger_dir backup_file
+    claude_md="${workspace_root}/CLAUDE.md"
+    danger_dir="${dir}/danger"
+    mkdir -p "$danger_dir"
+    backup_file="${danger_dir}/CLAUDE.md.bak"
+    if [ -f "$claude_md" ]; then
+        cp "$claude_md" "$backup_file"
+    else
+        rm -f "$backup_file"
+        touch "$backup_file"
+    fi
+    local rules_file="${danger_dir}/danger_rules.md"
+    if [ ! -f "$rules_file" ]; then
+        cat > "$rules_file" << 'DANGEREOF'
+# ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
+
+You are running with **automatic permission approval**. Every tool call you
+make is executed WITHOUT confirmation. This is a safety-critical mode.
+
+## MANDATORY RESTRICTIONS — Git write operations
+
+Only the following **Staging & Read** operations are allowed:
+
+### ✅ ALLOWED Git Operations
+| Command | Purpose |
+|---------|---------|
+| `git add <file>` | Stage a file (fine-grained) |
+| `git add -p` | Stage interactively by hunk |
+| `git add -A` | Stage all changes |
+| `git status` | View working tree state |
+| `git diff` | View unstaged changes |
+| `git diff --cached` | View staged changes |
+| `git log` | View commit history |
+| `git show` | View a commit |
+| `git blame` | Annotate a file |
+| `git restore <file>` | Discard unstaged local changes |
+| `git stash push` | Save WIP temporarily |
+| `git stash list` | View stashes |
+| `git stash show` | View stash contents |
+
+### ❌ FORBIDDEN Git Operations
+| Operation | Reason |
+|-----------|--------|
+| `git commit` | Would record changes permanently |
+| `git push` / `git push --force` | Would publish to remote |
+| `git branch` / `git checkout -b` | Would create branches |
+| `git merge` / `git rebase` | Would alter history |
+| `git tag` | Would tag releases |
+| `git fetch` / `git pull` | Would contact remote |
+| `git reset --hard` / `git reset --mixed` | Destructive history reset |
+| `git revert` / `git cherry-pick` | Would create new commits |
+| `git rm` / `git mv` | Would remove/rename tracked files |
+| `git submodule` | Complex git mutation |
+| `git worktree` | Would create worktrees |
+| `git gc` / `git prune` / `git repack` | Repository maintenance |
+| `git clean -fd` / `-fdX` | Aggressive file removal |
+| `git stash drop` / `git stash pop` / `git stash clear` | Destructive stash ops |
+| `git config` (with global/system) | Would change git settings |
+
+### File System Cautions
+- You can read, write, and edit files normally.
+- **Do not delete files** without the user explicitly asking — even though
+  you auto-accept permissions, ask for verbal confirmation on deletes.
+- **Do not run shell commands** that modify the system (install packages,
+  change system config) without asking first.
+
+### Enforcement
+- If you are asked to do a forbidden git operation, say:
+  "⛔ This operation is blocked by Danger Mode guardrails."
+- If in doubt, err on the side of refusing. The user can always switch to
+  normal mode (`cz`) for git-write operations.
+
+DANGEREOF
+    fi
+    cp "$rules_file" "$claude_md"
+    printf '  🔒 Danger guardrails installed (CLAUDE.md)\n'
+    printf '%s' "$backup_file"
+}
+
+_claude_zen_cleanup_danger_guardrails() {
+    local workspace_root="$1" dir="$2" backup_file="$3" exit_code="${4:-$?}"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        cp "$backup_file" "$claude_md"
+        printf '\n  ✅ Restored original CLAUDE.md\n'
+    elif [ -f "$backup_file" ]; then
+        rm -f "$claude_md"
+        printf '\n  ✅ Removed danger CLAUDE.md (no original to restore)\n'
+    fi
+    rm -f "$backup_file"
+    return "$exit_code"
+}
+
+# ── Session management: list & resume recent conversations ─────────────────
+# These rely on the claude_persist (which survives devcontainer rebuilds),
+# so past sessions are always findable even after fresh-install `cz`.
+_claude_zen_derive_workspace_root() {
+    local dir="${1:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}}"
+    local root="${dir%/.claude_config_zen}"
+    [ -z "$root" ] && root="${dir%/*}"
+    printf '%s' "$root"
+}
+_claude_zen_persist_dir() {
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    # The persist dir is one level up from config: <workspace>/.claude_config_zen => <workspace>
+    local workspace_root="${dir%/.claude_config_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+    # The real persist target that ~/.claude points to
+    readlink -f "${HOME}/.claude" 2>/dev/null || echo "${workspace_root}/.claude_persist"
+}
+
+claude_zen_list_recent() {
+    local persist claude_bin danger_mode dir workspace_root backup_file
+    danger_mode=0
+    if [ "${1:-}" = "--danger" ]; then
+        danger_mode=1
+        shift
+    fi
+    persist="$(_claude_zen_persist_dir)"
+    if [ ! -f "${persist}/history.jsonl" ]; then
+        printf 'No session history found.\n' >&2
+        return 1
+    fi
+    printf '\n  Recent sessions:\n'
+    printf '  %s\n' '────────────────────────────────────────────────'
+    # Show the most recent 10 sessions from history.jsonl with index numbers
+    python3 - "${persist}/history.jsonl" << 'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+except FileNotFoundError:
+    print("No history found.")
+    sys.exit(0)
+# Deduplicate: keep the most recent entry per session
+seen = {}
+for e in entries:
+    sid = e.get("sessionId", "")
+    seen[sid] = e  # last wins = most recent
+unique = list(seen.values())
+# Show last 10 (most recent first)
+for i, e in enumerate(reversed(unique[-10:]), 1):
+    disp = e.get("display", "")[:90]
+    sid = e.get("sessionId", "")[:12]
+    ts = e.get("timestamp", 0)
+    print(f'  {i:>2}) [{sid}...] {disp}')
+PY
+    printf '\n  Enter number to resume, or 0 to start fresh: ' >&2
+    read -r choice
+    case "${choice}" in
+        0|"") return 1 ;;
+        *)
+            # Pick the Nth recent unique session
+            local sid
+            claude_bin="$(_claude_zen_find_claude)" || return 1
+            sid=$(python3 - "${persist}/history.jsonl" "${choice}" 2>/dev/null << 'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    entries = [json.loads(line) for line in f if line.strip()]
+seen = {}
+for e in entries:
+    seen[e.get("sessionId", "")] = e
+unique = list(seen.values())
+idx = len(unique) - int(sys.argv[2])
+if 0 <= idx < len(unique):
+    print(unique[idx]["sessionId"])
+else:
+    sys.exit(1)
+PY
+) || { printf 'Invalid choice.\n' >&2; return 1; }
+            printf 'Resuming session %s...\n' "${sid}"
+            if [ "$danger_mode" -eq 1 ]; then
+                dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+                workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
+                backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
+                printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
+                env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+                    ANTHROPIC_API_KEY="freecc" \
+                    "${claude_bin}" --resume "${sid}" --dangerously-skip-permissions "$@"
+                _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
+            else
+                exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+                    ANTHROPIC_API_KEY="freecc" \
+                    "${claude_bin}" --resume "${sid}" "$@"
+            fi
+            ;;
+    esac
+}
+
+claude_zen_resume_last() {
+    local claude_bin danger_mode dir workspace_root backup_file
+    danger_mode=0
+    if [ "${1:-}" = "--danger" ]; then
+        danger_mode=1
+        shift
+    fi
+    claude_bin="$(_claude_zen_find_claude)" || return 1
+    if [ "$danger_mode" -eq 1 ]; then
+        dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+        workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
+        backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
+        printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
+        env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+            ANTHROPIC_API_KEY="freecc" \
+            "${claude_bin}" --continue --dangerously-skip-permissions "$@"
+        _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
+    else
+        exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+            ANTHROPIC_API_KEY="freecc" \
+            "${claude_bin}" --continue "$@"
+    fi
+}
+
+claude_zen_quick_resume() {
+    # Resume by session ID prefix or full ID
+    # Usage: claude_zen_quick_resume [--danger] <session-id-prefix> [extra-claude-args...]
+    local claude_bin sid target session_id danger_mode dir workspace_root backup_file
+    danger_mode=0
+    if [ "${1:-}" = "--danger" ]; then
+        danger_mode=1
+        shift
+    fi
+    sid="$1"; shift
+    claude_bin="$(_claude_zen_find_claude)" || return 1
+    # Find the session file and extract the sessionId from its first line
+    target=""
+    for f in "$(_claude_zen_persist_dir)/projects/-workspace/"*.jsonl; do
+        if [[ "$(basename "$f")" == "${sid}"* ]]; then
+            target="$f"; break
+        fi
+    done
+    if [ -z "$target" ] || [ ! -f "$target" ]; then
+        printf 'Session not found: %s\n' "$sid" >&2
+        return 1
+    fi
+    # Extract sessionId from first JSON line
+    session_id=$(head -1 "$target" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sessionId',''))" 2>/dev/null)
+    if [ -z "$session_id" ]; then
+        printf 'Could not read session ID from %s\n' "$target" >&2
+        return 1
+    fi
+    printf 'Resuming session %s...\n' "$session_id"
+    if [ "$danger_mode" -eq 1 ]; then
+        dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+        workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
+        backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
+        printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
+        env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+            ANTHROPIC_API_KEY="freecc" \
+            "${claude_bin}" --resume "$session_id" --dangerously-skip-permissions "$@"
+        _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
+    else
+        exec env ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
+            ANTHROPIC_API_KEY="freecc" \
+            "${claude_bin}" --resume "$session_id" "$@"
+    fi
+}
+
 alias cz='claude_zen_launch'
 alias cz-new='claude_zen_launch'
 alias cz-danger='claude_zen_launch_danger'
@@ -1311,6 +1484,12 @@ alias cz-proxy-start='claude_zen_proxy_start'
 alias cz-proxy-stop='claude_zen_proxy_stop'
 alias cz-proxy-status='claude_zen_proxy_status'
 alias cz-undo-danger='claude_zen_uninstall_danger_rules'
+alias cz-recent='claude_zen_list_recent'
+alias cz-last='claude_zen_resume_last'
+alias cz-resume='claude_zen_quick_resume'
+alias cz-danger-recent='claude_zen_list_recent --danger'
+alias cz-danger-last='claude_zen_resume_last --danger'
+alias cz-danger-resume='claude_zen_quick_resume --danger'
 __MARKER_END__
 WRAPEOF
 }
@@ -1425,14 +1604,25 @@ cat << SUMMARY
   Activate:     source ~/${SHELL_RC}
 
   Commands:
-    cz              Pick a model -> launch Claude CLI
-    cz-danger       Pick a model -> launch Claude CLI (auto-accept permissions)
-    cz-model        Pick a model (no launch)
-    cz-model-current  Show current model (provider + model name)
-    cz-proxy-start  Start the proxy daemon
-    cz-proxy-stop   Stop it
-    cz-proxy-status Check if running
-    cz-undo-danger  Remove danger guardrails from workspace CLAUDE.md
+    cz                  Pick a model -> launch Claude CLI (fresh session)
+    cz-last             Continue the most recent conversation (quick resume)
+    cz-danger-last      Same as cz-last but with auto-accept permissions
+    cz-recent           List all recent sessions -> pick any to resume
+    cz-danger-recent    Same as cz-recent but with auto-accept permissions
+    cz-resume <id>      Resume a specific session by ID prefix
+    cz-danger-resume <id>  Same as cz-resume but with auto-accept permissions
+    cz-danger           Pick a model -> launch (auto-accept permissions)
+    cz-model            Pick a model (no launch)
+    cz-model-current    Show current model (provider + model name)
+    cz-proxy-start      Start the proxy daemon
+    cz-proxy-stop       Stop it
+    cz-proxy-status     Check if running
+    cz-undo-danger      Remove danger guardrails from workspace CLAUDE.md
+
+  Session persistence is handled automatically by the script.  All chats
+  are stored in .claude_persist/ which survives devcontainer rebuilds.
+  Use cz-last, cz-recent, or their -danger counterparts to pick up where
+  you left off.
 
   Models are organized by family (Claude, GPT, Gemini, DeepSeek, etc.)
   Edit backends.json to add/remove models:
