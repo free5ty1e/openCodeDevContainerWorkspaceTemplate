@@ -167,6 +167,20 @@ ollama list
 - Models persist in Ollama storage, not in the container — survives rebuilds
 - Port 11434 is forwarded for Ollama API access
 
+## Upgrading OpenCode
+
+OpenCode is installed at build time with the latest version available. You can also upgrade manually without rebuilding the container.
+
+### Task: Upgrade to Latest
+- **Command Palette**: `Tasks: Run Task` → `Opencode: Upgrade to Latest`
+- Fetches the latest release from GitHub and replaces the installed binary
+- Works without a container rebuild
+
+### Manual upgrade
+```bash
+bash .devcontainer/upgrade_opencode.sh
+```
+
 ## Claude CLI with Ollama
 
 This project includes a setup script for using [Anthropic's Claude CLI](https://docs.anthropic.com/en/docs/claude-code/overview) with local Ollama models running on the host machine (instead of using Anthropic's cloud API).
@@ -227,18 +241,24 @@ After setup, source your shell rc file (`source ~/.zshrc`) and use:
 
 ```
 .devcontainer/
-  ├── Dockerfile             # Container image definition
-  ├── devcontainer.json     # Devcontainer config
-  ├── ollama_models.conf    # Central model list (edit here to add/change models)
-  ├── setup_devcontainer.sh # Post-create setup
-  ├── setup_ollama.sh       # Model pulling script
-  ├── start_ollama.sh      # Idempotent server startup
-  ├── check_models.sh       # Verify configs are in sync
-  └── launch_opencode.sh    # Launch/resume opencode
+  ├── Dockerfile                 # Container image definition (fetches latest opencode at build time)
+  ├── devcontainer.json          # Devcontainer config
+  ├── ollama_models.conf         # Central model list (edit here to add/change models)
+  ├── setup_devcontainer.sh      # Post-create setup (runs on container start)
+  ├── setup_ai_working.sh        # Initialize .ai_working folder structure
+  ├── setup_ollama.sh            # Model pulling script
+  ├── start_ollama.sh            # Idempotent server startup
+  ├── launch_opencode.sh         # Launch/resume opencode
+  ├── upgrade_opencode.sh        # Manual upgrade to latest opencode
+  ├── fix-sessions.sh            # Migrate sessions after container rebuild
+  ├── migrate_sessions.py        # Python helper for session migration
+  └── check_models.sh            # Verify configs are in sync
 .vscode/
-  └── tasks.json            # VS Code tasks for opencode + Ollama
-opencode.json               # OpenCode Ollama provider config
-.gitattributes              # Enforce LF line endings
+  └── tasks.json                 # VS Code tasks for opencode + Ollama
+opencode.json                    # OpenCode Ollama provider config
+setup_claude_ollama_local_in_devcontainer.sh  # Claude CLI + local Ollama setup
+setup_claude_zen_devcontainer.sh             # Claude Zen / big-pickle model setup
+.gitattributes                   # Enforce LF line endings
 ```
 
 ## License
