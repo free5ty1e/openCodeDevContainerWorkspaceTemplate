@@ -199,13 +199,47 @@ PROXY_VENV="${PERSISTENCE_DIR}/proxy-venv"
 # sys._base_executable points at the real interpreter even inside a venv.
 SYSTEM_PY="$(python3 -c 'import sys; print(sys._base_executable)' 2>/dev/null || command -v python3)"
 printf '  Base Python: %s (%s)\n' "${SYSTEM_PY}" "$(${SYSTEM_PY} --version 2>&1)"
-if [ ! -x "${PROXY_VENV}/bin/python3" ]; then
+
+USE_SYSTEM_PY_FLAG="${PERSISTENCE_DIR}/.USE_SYSTEM_PY"
+
+if [ -x "${PROXY_VENV}/bin/python3" ] && "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; then
+    # Venv exists and pip is usable
+    printf '  Proxy venv already exists. Ensuring packages...\n'
+    "${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
+    printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
+
+elif [ -f "${USE_SYSTEM_PY_FLAG}" ] || { [ -x "${PROXY_VENV}/bin/python3" ] && ! "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; }; then
+    # Either previously fell back to system Python, or the venv exists but is
+    # broken (no pip -- happens when ensurepip is unavailable).
+    # Fall back to system Python with --break-system-packages.
+    if [ -x "${PROXY_VENV}/bin/python3" ] && ! "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; then
+        printf '  Warning: proxy venv is incomplete (pip not installed).\n'
+        printf '  Removing broken venv and falling back to system Python.\n'
+        rm -rf "${PROXY_VENV}"
+        printf '%s\n' "${SYSTEM_PY}" > "${USE_SYSTEM_PY_FLAG}"
+        printf '  Using system Python. Ensuring packages...\n'
+    else
+        printf '  Using system Python (from previous run). Ensuring packages...\n'
+    fi
+    pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1
+    printf '  ✓ Using system Python (packages installed with --break-system-packages)\n'
+
+else
+    # Try creating a venv first
     printf '  Creating proxy venv at %s ...\n' "${PROXY_VENV}"
-    "${SYSTEM_PY}" -m venv "${PROXY_VENV}"
+    if "${SYSTEM_PY}" -m venv "${PROXY_VENV}" 2>/dev/null; then
+        printf '  Installing proxy dependencies into venv...\n'
+        "${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
+        printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
+    else
+        printf '  Warning: standard venv creation failed (ensurepip not available).\n'
+        printf '  Falling back to system Python with --break-system-packages.\n'
+        pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1
+        printf '%s\n' "${SYSTEM_PY}" > "${USE_SYSTEM_PY_FLAG}"
+        printf '  ✓ Using system Python (packages installed via --break-system-packages)\n'
+        printf '    System Python: %s\n' "${SYSTEM_PY}"
+    fi
 fi
-printf '  Installing proxy dependencies into venv...\n'
-"${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
-printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
 
 # ─── 2. Claude CLI ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 2: Claude CLI ==="
@@ -1030,10 +1064,17 @@ _claude_zen_ensure_proxy() {
         printf '\nProxy script not found at %s\n' "$proxy_script" >&2
         return 1
     fi
-    # Use the dedicated proxy venv Python — immune to PATH venv shims.
-    local proxy_python="${dir}/proxy-venv/bin/python3"
-    if [ ! -x "${proxy_python}" ]; then
-        printf '\nProxy venv not found at %s. Re-run setup_claude_zen_devcontainer.sh\n' "${proxy_python}" >&2
+    # Determine Python: prefer dedicated proxy venv, fall back to system
+    local proxy_python
+    if [ -x "${dir}/proxy-venv/bin/python3" ]; then
+        proxy_python="${dir}/proxy-venv/bin/python3"
+    elif [ -f "${dir}/.USE_SYSTEM_PY" ]; then
+        proxy_python="$(head -1 "${dir}/.USE_SYSTEM_PY" 2>/dev/null)"
+        if [ ! -x "$proxy_python" ]; then
+            proxy_python="$(command -v python3)"
+        fi
+    else
+        printf '\nProxy Python not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
         return 1
     fi
     "${proxy_python}" "$proxy_script" \
