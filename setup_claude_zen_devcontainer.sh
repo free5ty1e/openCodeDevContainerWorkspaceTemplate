@@ -1077,6 +1077,29 @@ _claude_zen_ensure_proxy() {
         printf '\nProxy Python not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
         return 1
     fi
+
+    # ── Kill any stale proxy process on our port ──────────────────────────
+    # Orphaned proxies with outdated backends.json (e.g. be.model = "big-pickle"
+    # from a previous script version) would hardcode the upstream model name,
+    # silently breaking model switching.  Kill them so the new proxy loads the
+    # current backends.json where model = "" (pass-through mode).
+    local stale_pids
+    stale_pids="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
+    if [ -n "$stale_pids" ]; then
+        printf '  Stopping stale proxy process(es): %s\n' "$stale_pids"
+        kill $stale_pids 2>/dev/null || true
+        sleep 1
+        local remaining
+        remaining="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
+        if [ -n "$remaining" ]; then
+            printf '  Force-killing stalled proxy(es): %s\n' "$remaining"
+            kill -9 $remaining 2>/dev/null || true
+            sleep 1
+        fi
+        # Clear stale PID file (ours or orphaned)
+        rm -f "$pidf"
+    fi
+
     "${proxy_python}" "$proxy_script" \
         --backends "$backends_file" \
         --port "$port" \

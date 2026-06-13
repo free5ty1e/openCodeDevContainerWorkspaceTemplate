@@ -3,3 +3,5 @@ bak/
 .ai_memory/
 .ai_working/
 .claude_config_zen/
+.claude_config/
+.claude_persist/
