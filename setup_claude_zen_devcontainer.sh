@@ -214,12 +214,12 @@ elif [ -f "${USE_SYSTEM_PY_FLAG}" ] || { [ -x "${PROXY_VENV}/bin/python3" ] && !
     # broken (no pip -- happens when ensurepip is unavailable).
     # Fall back to system Python with --break-system-packages.
     if [ -x "${PROXY_VENV}/bin/python3" ] && ! "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; then
-        printf '  Warning: proxy venv is incomplete (pip not installed).\n'
+    printf '  Warning: proxy venv is incomplete (pip not installed).\n'
         printf '  Removing broken venv and falling back to system Python.\n'
         rm -rf "${PROXY_VENV}"
         printf '%s\n' "${SYSTEM_PY}" > "${USE_SYSTEM_PY_FLAG}"
         printf '  Using system Python. Ensuring packages...\n'
-    else
+else
         printf '  Using system Python (from previous run). Ensuring packages...\n'
     fi
     pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1
@@ -232,8 +232,8 @@ else
         printf '  Installing proxy dependencies into venv...\n'
         "${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
         printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
-    else
-        printf '  Warning: standard venv creation failed (ensurepip not available).\n'
+else
+    printf '  Warning: standard venv creation failed (ensurepip not available).\n'
         printf '  Falling back to system Python with --break-system-packages.\n'
         pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1
         printf '%s\n' "${SYSTEM_PY}" > "${USE_SYSTEM_PY_FLAG}"
@@ -256,8 +256,8 @@ else
     }
     if have claude; then
         printf '  Installed: %s\n' "$(command -v claude)"
-    else
-        printf '  Warning: claude not in PATH yet. It may be at %s/bin/claude\n' "${NPM_GLOBAL_DIR}"
+else
+    printf '  Warning: claude not in PATH yet. It may be at %s/bin/claude\n' "${NPM_GLOBAL_DIR}"
         printf '  Restart your shell or run: export PATH="%s/bin:\${PATH}"\n' "${NPM_GLOBAL_DIR}"
     fi
 fi
@@ -873,7 +873,130 @@ printf '  Created %s\n' "${PROXY_SCRIPT}"
 
 # ─── 5. Backends config ───────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 5: Backends config ==="
-if [ ! -f "${BACKENDS_FILE}" ]; then
+printf '  Querying OpenCode Zen API for available models...\n'
+python3 << 'PY' > "${BACKENDS_FILE}"
+"""Generate backends.json dynamically by querying the OpenCode Zen API."""
+import json, os, sys, urllib.request
+from urllib.error import URLError
+
+API_BASE = "https://opencode.ai/zen/v1"
+
+# ── Fetch model list from API ──────────────────────────────────────────────
+try:
+    req = urllib.request.Request(f"{API_BASE}/models", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        all_models = [m["id"] for m in json.loads(resp.read()).get("data", [])]
+    if not all_models:
+        raise ValueError("empty model list")
+except Exception as e:
+    print(f"  Warning: could not fetch model list ({e}).", file=sys.stderr)
+    print(f"  Writing minimal fallback config.", file=sys.stderr)
+    json.dump({
+        "zen": {
+            "base_url": API_BASE, "api_key_env": "ZEN_API_KEY", "api_key": "",
+            "model": "", "provider_name": "ZEN",
+            "models": {"Free": ["big-pickle"]},
+        },
+        "openai": {
+            "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
+            "api_key": "", "model": "gpt-4o", "provider_name": "OpenAI",
+        },
+        "groq": {
+            "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY",
+            "api_key": "", "model": "llama-3.3-70b-versatile", "provider_name": "Groq",
+        },
+    }, sys.stdout, indent=4)
+    print()
+    sys.exit(0)
+
+# ── Classify models into families by name patterns ─────────────────────────
+FAMILY_RULES = [
+    ("claude-", "Claude"), ("gpt-", "GPT"), ("gemini-", "Gemini"),
+    ("deepseek-", "DeepSeek"), ("grok-", "xAI"),
+    ("glm-", "Other"), ("minimax-", "Other"), ("kimi-", "Other"),
+    ("qwen", "Other"), ("mimo-", "Other"), ("nemotron-", "Other"),
+    ("north-", "Other"),
+]
+def classify(mid):
+    for prefix, family in FAMILY_RULES:
+        if mid.startswith(prefix):
+            return family
+    return "Other"
+
+# First pass: classify everything
+families = {}  # family -> [model_ids]
+for m in all_models:
+    fam = classify(m)
+    families.setdefault(fam, []).append(m)
+
+# Identify free candidates and probe them
+free_candidates = [m for m in all_models if m.endswith("-free") or m == "big-pickle"]
+
+if free_candidates:
+    print(f"  Probing {len(free_candidates)} potential free model(s)...", file=sys.stderr)
+free_models = []
+expired = []
+for m in free_candidates:
+    body = json.dumps({"model": m, "messages": [{"role":"user","content":"hi"}], "max_tokens":1, "stream":False}).encode()
+    req = urllib.request.Request(f"{API_BASE}/chat/completions", data=body, headers={"Content-Type":"application/json", "User-Agent": "Mozilla/5.0"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8):
+            free_models.append(m)
+            print(f"    \u2713 {m}", file=sys.stderr)
+    except URLError as e:
+        if getattr(e, "code", None) == 401:
+            expired.append(m)
+            print(f"    \u2717 {m} (needs API key)", file=sys.stderr)
+        else:
+            free_models.append(m)
+            print(f"    ? {m} (assuming free)", file=sys.stderr)
+    except Exception:
+        free_models.append(m)
+        print(f"    ? {m} (assuming free)", file=sys.stderr)
+
+# ── Build the output ──────────────────────────────────────────────────────
+ORDER = ["Claude", "GPT", "Gemini", "DeepSeek", "xAI", "Other", "Free"]
+zen_models = {}
+
+# Add each family in order, removing free/expired models from their families
+for fam in ORDER:
+    if fam == "Free":
+        continue
+    remaining = [m for m in families.get(fam, []) if m not in free_models and m not in expired]
+    if remaining:
+        zen_models[fam] = remaining
+
+# Free models (proven working) go last
+if free_models:
+    zen_models["Free"] = sorted(set(free_models))
+
+# Expired models back into Other
+if expired:
+    zen_models.setdefault("Other", []).extend(expired)
+
+result = {
+    "zen": {
+        "base_url": API_BASE, "api_key_env": "ZEN_API_KEY", "api_key": "",
+        "model": "", "provider_name": "ZEN",
+        "models": zen_models,
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
+        "api_key": "", "model": "gpt-4o", "provider_name": "OpenAI",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY",
+        "api_key": "", "model": "llama-3.3-70b-versatile", "provider_name": "Groq",
+    },
+}
+
+json.dump(result, sys.stdout, indent=4)
+print()
+PY
+if [ -s "${BACKENDS_FILE}" ]; then
+    printf '  Generated %s with dynamic model list\n' "${BACKENDS_FILE}"
+else
+    printf '  Warning: dynamic generation failed, writing fallback.\n' >&2
     cat > "${BACKENDS_FILE}" << JSONEOF
 {
     "zen": {
@@ -883,67 +1006,7 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
         "model": "",
         "provider_name": "ZEN",
         "models": {
-            "Claude": [
-                "claude-fable-5",
-                "claude-opus-4-8",
-                "claude-opus-4-7",
-                "claude-opus-4-6",
-                "claude-opus-4-5",
-                "claude-opus-4-1",
-                "claude-sonnet-4-6",
-                "claude-sonnet-4-5",
-                "claude-sonnet-4",
-                "claude-haiku-4-5"
-            ],
-            "GPT": [
-                "gpt-5.5",
-                "gpt-5.5-pro",
-                "gpt-5.4",
-                "gpt-5.4-pro",
-                "gpt-5.4-mini",
-                "gpt-5.4-nano",
-                "gpt-5.3-codex-spark",
-                "gpt-5.3-codex",
-                "gpt-5.2",
-                "gpt-5.2-codex",
-                "gpt-5.1",
-                "gpt-5.1-codex-max",
-                "gpt-5.1-codex",
-                "gpt-5.1-codex-mini",
-                "gpt-5",
-                "gpt-5-codex",
-                "gpt-5-nano"
-            ],
-            "Gemini": [
-                "gemini-3.5-flash",
-                "gemini-3.1-pro",
-                "gemini-3-flash"
-            ],
-            "DeepSeek": [
-                "deepseek-v4-pro",
-                "deepseek-v4-flash"
-            ],
-            "xAI": [
-                "grok-build-0.1"
-            ],
-            "Other": [
-                "glm-5.1",
-                "glm-5",
-                "minimax-m2.7",
-                "minimax-m2.5",
-                "kimi-k2.6",
-                "kimi-k2.5",
-                "qwen3.6-plus",
-                "qwen3.5-plus",
-                "minimax-m3-free",
-                "qwen3.6-plus-free"
-            ],
-            "Free": [
-                "big-pickle",
-                "deepseek-v4-flash-free",
-                "nemotron-3-ultra-free",
-                "north-mini-code-free"
-            ]
+            "Free": ["big-pickle"]
         }
     },
     "openai": {
@@ -962,9 +1025,7 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
     }
 }
 JSONEOF
-    printf '  Created %s\n' "${BACKENDS_FILE}"
-else
-    printf '  Already exists: %s\n' "${BACKENDS_FILE}"
+    printf '  Created %s (fallback)\n' "${BACKENDS_FILE}"
 fi
 
 # ─── 6. Shell wrappers ────────────────────────────────────────────────────────
@@ -1103,7 +1164,7 @@ _claude_zen_ensure_proxy() {
         if [ ! -x "$proxy_python" ]; then
             proxy_python="$(command -v python3)"
         fi
-    else
+else
         printf '\nProxy Python not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
         return 1
     fi
@@ -1176,7 +1237,7 @@ claude_zen_launch() {
     if [[ "$sel" == *"|"* ]]; then
         provider_id="${sel%%|*}"
         model_name="${sel#*|}"
-    else
+else
         # Legacy format: just provider_id
         provider_id="$sel"
         model_name=$(python3 -c "
@@ -1210,7 +1271,7 @@ claude_zen_launch_danger() {
     if [[ "$sel" == *"|"* ]]; then
         provider_id="${sel%%|*}"
         model_name="${sel#*|}"
-    else
+else
         provider_id="$sel"
         model_name=$(python3 -c "
 import json
@@ -1266,7 +1327,7 @@ claude_zen_uninstall_danger_rules() {
         else
             printf 'CLAUDE.md is not a danger rules file — leaving untouched\n'
         fi
-    else
+else
         printf 'No CLAUDE.md found\n'
     fi
 }
@@ -1286,7 +1347,7 @@ claude_zen_pick_model() {
         provider_id="${sel%%|*}"
         model_name="${sel#*|}"
         printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
-    else
+else
         printf 'Backend: %s\n' "$sel"
     fi
 }
@@ -1303,7 +1364,7 @@ claude_zen_current_model() {
         else
             printf 'Backend: %s\n' "$sel"
         fi
-    else
+else
         echo "No model selected (run cz-model)"
     fi
 }
@@ -1341,13 +1402,13 @@ _claude_zen_install_danger_guardrails() {
     backup_file="${danger_dir}/CLAUDE.md.bak"
     if [ -f "$claude_md" ]; then
         cp "$claude_md" "$backup_file"
-    else
+else
         rm -f "$backup_file"
         touch "$backup_file"
     fi
     local rules_file="${danger_dir}/danger_rules.md"
     if [ ! -f "$rules_file" ]; then
-        cat > "$rules_file" << 'DANGEREOF'
+    cat > "$rules_file" << 'DANGEREOF'
 # ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
 
 You are running with **automatic permission approval**. Every tool call you
@@ -1459,7 +1520,7 @@ claude_zen_list_recent() {
     if [[ "$sel" == *"|"* ]]; then
         provider_id="${sel%%|*}"
         model_name="${sel#*|}"
-    else
+else
         provider_id="$sel"
         model_name=$(python3 -c "
     import json
@@ -1558,7 +1619,7 @@ claude_zen_resume_last() {
     if [[ "$sel" == *"|"* ]]; then
         provider_id="${sel%%|*}"
         model_name="${sel#*|}"
-    else
+else
         provider_id="$sel"
         model_name=$(python3 -c "
     import json
@@ -1580,7 +1641,7 @@ claude_zen_resume_last() {
             ANTHROPIC_API_KEY="freecc" \
             "${claude_bin}" --model "${model_name}" --continue --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
-    else
+else
         exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
@@ -1607,7 +1668,7 @@ claude_zen_quick_resume() {
     if [[ "$sel" == *"|"* ]]; then
         provider_id="${sel%%|*}"
         model_name="${sel#*|}"
-    else
+else
         provider_id="$sel"
         model_name=$(python3 -c "
     import json
@@ -1646,7 +1707,7 @@ claude_zen_quick_resume() {
             ANTHROPIC_API_KEY="freecc" \
             "${claude_bin}" --model "${model_name}" --resume "$session_id" --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
-    else
+else
         exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc" \
@@ -1719,7 +1780,7 @@ if [ -L "${HOME}/.claude" ]; then
     CURRENT_TARGET="$(readlink "${HOME}/.claude")"
     if [ "${CURRENT_TARGET}" = "${CLAUDE_PERSIST_DIR}" ]; then
         printf '  ~/.claude already symlinked to workspace: %s\n' "${CLAUDE_PERSIST_DIR}"
-    else
+else
         # Symlink points somewhere else (e.g. .claude_config/dot-claude from
         # an older ollama setup). Migrate data if the old target has content
         # and our persist dir is empty, then re-point to .claude_persist.
@@ -1735,7 +1796,7 @@ if [ -L "${HOME}/.claude" ]; then
 elif [ -d "${HOME}/.claude" ]; then
     if [ -z "$(ls -A "${HOME}/.claude" 2>/dev/null)" ]; then
         rm -rf "${HOME}/.claude"
-    else
+else
         printf '  Migrating ~/.claude to %s ...\n' "${CLAUDE_PERSIST_DIR}"
         cp -a "${HOME}/.claude/." "${CLAUDE_PERSIST_DIR}/" && rm -rf "${HOME}/.claude"
         printf '  Done.\n'
