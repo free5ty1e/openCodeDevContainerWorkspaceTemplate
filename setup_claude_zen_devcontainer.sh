@@ -103,12 +103,13 @@
 #       "model": "",
 #       "provider_name": "ZEN",
 #       "models": {
-#         "Claude":     ["claude-fable-5", "claude-opus-4-8", ...],
-#         "GPT":        ["gpt-5.5", "gpt-5.5-pro", ...],
-#         "Gemini":     ["gemini-3.5-flash", ...],
-#         "DeepSeek":   [...],
-#         "Other":      [...],
-#         "Free":       [...]
+#         "Claude":     ["claude-fable-5", "claude-opus-4-8", ...],   # paid — set ZEN_API_KEY
+#         "GPT":        ["gpt-5.5", "gpt-5.5-pro", ...],               # paid — set ZEN_API_KEY
+#         "Gemini":     ["gemini-3.5-flash", ...],                      # paid — set ZEN_API_KEY
+#         "DeepSeek":   [...],                                          # paid — set ZEN_API_KEY
+#         "xAI":        [...],                                          # paid — set ZEN_API_KEY
+#         "Other":      [...],                                          # paid — set ZEN_API_KEY
+#         "Free":       ["deepseek-v4-flash-free", "big-pickle", ...]   # free — no key needed
 #       }
 #     },
 #     "openai": {
@@ -125,7 +126,7 @@
 # ── Environment variables ─────────────────────────────────────────────────────
 #   CLAUDE_ZEN_CONFIG_DIR   Override persistence dir (default: .claude_config)
 #   CLAUDE_ZEN_PROXY_PORT   Override proxy port (default: 8083)
-#   ZEN_API_KEY             API key for OpenCode Zen (optional for free models)
+#   ZEN_API_KEY             API key for OpenCode Zen (required for paid models; free models work without it)
 #   ANTHROPIC_AUTH_TOKEN    Proxy auth token (default: "freecc")
 #   ZEN_BACKENDS            Override path to backends JSON (default: backends.json)
 #   ZEN_HOST                Override proxy host (default: 0.0.0.0)
@@ -308,6 +309,7 @@ class Backend:
     api_key: str
     model: str
     provider_name: str = ""
+    api_key_env: str = ""
     models: dict | None = None
 
 # ---------------------------------------------------------------------------
@@ -552,6 +554,7 @@ def load_backends(path: Path) -> dict[str, Backend]:
             api_key=api_key,
             model=info.get("model", ""),
             provider_name=info.get("provider_name", pid.upper()),
+            api_key_env=info.get("api_key_env", ""),
             models=info.get("models"),
         )
     return result
@@ -626,15 +629,20 @@ async def list_models():
     models = []
     for pid, be in backends.items():
         display = be.provider_name or pid
+        # Does this backend have an API key requirement at all?
+        has_key_req = bool(be.api_key_env)
         # If backend has a models dict, list all models from it
         if be.models:
             for family, model_list in be.models.items():
+                # Free family models don't need a key; all others do
+                family_needs_key = has_key_req and (family != "Free")
                 for m in model_list:
                     models.append({
                         "id": m,
                         "display_name": f"{display} {family} ({m})",
                         "created_at": "2025-01-01T00:00:00Z",
                         "type": "model",
+                        "api_key_required": family_needs_key,
                     })
         else:
             model_id = be.model or f"{pid}/default"
@@ -643,6 +651,7 @@ async def list_models():
                 "display_name": f"{display} ({model_id})",
                 "created_at": "2025-01-01T00:00:00Z",
                 "type": "model",
+                "api_key_required": has_key_req,
             })
     return {"data": models}
 
@@ -925,8 +934,7 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
                 "kimi-k2.6",
                 "kimi-k2.5",
                 "qwen3.6-plus",
-                "qwen3.5-plus",
-                "big-pickle"
+                "qwen3.5-plus"
             ],
             "Free": [
                 "deepseek-v4-flash-free",
@@ -934,7 +942,8 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
                 "qwen3.6-plus-free",
                 "minimax-m3-free",
                 "nemotron-3-ultra-free",
-                "north-mini-code-free"
+                "north-mini-code-free",
+                "big-pickle"
             ]
         }
     },
@@ -998,51 +1007,70 @@ try:
 except Exception as e:
     print(f"Error loading backends: {e}", file=sys.stderr); sys.exit(1)
 
-# Build model entries list: (label, provider_id, model_name)
+# Build model entries: (label, provider_id, model_name, api_key_env, is_free)
 entries = []
 for pid, bc in cfg.items():
     if not isinstance(bc, dict): continue
     pname = bc.get("provider_name", pid)
+    api_key_env = bc.get("api_key_env", "")
 
     # Backend with multiple models grouped by family (e.g. Zen)
     models_dict = bc.get("models")
     if models_dict and isinstance(models_dict, dict):
         for family in sorted(models_dict.keys()):
+            is_free = (family == "Free")
             for m in models_dict[family]:
-                entries.append((f"{family} > {m}", pid, m))
+                entries.append((f"{family} > {m}", pid, m, api_key_env, is_free))
         continue
 
     # Traditional single-model backend
     model = bc.get("model", "")
     label = f"{model} ({pname})" if model else pname
-    entries.append((label, pid, model or ""))
+    entries.append((label, pid, model or "", api_key_env, False))
 
-entries.sort(key=lambda x: x[0].lower())
+# Sort entries within each category
+zen_paid = sorted([e for e in entries if e[1] == "zen" and not e[4]], key=lambda x: x[0].lower())
+zen_free = sorted([e for e in entries if e[1] == "zen" and e[4]], key=lambda x: x[0].lower())
+other_be = sorted([e for e in entries if e[1] != "zen"], key=lambda x: x[0].lower())
 
-# Show Zen models in a separate section from other providers
-zen_count = sum(1 for e in entries if e[1] == "zen")
-if zen_count > 1:
-    print(f"\n{' ZEN Models ':-^50}", file=sys.stderr)
-    for i, (label, pid, model) in enumerate(entries, 1):
-        if pid == "zen":
-            print(f"  {i:>3}) {label}", file=sys.stderr)
-    print(f"{' Other Providers ':-^50}", file=sys.stderr)
-    for i, (label, pid, model) in enumerate(entries, 1):
-        if pid != "zen":
-            print(f"  {i:>3}) {label}", file=sys.stderr)
-else:
-    for i, (label, pid, model) in enumerate(entries, 1):
-        print(f"  {i:>3}) {label}", file=sys.stderr)
+# Display in order: Paid -> Free -> Other, with continuous numbering
+all_display = []
+idx = 1
+
+if zen_paid:
+    print(f"\n{' Paid Models (set ZEN_API_KEY env var) ':-^65}", file=sys.stderr)
+    for label, pid, model, key_env, is_free in zen_paid:
+        print(f"  {idx:>3}) {label}", file=sys.stderr)
+        all_display.append((label, pid, model))
+        idx += 1
+    if not os.environ.get("ZEN_API_KEY", ""):
+        print(f"\n      * Set ZEN_API_KEY to access paid models", file=sys.stderr)
+        print(f"      * Get one at https://opencode.ai/keys", file=sys.stderr)
+
+if zen_free:
+    print(f"{' Free Models (no API key needed) ':-^65}", file=sys.stderr)
+    for label, pid, model, key_env, is_free in zen_free:
+        print(f"  {idx:>3}) {label}", file=sys.stderr)
+        all_display.append((label, pid, model))
+        idx += 1
+
+if other_be:
+    print(f"{' Other Providers ':-^65}", file=sys.stderr)
+    for label, pid, model, key_env, is_free in other_be:
+        suff = f" (set ${key_env})" if key_env else ""
+        print(f"  {idx:>3}) {label}{suff}", file=sys.stderr)
+        all_display.append((label, pid, model))
+        idx += 1
 
 print("\nSelect model:", file=sys.stderr)
 with open("/dev/tty", "r", encoding="utf-8") as tty:
     c = tty.readline().strip()
 if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
 p = int(c) - 1
-if p < 0 or p >= len(entries): print("Out of range.", file=sys.stderr); sys.exit(1)
+if p < 0 or p >= len(all_display): print("Out of range.", file=sys.stderr); sys.exit(1)
 
 # Output: provider_id|model_name
-print(f"{entries[p][1]}|{entries[p][2]}")
+print(f"{all_display[p][1]}|{all_display[p][2]}")
 PY
 }
 
