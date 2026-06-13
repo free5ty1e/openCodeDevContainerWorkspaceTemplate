@@ -109,7 +109,8 @@
 #         "DeepSeek":   [...],                                          # paid — set ZEN_API_KEY
 #         "xAI":        [...],                                          # paid — set ZEN_API_KEY
 #         "Other":      [...],                                          # paid — set ZEN_API_KEY
-#         "Free":       ["deepseek-v4-flash-free", "big-pickle", ...]   # free — no key needed
+#         "Free (working)": ["big-pickle", "deepseek-v4-flash-free", ...]   # free — no key needed
+#         "Free (expired)": ["qwen3.6-plus-free", ...]                     # expired promo — subscribe at opencode.ai/go
 #       }
 #     },
 #     "openai": {
@@ -936,14 +937,15 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
                 "qwen3.6-plus",
                 "qwen3.5-plus"
             ],
-            "Free": [
+            "Free (working)": [
+                "big-pickle",
                 "deepseek-v4-flash-free",
-                "mimo-v2.5-free",
-                "qwen3.6-plus-free",
-                "minimax-m3-free",
                 "nemotron-3-ultra-free",
-                "north-mini-code-free",
-                "big-pickle"
+                "north-mini-code-free"
+            ],
+            "Free (expired)": [
+                "qwen3.6-plus-free",
+                "minimax-m3-free"
             ]
         }
     },
@@ -1018,7 +1020,7 @@ for pid, bc in cfg.items():
     models_dict = bc.get("models")
     if models_dict and isinstance(models_dict, dict):
         for family in sorted(models_dict.keys()):
-            is_free = (family == "Free")
+            is_free = family.startswith("Free")
             for m in models_dict[family]:
                 entries.append((f"{family} > {m}", pid, m, api_key_env, is_free))
         continue
@@ -1050,9 +1052,12 @@ if zen_paid:
 if zen_free:
     print(f"{' Free Models (no API key needed) ':-^65}", file=sys.stderr)
     for label, pid, model, key_env, is_free in zen_free:
-        print(f"  {idx:>3}) {label}", file=sys.stderr)
+        has_expired = "expired" in label.lower()
+        suffix = "  (promotion ended)" if has_expired else ""
+        print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
+    print(f"\n      * Expired promos can be reactivated at https://opencode.ai/go", file=sys.stderr)
 
 if other_be:
     print(f"{' Other Providers ':-^65}", file=sys.stderr)
