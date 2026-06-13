@@ -85,8 +85,11 @@ NUM_CTX="${CLAUDE_OLLAMA_NUM_CTX_SETUP:-262144}"
 # Thinking token budget and effort defaults. Same baking strategy as NUM_CTX.
 MAX_THINKING_TOKENS_DEFAULT="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS_SETUP:-16384}"
 EFFORT_DEFAULT="${CLAUDE_OLLAMA_EFFORT_SETUP:-low}"
+DANGEROUSLY_SKIP_PERMISSIONS="${CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS:-false}"
 MARKER_BEGIN="# >>> claude-ollama-devcontainer >>>"
 MARKER_END="# <<< claude-ollama-devcontainer <<<"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLAUDE_PERSIST_DIR="${CLAUDE_OLLAMA_PERSIST_DIR:-${SCRIPT_DIR}/.claude_persist}"
 
 ensure_ollama_prereqs() {
     if have_command zstd; then
@@ -164,27 +167,36 @@ ensure_persistence_link() {
     ln -s "${PERSISTENCE_DIR}" "${CONFIG_PATH}"
     log "✅ Config linked: ${CONFIG_PATH} -> ${PERSISTENCE_DIR}"
 
-    # Persist ~/.claude/ (sessions, history, cache, plugins, daemon state)
-    local persisted_claude_dir="${PERSISTENCE_DIR}/dot-claude"
+    # Both scripts share one persist dir so `c` and `cz` see the same sessions/history.
+    local claude_persist="${CLAUDE_PERSIST_DIR:-${SCRIPT_DIR}/.claude_persist}"
+    # Always ensure the target directory exists — a dangling symlink causes
+    # Claude Code to fail with ENOENT when trying to create jobs/sessions dirs.
+    mkdir -p "${claude_persist}"
     if [ -L "${HOME}/.claude" ]; then
         local current_target
         current_target="$(readlink "${HOME}/.claude")"
-        if [ "${current_target}" != "${persisted_claude_dir}" ]; then
+        if [ "${current_target}" != "${claude_persist}" ]; then
+            # Old symlink pointed elsewhere (e.g. .claude_config/dot-claude).
+            # Migrate data if the old target had content and the new one is empty.
+            if [ -d "${current_target}" ] && [ -z "$(ls -A "${claude_persist}" 2>/dev/null)" ]; then
+                log "📦 Migrating Claude data from ${current_target} to ${claude_persist}..."
+                cp -a "${current_target}/." "${claude_persist}/"
+            fi
             rm -f "${HOME}/.claude"
-            ln -s "${persisted_claude_dir}" "${HOME}/.claude"
+            ln -s "${claude_persist}" "${HOME}/.claude"
         fi
     elif [ -d "${HOME}/.claude" ]; then
-        if [ -d "${persisted_claude_dir}" ]; then
+        if [ -z "$(ls -A "${HOME}/.claude" 2>/dev/null)" ]; then
             rm -rf "${HOME}/.claude"
         else
-            mv "${HOME}/.claude" "${persisted_claude_dir}"
+            cp -a "${HOME}/.claude/." "${claude_persist}/"
+            rm -rf "${HOME}/.claude"
         fi
-        ln -s "${persisted_claude_dir}" "${HOME}/.claude"
+        ln -sfn "${claude_persist}" "${HOME}/.claude"
     else
-        mkdir -p "${persisted_claude_dir}"
-        ln -sfn "${persisted_claude_dir}" "${HOME}/.claude"
+        ln -sfn "${claude_persist}" "${HOME}/.claude"
     fi
-    log "✅ ~/.claude linked -> ${persisted_claude_dir}"
+    log "✅ ~/.claude linked -> ${claude_persist}"
 
     # Persist ~/.claude.json (user ID, project settings, onboarding state)
     local persisted_claude_json="${PERSISTENCE_DIR}/dot-claude.json"
@@ -229,6 +241,7 @@ build_wrapper_block() {
         -e "s|__NUM_CTX__|${NUM_CTX}|g" \
         -e "s|__MAX_THINKING_TOKENS__|${MAX_THINKING_TOKENS_DEFAULT}|g" \
         -e "s|__EFFORT_DEFAULT__|${EFFORT_DEFAULT}|g" \
+        -e "s|__DANGEROUSLY_SKIP__|${DANGEROUSLY_SKIP_PERMISSIONS}|g" \
         -e "s|__MODEL_FILE__|${MODEL_FILE}|g"
 __MARKER_BEGIN__
 export OLLAMA_HOST="__LLM_HOST__"
@@ -253,8 +266,9 @@ export CLAUDE_OLLAMA_EFFORT="__EFFORT_DEFAULT__"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-__MAX_OUTPUT_TOKENS__}"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
-unalias c c-new c-cloud c-continue 2>/dev/null || true
-unset -f c c_new cc claude_launch claude_local_launch claude_cloud_launch claude_pick_ollama_model claude_current_ollama_model _claude_pick_ollama_model_impl _claude_ensure_ctx_variant _claude_has_effort_flag 2>/dev/null || true
+unalias c c-new c-danger c-cloud c-continue 2>/dev/null || true
+unset -f c c_new cc c-danger c-continue claude_launch claude_local_launch claude_cloud_launch claude_pick_ollama_model claude_current_ollama_model _claude_pick_ollama_model_impl _claude_ensure_ctx_variant _claude_has_effort_flag \
+      _claude_ollama_install_danger_guardrails _claude_ollama_cleanup_danger_guardrails claude_ollama_launch_danger claude_ollama_uninstall_danger_rules 2>/dev/null || true
 
 _claude_pick_ollama_model_impl() {
     python3 - <<'PY'
@@ -393,14 +407,176 @@ claude_local_launch() {
                 ;;
         esac
     fi
+
+    local -a extra_args=()
+    if [ "${CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS:-__DANGEROUSLY_SKIP__}" = "true" ] ||
+       printf '%s' "$@" | grep -qw -- '--dangerously-skip-permissions'; then
+        extra_args+=(--dangerously-skip-permissions)
+    fi
+
     printf 'Launching Claude on %s\n' "${launch_model}" >&2
     OLLAMA_HOST="${OLLAMA_HOST}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
-    ollama launch claude --model "${launch_model}" -- "${effort_args[@]}" "$@"
+    ollama launch claude --model "${launch_model}" -- "${extra_args[@]}" "${effort_args[@]}" "$@"
 }
 
 claude_cloud_launch() {
     claude "$@"
+}
+
+# ── Danger mode: auto-accept permissions with git guardrails ────────────────
+# Installs a temporary CLAUDE.md with git-restriction guardrails, backed up
+# from the original so it can be restored after Claude exits.
+
+_claude_ollama_install_danger_guardrails() {
+    local workspace_root="$1" dir="$2" claude_md danger_dir backup_file
+    claude_md="${workspace_root}/CLAUDE.md"
+    danger_dir="${dir}/danger"
+    mkdir -p "$danger_dir"
+    backup_file="${danger_dir}/CLAUDE.md.bak"
+    if [ -f "$claude_md" ]; then
+        cp "$claude_md" "$backup_file"
+    else
+        rm -f "$backup_file"
+        touch "$backup_file"
+    fi
+    local rules_file="${danger_dir}/danger_rules.md"
+    if [ ! -f "$rules_file" ]; then
+        cat > "$rules_file" << 'DANGEREOF'
+# ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
+
+You are running with **automatic permission approval**. Every tool call you
+make is executed WITHOUT confirmation. This is a safety-critical mode.
+
+## MANDATORY RESTRICTIONS — Git write operations
+
+Only the following **Staging & Read** operations are allowed:
+
+### ✅ ALLOWED Git Operations
+| Command | Purpose |
+|---------|---------|
+| `git add <file>` | Stage a file (fine-grained) |
+| `git add -p` | Stage interactively by hunk |
+| `git add -A` | Stage all changes |
+| `git status` | View working tree state |
+| `git diff` | View unstaged changes |
+| `git diff --cached` | View staged changes |
+| `git log` | View commit history |
+| `git show` | View a commit |
+| `git blame` | Annotate a file |
+| `git restore <file>` | Discard unstaged local changes |
+| `git stash push` | Save WIP temporarily |
+| `git stash list` | View stashes |
+| `git stash show` | View stash contents |
+
+### ❌ FORBIDDEN Git Operations
+| Operation | Reason |
+|-----------|--------|
+| `git commit` | Would record changes permanently |
+| `git push` / `git push --force` | Would publish to remote |
+| `git branch` / `git checkout -b` | Would create branches |
+| `git merge` / `git rebase` | Would alter history |
+| `git tag` | Would tag releases |
+| `git fetch` / `git pull` | Would contact remote |
+| `git reset --hard` / `git reset --mixed` | Destructive history reset |
+| `git revert` / `git cherry-pick` | Would create new commits |
+| `git rm` / `git mv` | Would remove/rename tracked files |
+| `git submodule` | Complex git mutation |
+| `git worktree` | Would create worktrees |
+| `git gc` / `git prune` / `git repack` | Repository maintenance |
+| `git clean -fd` / `-fdX` | Aggressive file removal |
+| `git stash drop` / `git stash pop` / `git stash clear` | Destructive stash ops |
+| `git config` (with global/system) | Would change git settings |
+
+### File System Cautions
+- You can read, write, and edit files normally.
+- **Do not delete files** without the user explicitly asking — even though
+  you auto-accept permissions, ask for verbal confirmation on deletes.
+- **Do not run shell commands** that modify the system (install packages,
+  change system config) without asking first.
+
+### Enforcement
+- If you are asked to do a forbidden git operation, say:
+  "⛔ This operation is blocked by Danger Mode guardrails."
+- If in doubt, err on the side of refusing. The user can always switch to
+  normal mode (`c`) for git-write operations.
+
+DANGEREOF
+    fi
+    cp "$rules_file" "$claude_md"
+    printf '%s' "$backup_file"
+}
+
+_claude_ollama_cleanup_danger_guardrails() {
+    local workspace_root="$1" dir="$2" backup_file="$3" exit_code="${4:-$?}"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        cp "$backup_file" "$claude_md"
+    elif [ -f "$backup_file" ]; then
+        rm -f "$claude_md"
+    fi
+    rm -f "$backup_file"
+    return "$exit_code"
+}
+
+claude_ollama_launch_danger() {
+    if ! command -v ollama >/dev/null 2>&1; then
+        printf '%s\n' "ollama CLI is not installed in this container." >&2
+        return 1
+    fi
+
+    local selected_model
+    if ! selected_model="$(_claude_pick_ollama_model_impl)"; then
+        return 1
+    fi
+
+    printf '%s\n' "${selected_model}" > "${CLAUDE_OLLAMA_MODEL_FILE}"
+    local launch_model
+    launch_model="$(_claude_ensure_ctx_variant "${selected_model}")"
+
+    # Derive workspace root from PERSISTENCE_DIR
+    local workspace_root="${PERSISTENCE_DIR%/*}"
+    [ -z "$workspace_root" ] && workspace_root="$(pwd)"
+
+    printf '\n'
+    printf '  ⚠️  DANGER MODE\n'
+    printf '  ────────────\n'
+    printf '  Auto-accepting ALL permissions.\n'
+    printf '  Model: %s\n' "${launch_model}"
+    printf '\n'
+
+    local backup_file
+    backup_file="$(_claude_ollama_install_danger_guardrails "$workspace_root" "${PERSISTENCE_DIR}")"
+
+    printf 'Launching Claude on %s (danger mode)\n' "${launch_model}" >&2
+    OLLAMA_HOST="${OLLAMA_HOST}" \
+    MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
+    CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
+    ollama launch claude --model "${launch_model}" -- "$@"
+
+    _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${PERSISTENCE_DIR}" "$backup_file"
+}
+
+claude_ollama_uninstall_danger_rules() {
+    local workspace_root="${PERSISTENCE_DIR%/*}"
+    [ -z "$workspace_root" ] && workspace_root="$(pwd)"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    local backup_file="${PERSISTENCE_DIR}/danger/CLAUDE.md.bak"
+
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        cp "$backup_file" "$claude_md"
+        printf 'Restored original CLAUDE.md\n'
+        rm -f "$backup_file"
+    elif [ -f "$claude_md" ]; then
+        if grep -q 'DANGER MODE GUARDRAILS' "$claude_md" 2>/dev/null; then
+            rm -f "$claude_md"
+            printf 'Removed danger CLAUDE.md\n'
+        else
+            printf 'CLAUDE.md is not a danger rules file — leaving untouched\n'
+        fi
+    else
+        printf 'No CLAUDE.md found\n'
+    fi
 }
 
 c() {
@@ -416,6 +592,8 @@ cc() {
 }
 
 alias c-new='c_new'
+alias c-danger='claude_ollama_launch_danger'
+alias c-undo-danger='claude_ollama_uninstall_danger_rules'
 alias c-cloud='claude_cloud_launch'
 alias c-continue='cc'
 alias c-med='CLAUDE_OLLAMA_EFFORT=medium c'
@@ -483,6 +661,15 @@ print_summary() {
     log "4. Use: c-cloud  to launch the installed Claude CLI directly"
     log "5. Use: cc       to continue the most recent Claude cloud session"
     log "6. Config lives at: ${PERSISTENCE_DIR}"
+    log "7. Use: c-danger  to pick a host Ollama model and launch Claude with auto-accept permissions + git guardrails"
+    log "8. Use: c-undo-danger  remove danger guardrails from CLAUDE.md (without launching)"
+    log "------------------------------------------------"
+    log "Coexistence with zen setup (setup_claude_zen_devcontainer.sh):"
+    log "  - Both scripts share ~/.claude -> .claude_persist/ for sessions/history."
+    log "  - Config dir (.claude_config/) is shared — each script writes disjoint files into it."
+    log "  - Aliases are separate: c* (ollama) vs cz* (zen)."
+    log "  - Run 'c' and 'cz' in separate windows to use different models, same session history."
+    log "  - Do NOT run them concurrently — shared state files can corrupt under simultaneous writes."
     log "------------------------------------------------"
     log "Effort levels (keep thinking enabled, adjust reasoning depth/breadth):"
     log "  c              (default: low effort, fast, safe for broad analysis)"

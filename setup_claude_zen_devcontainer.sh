@@ -15,7 +15,7 @@
 #     session/config persistence across devcontainer rebuilds via symlink
 #  6. Creates a symlink so Claude Code's memory survives rebuilds:
 #     $HOME/.claude/projects/<slug>/memory/ → $SCRIPT_DIR/.ai_memory/
-#  7. All state lives in .claude_config_zen/, .ai_memory/, or .claude_persist/
+#  7. All state lives in .claude_config/, .ai_memory/, or .claude_persist/
 #     — critical data is never lost on rebuild
 #
 # ── How the proxy works ───────────────────────────────────────────────────────
@@ -26,11 +26,15 @@
 #     claude  ──ANTHROPIC_BASE_URL──►  zen-proxy (:8083)  ──Chat Completions──►  upstream
 #       (Anthropic Messages SSE)         ↕ translation          (OpenAI SSE)
 #
-# ── Independence from ollama+claude setup ─────────────────────────────────────
+# ── Coexistence with ollama+claude setup ──────────────────────────────────────
+#   Both scripts share ~/.claude -> .claude_persist/ so sessions/history are
+#   visible across models. Each script writes disjoint files into .clau le_config/.
+#   Run 'c' (ollama) and 'cz' (zen/proxy) in separate windows for different models.
 #   ┌──────────────────────┬───────────────────────────┬──────────────────────────┐
 #   │                      │  ollama+claude setup      │  zen+claude setup (this) │
 #   ├──────────────────────┼───────────────────────────┼──────────────────────────┤
-#   │ Persistence dir      │ .claude_config/           │ .claude_config_zen/       │
+#   │ Persistence dir      │ .claude_config/           │ .claude_config/       │
+#   │ ~/.clau de ->        │ .claude_persist/          │ .claule_persist/    │
 #   │ Proxy port           │ N/A (ollama built-in)     │ 8083                     │
 #   │ Shell aliases        │ c, c-new, cc              │ cz, cz-new, ccz          │
 #   │ Shell markers        │ claude-ollama-devcontainer│ claude-zen-devcontainer   │
@@ -90,7 +94,7 @@
 #   cz-undo-danger  Remove danger guardrails from workspace CLAUDE.md
 #
 # ── Backends configuration ────────────────────────────────────────────────────
-# Edit the JSON file at .claude_config_zen/backends.json:
+# Edit the JSON file at .claude_config/backends.json:
 #
 #   {
 #     "zen": {
@@ -119,7 +123,7 @@
 # Add/remove models under the "models" dict to customize your list.
 #
 # ── Environment variables ─────────────────────────────────────────────────────
-#   CLAUDE_ZEN_CONFIG_DIR   Override persistence dir (default: .claude_config_zen)
+#   CLAUDE_ZEN_CONFIG_DIR   Override persistence dir (default: .claude_config)
 #   CLAUDE_ZEN_PROXY_PORT   Override proxy port (default: 8083)
 #   ZEN_API_KEY             API key for OpenCode Zen (optional for free models)
 #   ANTHROPIC_AUTH_TOKEN    Proxy auth token (default: "freecc")
@@ -135,7 +139,7 @@
 #   - curl
 #
 # ── Files created ─────────────────────────────────────────────────────────────
-#   .claude_config_zen/
+#   .claude_config/
 #   ├── backends.json        Backend provider definitions (edit to add more)
 #   ├── proxy.py             Standalone translation proxy
 #   ├── selected-model       Last selected MODEL= string
@@ -166,7 +170,11 @@ fi
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PERSISTENCE_DIR="${CLAUDE_ZEN_CONFIG_DIR:-${SCRIPT_DIR}/.claude_config_zen}"
+# Use _SETUP suffix so the variable is NOT shadowed by an already-exported
+# CLAUDE_ZEN_CONFIG_DIR from a previous install (same pattern as the ollama
+# script). The baked wrapper exports CLAUDE_ZEN_CONFIG_DIR at shell-source
+# time; re-running the setup script must not inherit the old value.
+PERSISTENCE_DIR="${CLAUDE_ZEN_CONFIG_DIR_SETUP:-${SCRIPT_DIR}/.claude_config}"
 PROXY_PORT="${CLAUDE_ZEN_PROXY_PORT:-8083}"
 PROXY_SCRIPT="${PERSISTENCE_DIR}/proxy.py"
 BACKENDS_FILE="${PERSISTENCE_DIR}/backends.json"
@@ -180,13 +188,24 @@ NPM_GLOBAL_DIR="${HOME}/.npm-global"
 have() { command -v "$1" >/dev/null 2>&1; }
 export PATH="${NPM_GLOBAL_DIR}/bin:${PATH}"
 
-# ─── 1. Prerequisites: pip packages ───────────────────────────────────────────
-printf '\n%s\n' "=== Step 1: Prerequisites ==="
-pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1 | tail -3 || {
-    printf '  pip install failed. Trying apt packages...\n'
-    sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
-    pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken
-}
+# ─── 1. Prerequisites: dedicated proxy venv ──────────────────────────────────
+# Use a venv inside the workspace config dir so packages are:
+#   - isolated from the system Python and any active devcontainer venv
+#   - always found by the proxy regardless of what 'python3' resolves to
+#   - persisted across devcontainer rebuilds (lives on the workspace volume)
+printf '\n%s\n' "=== Step 1: Proxy Python environment ==="
+PROXY_VENV="${PERSISTENCE_DIR}/proxy-venv"
+# Find the base Python executable, bypassing any active venv shim.
+# sys._base_executable points at the real interpreter even inside a venv.
+SYSTEM_PY="$(python3 -c 'import sys; print(sys._base_executable)' 2>/dev/null || command -v python3)"
+printf '  Base Python: %s (%s)\n' "${SYSTEM_PY}" "$(${SYSTEM_PY} --version 2>&1)"
+if [ ! -x "${PROXY_VENV}/bin/python3" ]; then
+    printf '  Creating proxy venv at %s ...\n' "${PROXY_VENV}"
+    "${SYSTEM_PY}" -m venv "${PROXY_VENV}"
+fi
+printf '  Installing proxy dependencies into venv...\n'
+"${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
+printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
 
 # ─── 2. Claude CLI ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 2: Claude CLI ==="
@@ -1011,7 +1030,13 @@ _claude_zen_ensure_proxy() {
         printf '\nProxy script not found at %s\n' "$proxy_script" >&2
         return 1
     fi
-    python3 "$proxy_script" \
+    # Use the dedicated proxy venv Python — immune to PATH venv shims.
+    local proxy_python="${dir}/proxy-venv/bin/python3"
+    if [ ! -x "${proxy_python}" ]; then
+        printf '\nProxy venv not found at %s. Re-run setup_claude_zen_devcontainer.sh\n' "${proxy_python}" >&2
+        return 1
+    fi
+    "${proxy_python}" "$proxy_script" \
         --backends "$backends_file" \
         --port "$port" \
         >> "$logf" 2>&1 &
@@ -1082,8 +1107,8 @@ claude_zen_launch_danger() {
     local sel provider_id model_name claude_bin dir workspace_root danger_rules_file
     sel="$(_claude_zen_pick)" || return 1
     dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    # Derive workspace root: __PERSISTENCE_DIR__ = <root>/.claude_config_zen
-    workspace_root="${dir%/.claude_config_zen}"
+    # Derive workspace root: __PERSISTENCE_DIR__ = <root>/.claude_config
+    workspace_root="${dir%/.claude_config}"
     [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
     mkdir -p "$dir"
     printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
@@ -1130,7 +1155,7 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
 # Remove danger guardrails from CLAUDE.md without launching (cleanup utility)
 claude_zen_uninstall_danger_rules() {
     local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local workspace_root="${dir%/.claude_config_zen}"
+    local workspace_root="${dir%/.claude_config}"
     [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
     local claude_md="${workspace_root}/CLAUDE.md"
     local backup_file="${dir}/danger/CLAUDE.md.bak"
@@ -1313,14 +1338,14 @@ _claude_zen_cleanup_danger_guardrails() {
 # so past sessions are always findable even after fresh-install `cz`.
 _claude_zen_derive_workspace_root() {
     local dir="${1:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}}"
-    local root="${dir%/.claude_config_zen}"
+    local root="${dir%/.claude_config}"
     [ -z "$root" ] && root="${dir%/*}"
     printf '%s' "$root"
 }
 _claude_zen_persist_dir() {
     local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    # The persist dir is one level up from config: <workspace>/.claude_config_zen => <workspace>
-    local workspace_root="${dir%/.claude_config_zen}"
+    # The persist dir is one level up from config: <workspace>/.claude_config => <workspace>
+    local workspace_root="${dir%/.claude_config}"
     [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
     # The real persist target that ~/.claude points to
     readlink -f "${HOME}/.claude" 2>/dev/null || echo "${workspace_root}/.claude_persist"
@@ -1588,6 +1613,11 @@ printf '\n%s\n' "=== Step 7: Claude Code persistence ==="
 
 CLAUDE_PERSIST_DIR="${SCRIPT_DIR}/.claude_persist"
 CLAUDE_MEMORY_DIR="${SCRIPT_DIR}/.ai_memory"
+# Always create both target dirs before ANY symlink or path-through-symlink
+# mkdir calls. A dangling symlink (target dir missing) causes two failures:
+#   1. Claude Code: ENOENT when creating jobs/sessions dirs under ~/.claude
+#   2. mkdir -p on step 7b: "File exists" (can't traverse dangling symlink)
+mkdir -p "${CLAUDE_PERSIST_DIR}"
 mkdir -p "${CLAUDE_MEMORY_DIR}"
 
 # ── 7a. Migrate ~/.claude → workspace ──────────────────────────────────────
@@ -1596,25 +1626,32 @@ if [ -L "${HOME}/.claude" ]; then
     if [ "${CURRENT_TARGET}" = "${CLAUDE_PERSIST_DIR}" ]; then
         printf '  ~/.claude already symlinked to workspace: %s\n' "${CLAUDE_PERSIST_DIR}"
     else
-        printf '  ~/.claude symlinked to: %s (unexpected, leaving as-is)\n' "${CURRENT_TARGET}"
-    fi
-elif [ -d "${HOME}/.claude" ]; then
-    if [ -d "${CLAUDE_PERSIST_DIR}" ]; then
-        printf '  WARNING: Both ~/.claude and %s exist. Remove one manually.\n' "${CLAUDE_PERSIST_DIR}"
-    else
-        printf '  Migrating ~/.claude to %s ...\n' "${CLAUDE_PERSIST_DIR}"
-        cp -a "${HOME}/.claude" "${CLAUDE_PERSIST_DIR}" && \
-        rm -rf "${HOME}/.claude" && \
-        ln -s "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude" && \
+        # Symlink points somewhere else (e.g. .claude_config/dot-claude from
+        # an older ollama setup). Migrate data if the old target has content
+        # and our persist dir is empty, then re-point to .claude_persist.
+        printf '  ~/.claude was pointing to: %s — re-linking to %s\n' "${CURRENT_TARGET}" "${CLAUDE_PERSIST_DIR}"
+        if [ -d "${CURRENT_TARGET}" ] && [ -z "$(ls -A "${CLAUDE_PERSIST_DIR}" 2>/dev/null)" ]; then
+            printf '  Migrating Claude data...\n'
+            cp -a "${CURRENT_TARGET}/." "${CLAUDE_PERSIST_DIR}/"
+        fi
+        rm -f "${HOME}/.claude"
+        ln -sfn "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
         printf '  Done: ~/.claude -> %s\n' "${CLAUDE_PERSIST_DIR}"
     fi
-else
-    # ~/.claude doesn't exist yet; just create the symlink so future runs store data
-    # in the workspace. Claude Code will create the directory structure on first use.
-    if [ ! -d "${CLAUDE_PERSIST_DIR}" ]; then
-        mkdir -p "${CLAUDE_PERSIST_DIR}"
+elif [ -d "${HOME}/.claude" ]; then
+    if [ -z "$(ls -A "${HOME}/.claude" 2>/dev/null)" ]; then
+        rm -rf "${HOME}/.claude"
+    else
+        printf '  Migrating ~/.claude to %s ...\n' "${CLAUDE_PERSIST_DIR}"
+        cp -a "${HOME}/.claude/." "${CLAUDE_PERSIST_DIR}/" && rm -rf "${HOME}/.claude"
+        printf '  Done.\n'
     fi
-    ln -s "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
+    ln -sfn "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
+    printf '  Done: ~/.claude -> %s\n' "${CLAUDE_PERSIST_DIR}"
+else
+    # ~/.claude doesn't exist yet; create the symlink so future runs store data
+    # in the workspace. Claude Code will create the directory structure on first use.
+    ln -sfn "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
     printf '  Created: ~/.claude -> %s (empty, populated on first Claude launch)\n' "${CLAUDE_PERSIST_DIR}"
 fi
 
@@ -1639,7 +1676,7 @@ fi
 
 # ─── 8. Verify ────────────────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 8: Smoke test ==="
-if python3 -c "
+if "${PROXY_VENV}/bin/python3" -c "
 import sys; sys.path.insert(0, '${PERSISTENCE_DIR}')
 from proxy import app
 print('  Proxy module: OK')
@@ -1680,6 +1717,11 @@ cat << SUMMARY
     cz-proxy-stop       Stop it
     cz-proxy-status     Check if running
     cz-undo-danger      Remove danger guardrails from workspace CLAUDE.md
+
+  Coexistence with ollama setup (setup_claude_ollama_local_in_devcontainer.sh):
+    cz and 'c' share the same ~/.claude -> .claule_persist/ for session history.
+    Run them in separate windows to use different models, same sessions.
+    Do NOT run them concurrently — shared state files can corrupt under simultaneous writes.
 
   Session persistence is handled automatically by the script.  All chats
   are stored in .claude_persist/ which survives devcontainer rebuilds.
