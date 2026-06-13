@@ -109,8 +109,7 @@
 #         "DeepSeek":   [...],                                          # paid — set ZEN_API_KEY
 #         "xAI":        [...],                                          # paid — set ZEN_API_KEY
 #         "Other":      [...],                                          # paid — set ZEN_API_KEY
-#         "Free (working)": ["big-pickle", "deepseek-v4-flash-free", ...]   # free — no key needed
-#         "Free (expired)": ["qwen3.6-plus-free", ...]                     # expired promo — subscribe at opencode.ai/go
+#         "Free":       ["big-pickle", "deepseek-v4-flash-free", ...]       # free — no key needed
 #       }
 #     },
 #     "openai": {
@@ -935,17 +934,15 @@ if [ ! -f "${BACKENDS_FILE}" ]; then
                 "kimi-k2.6",
                 "kimi-k2.5",
                 "qwen3.6-plus",
-                "qwen3.5-plus"
+                "qwen3.5-plus",
+                "minimax-m3-free",
+                "qwen3.6-plus-free"
             ],
-            "Free (working)": [
+            "Free": [
                 "big-pickle",
                 "deepseek-v4-flash-free",
                 "nemotron-3-ultra-free",
                 "north-mini-code-free"
-            ],
-            "Free (expired)": [
-                "qwen3.6-plus-free",
-                "minimax-m3-free"
             ]
         }
     },
