@@ -361,6 +361,66 @@ PROVIDER_REGISTRY = {
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
     },
+    "together": {
+        "name": "Together AI",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+        "description": "Cloud platform for open-source models (Llama, Mistral, DeepSeek, etc.)",
+        "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "deepinfra": {
+        "name": "DeepInfra",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "api_key_env": "DEEPINFRA_API_KEY",
+        "description": "Serverless inference for open-source LLMs",
+        "free_tier_info": "Free tier with rate limits (Llama-3, Mixtral, DeepSeek, etc.)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "api_key_env": "FIREWORKS_API_KEY",
+        "description": "Fast inference for open-source and custom models",
+        "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "together": {
+        "name": "Together AI",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+        "description": "Cloud platform for open-source models",
+        "free_tier_info": "Free tier with rate limits",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "deepinfra": {
+        "name": "DeepInfra",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "api_key_env": "DEEPINFRA_API_KEY",
+        "description": "Serverless inference for open-source LLMs",
+        "free_tier_info": "Free tier with rate limits",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "api_key_env": "FIREWORKS_API_KEY",
+        "description": "Fast inference for open-source and custom models",
+        "free_tier_info": "Free tier with rate limits",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1259,36 @@ PROVIDER_REGISTRY = {
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
     },
+    "together": {
+        "name": "Together AI",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+        "description": "Cloud platform for open-source models (Llama, Mistral, DeepSeek, etc.)",
+        "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "deepinfra": {
+        "name": "DeepInfra",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "api_key_env": "DEEPINFRA_API_KEY",
+        "description": "Serverless inference for open-source LLMs",
+        "free_tier_info": "Free tier with rate limits (Llama-3, Mixtral, DeepSeek, etc.)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "api_key_env": "FIREWORKS_API_KEY",
+        "description": "Fast inference for open-source and custom models",
+        "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
 }
 
 def fetch_models(base_url, models_endpoint, api_key_env):
@@ -1323,6 +1413,7 @@ result = {
         "api_key": "",
         "model": "llama-3.3-70b-versatile",
         "provider_name": "Groq",
+        "models": {"Groq": all_models.get("groq", [])},
     },
     "google": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -1330,6 +1421,7 @@ result = {
         "api_key": "",
         "model": "gemini-1.5-flash",
         "provider_name": "Google (Gemini)",
+        "models": {"Gemini": all_models.get("google", [])},
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
@@ -1337,6 +1429,31 @@ result = {
         "api_key": "",
         "model": "openrouter/auto",
         "provider_name": "OpenRouter",
+        "models": {"OpenRouter": all_models.get("openrouter", [])},
+    },
+    "together": {
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+        "api_key": "",
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "provider_name": "Together AI",
+        "models": {"Together": all_models.get("together", [])},
+    },
+    "deepinfra": {
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "api_key_env": "DEEPINFRA_API_KEY",
+        "api_key": "",
+        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        "provider_name": "DeepInfra",
+        "models": {"DeepInfra": all_models.get("deepinfra", [])},
+    },
+    "fireworks": {
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "api_key_env": "FIREWORKS_API_KEY",
+        "api_key": "",
+        "model": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "provider_name": "Fireworks AI",
+        "models": {"Fireworks": all_models.get("fireworks", [])},
     },
 }
 
@@ -1435,6 +1552,18 @@ PROVIDER_META = {
         "name": "OpenRouter",
         "free_tier_info": "Some models free (mistral-7b, phi-3-mini) - see openrouter.ai",
     },
+    "together": {
+        "name": "Together AI",
+        "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
+    },
+    "deepinfra": {
+        "name": "DeepInfra",
+        "free_tier_info": "Free tier with rate limits (Llama-3, Mixtral, DeepSeek, etc.)",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
+    },
     "openai": {
         "name": "OpenAI",
         "free_tier_info": "No free tier (paid API key required)",
@@ -1502,12 +1631,22 @@ if zen_free:
         idx += 1
 
 if other_be:
-    print(f"{' Other Providers ':-^65}", file=sys.stderr)
+    print(f"{' Other Providers (set API key via env var) ':-^65}", file=sys.stderr)
+    last_pid = ""
     for label, pid, model, key_env, is_free, desc, free_info, kc, kt in other_be:
-        free_tag = f" [FREE TIER: {free_info}]" if free_info else ""
-        key_tag = f"  ({kc} {kt})" if key_env else ""
-        print(f"  {idx:>3}) {model} ({desc}){key_tag}", file=sys.stderr)
-        print(f"        {free_tag}" if free_tag else "", file=sys.stderr)
+        # Collapse models from same provider under one header line
+        if pid != last_pid:
+            last_pid = pid
+            meta_src = PROVIDER_META.get(pid, {})
+            prov_name = meta_src.get("name", desc)
+            free_tag = meta_src.get("free_tier_info", free_info)
+            model_count = sum(1 for e in other_be if e[1] == pid)
+            key_tag = f"  ({kc} {kt})" if key_env else ""
+            print(f"\n  {prov_name}{key_tag}", file=sys.stderr)
+            if free_tag and kt != "configured":
+                print(f"    {free_tag}", file=sys.stderr)
+        # Actually found an entry for this provider - look up models from the config
+        print(f"  {idx:>3}) {model}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
 
