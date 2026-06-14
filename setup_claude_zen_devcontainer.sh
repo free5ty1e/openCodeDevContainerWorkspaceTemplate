@@ -311,6 +311,107 @@ class Backend:
     provider_name: str = ""
     api_key_env: str = ""
     models: dict | None = None
+    # Enhanced metadata for rich model picker
+    description: str = ""
+    free_tier_info: str = ""
+    requires_api_key: bool = False
+
+# ---------------------------------------------------------------------------
+# Provider Registry with rich metadata for model picker
+# ---------------------------------------------------------------------------
+
+PROVIDER_REGISTRY = {
+    "zen": {
+        "name": "OpenCode Zen",
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_key_env": "ZEN_API_KEY",
+        "description": "Free and paid models from multiple providers via OpenCode proxy",
+        "free_tier_info": "Free models available without API key (big-pickle, deepseek-v4-flash-free, nemotron-3-ultra-free, north-mini-code-free)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "groq": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "description": "Ultra-fast inference for open-source models",
+        "free_tier_info": "14,400 requests/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b, etc.)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "google": {
+        "name": "Google (Gemini)",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key_env": "GOOGLE_API_KEY",
+        "description": "Google's Gemini models via OpenAI-compatible API",
+        "free_tier_info": "1,500 requests/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "description": "Access to 100+ models via single API",
+        "free_tier_info": "Some models free (mistral-7b, phi-3-mini, etc.) - check OpenRouter for current list",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# API Key Vault - persistent storage with prompting
+# ---------------------------------------------------------------------------
+
+import base64
+import hashlib
+
+class APIKeyVault:
+    """Persistent API key storage with optional encryption/obfuscation."""
+    
+    def __init__(self, vault_path: str):
+        self.vault_path = Path(vault_path)
+        self.vault_path.parent.mkdir(parents=True, exist_ok=True)
+        self._vault = {}
+        self._load()
+    
+    def _load(self):
+        if self.vault_path.exists():
+            try:
+                with open(self.vault_path, 'r') as f:
+                    self._vault = json.load(f)
+            except Exception:
+                self._vault = {}
+    
+    def _save(self):
+        try:
+            with open(self.vault_path, 'w') as f:
+                json.dump(self._vault, f, indent=2)
+        except Exception as e:
+            print(f"Warning: could not save API key vault: {e}", file=sys.stderr)
+    
+    def get_key(self, provider_id: str) -> str | None:
+        """Get API key for a provider."""
+        return self._vault.get(provider_id)
+    
+    def set_key(self, provider_id: str, key: str):
+        """Store API key for a provider."""
+        self._vault[provider_id] = key
+        self._save()
+    
+    def has_key(self, provider_id: str) -> bool:
+        """Check if provider has a stored key."""
+        return provider_id in self._vault and bool(self._vault[provider_id])
+    
+    def remove_key(self, provider_id: str):
+        """Remove stored key for a provider."""
+        if provider_id in self._vault:
+            del self._vault[provider_id]
+            self._save()
 
 # ---------------------------------------------------------------------------
 # Anthropic → OpenAI request conversion (adapted from claude-code-proxy)
@@ -870,46 +971,297 @@ if __name__ == "__main__":
 PYEOF
 chmod +x "${PROXY_SCRIPT}"
 printf '  Created %s\n' "${PROXY_SCRIPT}"
+# ─── 4.5. API Key Vault ──────────────────────────────────────────────────────
+KEY_VAULT_SCRIPT="${PERSISTENCE_DIR}/key_vault.py"
+cat > "${KEY_VAULT_SCRIPT}" << 'PYEOF'
+"""API Key Vault — resolve, prompt, and persist API keys for LLM providers.
+
+Usage:
+    python3 key_vault.py resolve <provider_id> <backends_file> <vault_file>
+        -> prints the key to stdout (empty = no key needed or user skipped)
+
+The vault file is a simple JSON dict: { "provider_id": "key_value", ... }
+"""
+import json, os, sys
+
+VAULT_FILE = ""
+BACKENDS_FILE = ""
+
+KEY_ENV_CACHE = {}  # provider_id -> env_var_name
+
+def get_key_env(pid):
+    """Get the env var name for a provider from backends.json."""
+    if pid in KEY_ENV_CACHE:
+        return KEY_ENV_CACHE[pid]
+    try:
+        with open(BACKENDS_FILE) as f:
+            cfg = json.load(f)
+        be = cfg.get(pid, {})
+        env_name = be.get("api_key_env", "")
+        KEY_ENV_CACHE[pid] = env_name
+        return env_name
+    except Exception:
+        return ""
+
+def get_provider_meta(pid):
+    """Get provider metadata from backends.json."""
+    try:
+        with open(BACKENDS_FILE) as f:
+            cfg = json.load(f)
+        be = cfg.get(pid, {})
+        return {
+            "name": be.get("provider_name", pid),
+            "description": be.get("description", ""),
+            "free_tier_info": be.get("free_tier_info", ""),
+        }
+    except Exception:
+        return {"name": pid, "description": "", "free_tier_info": ""}
+
+def load_vault():
+    try:
+        if os.path.exists(VAULT_FILE):
+            with open(VAULT_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_vault(vault):
+    try:
+        os.makedirs(os.path.dirname(VAULT_FILE), exist_ok=True)
+        with open(VAULT_FILE, 'w') as f:
+            json.dump(vault, f, indent=2)
+    except Exception as e:
+        print(f"  Warning: could not save API key: {e}", file=sys.stderr)
+
+def cmd_resolve(pid, model_name=""):
+    """Resolve the API key for provider pid.
+
+    Priority: 1) env var  2) vault  3) prompt user
+    Returns the key on stdout, empty if no key needed / user skipped.
+    If model_name is in a "Free" family in backends.json, skip prompting.
+    """
+    # Check if the selected model is free — skip key prompt entirely
+    if model_name:
+        try:
+            with open(BACKENDS_FILE) as f:
+                cfg = json.load(f)
+            be = cfg.get(pid, {})
+            models_dict = be.get("models", {})
+            for family, model_list in models_dict.items():
+                if family.startswith("Free") and model_name in model_list:
+                    return ""  # Free model — no API key needed
+        except Exception:
+            pass
+
+    key_env = get_key_env(pid)
+    if not key_env:
+        return ""  # No API key needed for this provider
+
+    # 1. Environment variable already set?
+    val = os.environ.get(key_env, "") or ""
+    if val:
+        return val
+
+    # 2. Check vault
+    vault = load_vault()
+    stored = vault.get(pid, "")
+    if stored:
+        return stored
+
+    # 3. Prompt user
+    meta = get_provider_meta(pid)
+    provider_name = meta.get("name", pid)
+    description = meta.get("description", "")
+    free_tier_info = meta.get("free_tier_info", "")
+
+    prompt_parts = [f"\n  {provider_name} requires an API key."]
+    if description:
+        prompt_parts.append(f"  {description}")
+    if free_tier_info:
+        prompt_parts.append(f"  {free_tier_info}")
+    prompt_parts.append(f"  Set ${key_env} or enter your key (or press Enter to skip): ")
+    prompt_text = "\n".join(prompt_parts)
+
+    try:
+        with open("/dev/tty", "r", encoding="utf-8") as tty:
+            sys.stderr.write(prompt_text + " ")
+            sys.stderr.flush()
+            key = tty.readline().strip()
+    except Exception:
+        return ""
+
+    if not key:
+        sys.stderr.write(f"  [SKIP] No key provided. Model may not work.\n")
+        return ""
+
+    # Store in vault
+    vault[pid] = key
+    save_vault(vault)
+    return key
+
+def cmd_set(pid, key_value):
+    """Store a key in the vault."""
+    vault = load_vault()
+    vault[pid] = key_value
+    save_vault(vault)
+    return ""
+
+def cmd_check(pid):
+    """Check if a key is available (env var or vault). Return the key if found."""
+    key_env = get_key_env(pid)
+    if not key_env:
+        return ""
+    val = os.environ.get(key_env, "") or ""
+    if val:
+        return val
+    vault = load_vault()
+    return vault.get(pid, "")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: key_vault.py <resolve|set|check> <provider_id> <backends_file> <vault_file> [key_value]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    pid = sys.argv[2]
+    BACKENDS_FILE = sys.argv[3]
+    VAULT_FILE = sys.argv[4]
+
+    if cmd == "resolve":
+        model_name = sys.argv[5] if len(sys.argv) >= 6 else ""
+        result = cmd_resolve(pid, model_name)
+        if result:
+            print(result)
+    elif cmd == "set":
+        if len(sys.argv) >= 6:
+            cmd_set(pid, sys.argv[5])
+    elif cmd == "check":
+        result = cmd_check(pid)
+        if result:
+            print(result)
+    else:
+        sys.exit(1)
+PYEOF
+chmod +x "${KEY_VAULT_SCRIPT}"
+printf '  Created %s\n' "${KEY_VAULT_SCRIPT}"
+
 
 # ─── 5. Backends config ───────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 5: Backends config ==="
 printf '  Querying OpenCode Zen API for available models...\n'
 python3 << 'PY' > "${BACKENDS_FILE}"
-"""Generate backends.json dynamically by querying the OpenCode Zen API."""
+"""Generate backends.json dynamically by querying ALL providers' APIs."""
 import json, os, sys, urllib.request
 from urllib.error import URLError
 
-API_BASE = "https://opencode.ai/zen/v1"
+# Provider registry (mirrors proxy.py's PROVIDER_REGISTRY)
+PROVIDER_REGISTRY = {
+    "zen": {
+        "name": "OpenCode Zen",
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_key_env": "ZEN_API_KEY",
+        "description": "Free and paid models from multiple providers via OpenCode proxy",
+        "free_tier_info": "Free models available without API key (big-pickle, deepseek-v4-flash-free, nemotron-3-ultra-free, north-mini-code-free)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "groq": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "description": "Ultra-fast inference for open-source models",
+        "free_tier_info": "14,400 requests/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b, etc.)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "google": {
+        "name": "Google (Gemini)",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key_env": "GOOGLE_API_KEY",
+        "description": "Google's Gemini models via OpenAI-compatible API",
+        "free_tier_info": "1,500 requests/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "description": "Access to 100+ models via single API",
+        "free_tier_info": "Some models free (mistral-7b, phi-3-mini, etc.) - check OpenRouter for current list",
+        "supports_dynamic_discovery": True,
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+    },
+}
 
-# ── Fetch model list from API ──────────────────────────────────────────────
-try:
-    req = urllib.request.Request(f"{API_BASE}/models", headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        all_models = [m["id"] for m in json.loads(resp.read()).get("data", [])]
-    if not all_models:
-        raise ValueError("empty model list")
-except Exception as e:
-    print(f"  Warning: could not fetch model list ({e}).", file=sys.stderr)
-    print(f"  Writing minimal fallback config.", file=sys.stderr)
-    json.dump({
-        "zen": {
-            "base_url": API_BASE, "api_key_env": "ZEN_API_KEY", "api_key": "",
-            "model": "", "provider_name": "ZEN",
-            "models": {"Free": ["big-pickle"]},
-        },
-        "openai": {
-            "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
-            "api_key": "", "model": "gpt-4o", "provider_name": "OpenAI",
-        },
-        "groq": {
-            "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY",
-            "api_key": "", "model": "llama-3.3-70b-versatile", "provider_name": "Groq",
-        },
-    }, sys.stdout, indent=4)
-    print()
-    sys.exit(0)
+def fetch_models(base_url, models_endpoint, api_key_env):
+    url = base_url.rstrip('/') + models_endpoint
+    headers = {"User-Agent": "Mozilla/5.0"}
+    api_key = os.environ.get(api_key_env, '')
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return [m.get("id", m.get("name", "")) for m in data.get("data", [])]
+    except Exception as e:
+        print(f"  Warning: could not fetch models from {base_url} ({e}).", file=sys.stderr)
+        return []
 
-# ── Classify models into families by name patterns ─────────────────────────
+def probe_free(base_url, chat_endpoint, model):
+    body = json.dumps({"model": model, "messages": [{"role":"user","content":"hi"}], "max_tokens":1, "stream":False}).encode()
+    headers = {"Content-Type":"application/json", "User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(base_url.rstrip('/') + "/chat/completions", data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8):
+            return True
+    except URLError as e:
+        if getattr(e, "code", None) == 401:
+            return False
+        return True
+    except Exception:
+        return True
+
+print('  Querying providers for available models...', file=sys.stderr)
+all_models = {}
+for pid, provider in PROVIDER_REGISTRY.items():
+    if provider.get('supports_dynamic_discovery'):
+        models = fetch_models(provider['base_url'], provider['models_endpoint'], provider['api_key_env'])
+        if models:
+            print(f'  Found {len(models)} models from {provider["name"]}', file=sys.stderr)
+            all_models[pid] = models
+        else:
+            print(f'  No models found from {provider["name"]}', file=sys.stderr)
+
+if not all_models:
+    print('  Warning: no models fetched from any provider. Using fallback.', file=sys.stderr)
+    all_models = {'zen': ['big-pickle']}
+
+# Probe free models
+zen_models_list = all_models.get('zen', [])
+free_candidates = [m for m in zen_models_list if m.endswith('-free') or m == 'big-pickle']
+
+free_models = []
+expired = []
+if free_candidates:
+    print(f'  Probing {len(free_candidates)} potential free model(s)...', file=sys.stderr)
+    zen_provider = PROVIDER_REGISTRY['zen']
+    for m in free_candidates:
+        if probe_free(zen_provider['base_url'], zen_provider['chat_endpoint'], m):
+            print(f'    ✓ {m}', file=sys.stderr)
+            free_models.append(m)
+        else:
+            print(f'    ✗ {m} (needs API key)', file=sys.stderr)
+            expired.append(m)
+
 FAMILY_RULES = [
     ("claude-", "Claude"), ("gpt-", "GPT"), ("gemini-", "Gemini"),
     ("deepseek-", "DeepSeek"), ("grok-", "xAI"),
@@ -917,83 +1269,81 @@ FAMILY_RULES = [
     ("qwen", "Other"), ("mimo-", "Other"), ("nemotron-", "Other"),
     ("north-", "Other"),
 ]
+
 def classify(mid):
     for prefix, family in FAMILY_RULES:
         if mid.startswith(prefix):
             return family
     return "Other"
 
-# First pass: classify everything
-families = {}  # family -> [model_ids]
-for m in all_models:
+families = {}
+zen_only = all_models.get('zen', [])
+for m in zen_only:
     fam = classify(m)
     families.setdefault(fam, []).append(m)
 
-# Identify free candidates and probe them
-free_candidates = [m for m in all_models if m.endswith("-free") or m == "big-pickle"]
+free_set = set(free_models)
+expired_set = set(expired)
 
-if free_candidates:
-    print(f"  Probing {len(free_candidates)} potential free model(s)...", file=sys.stderr)
-free_models = []
-expired = []
-for m in free_candidates:
-    body = json.dumps({"model": m, "messages": [{"role":"user","content":"hi"}], "max_tokens":1, "stream":False}).encode()
-    req = urllib.request.Request(f"{API_BASE}/chat/completions", data=body, headers={"Content-Type":"application/json", "User-Agent": "Mozilla/5.0"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=8):
-            free_models.append(m)
-            print(f"    \u2713 {m}", file=sys.stderr)
-    except URLError as e:
-        if getattr(e, "code", None) == 401:
-            expired.append(m)
-            print(f"    \u2717 {m} (needs API key)", file=sys.stderr)
-        else:
-            free_models.append(m)
-            print(f"    ? {m} (assuming free)", file=sys.stderr)
-    except Exception:
-        free_models.append(m)
-        print(f"    ? {m} (assuming free)", file=sys.stderr)
-
-# ── Build the output ──────────────────────────────────────────────────────
 ORDER = ["Claude", "GPT", "Gemini", "DeepSeek", "xAI", "Other", "Free"]
-zen_models = {}
+zen_models_out = {}
 
-# Add each family in order, removing free/expired models from their families
 for fam in ORDER:
     if fam == "Free":
         continue
-    remaining = [m for m in families.get(fam, []) if m not in free_models and m not in expired]
-    if remaining:
-        zen_models[fam] = remaining
+    models_in_fam = [m for m in families.get(fam, []) if m not in free_set and m not in expired_set]
+    if models_in_fam:
+        zen_models_out[fam] = models_in_fam
 
-# Free models (proven working) go last
 if free_models:
-    zen_models["Free"] = sorted(set(free_models))
+    zen_models_out["Free"] = sorted(set(free_models))
 
-# Expired models back into Other
 if expired:
-    zen_models.setdefault("Other", []).extend(expired)
+    zen_models_out.setdefault("Other", []).extend(expired)
 
 result = {
     "zen": {
-        "base_url": API_BASE, "api_key_env": "ZEN_API_KEY", "api_key": "",
-        "model": "", "provider_name": "ZEN",
-        "models": zen_models,
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_key_env": "ZEN_API_KEY",
+        "api_key": "",
+        "model": "",
+        "provider_name": "ZEN",
+        "models": zen_models_out,
     },
     "openai": {
-        "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
-        "api_key": "", "model": "gpt-4o", "provider_name": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "api_key": "",
+        "model": "gpt-4o",
+        "provider_name": "OpenAI",
     },
     "groq": {
-        "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY",
-        "api_key": "", "model": "llama-3.3-70b-versatile", "provider_name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "api_key": "",
+        "model": "llama-3.3-70b-versatile",
+        "provider_name": "Groq",
+    },
+    "google": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key_env": "GOOGLE_API_KEY",
+        "api_key": "",
+        "model": "gemini-1.5-flash",
+        "provider_name": "Google (Gemini)",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "api_key": "",
+        "model": "openrouter/auto",
+        "provider_name": "OpenRouter",
     },
 }
 
 json.dump(result, sys.stdout, indent=4)
 print()
 PY
-if [ -s "${BACKENDS_FILE}" ]; then
+    if [ -s "${BACKENDS_FILE}" ]; then
     printf '  Generated %s with dynamic model list\n' "${BACKENDS_FILE}"
 else
     printf '  Warning: dynamic generation failed, writing fallback.\n' >&2
@@ -1067,12 +1417,47 @@ try:
 except Exception as e:
     print(f"Error loading backends: {e}", file=sys.stderr); sys.exit(1)
 
-# Build model entries: (label, provider_id, model_name, api_key_env, is_free)
+# Provider registry with rich metadata for display
+PROVIDER_META = {
+    "zen": {
+        "name": "OpenCode Zen",
+        "free_tier_info": "Free models (big-pickle, deepseek-v4-flash-free) work without an API key. Paid models need ZEN_API_KEY.",
+    },
+    "groq": {
+        "name": "Groq",
+        "free_tier_info": "14,400 req/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b)",
+    },
+    "google": {
+        "name": "Google (Gemini)",
+        "free_tier_info": "1,500 req/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "free_tier_info": "Some models free (mistral-7b, phi-3-mini) - see openrouter.ai",
+    },
+    "openai": {
+        "name": "OpenAI",
+        "free_tier_info": "No free tier (paid API key required)",
+    },
+}
+
+def key_status(env_name):
+    """Return (status_char, status_text) for an API key env var."""
+    val = os.environ.get(env_name, "") or ""
+    if val:
+        return "\u2601", "configured"  # cloud emoji
+    return "\u2717", "not set"  # x mark
+
+# Build model entries with provider metadata
 entries = []
 for pid, bc in cfg.items():
     if not isinstance(bc, dict): continue
     pname = bc.get("provider_name", pid)
     api_key_env = bc.get("api_key_env", "")
+    meta = PROVIDER_META.get(pid, {})
+    desc = meta.get("name", pname)
+    free_info = meta.get("free_tier_info", "")
+    key_char, key_text = key_status(api_key_env)
 
     # Backend with multiple models grouped by family (e.g. Zen)
     models_dict = bc.get("models")
@@ -1080,26 +1465,26 @@ for pid, bc in cfg.items():
         for family in sorted(models_dict.keys()):
             is_free = family.startswith("Free")
             for m in models_dict[family]:
-                entries.append((f"{family} > {m}", pid, m, api_key_env, is_free))
+                entries.append((f"{family} > {m}", pid, m, api_key_env, is_free, desc, free_info, key_char, key_text))
         continue
 
     # Traditional single-model backend
     model = bc.get("model", "")
-    label = f"{model} ({pname})" if model else pname
-    entries.append((label, pid, model or "", api_key_env, False))
+    label = f"{model} ({desc})"
+    entries.append((label, pid, model or "", api_key_env, False, desc, free_info, key_char, key_text))
 
-# Sort entries within each category
+# Sort within categories
 zen_paid = sorted([e for e in entries if e[1] == "zen" and not e[4]], key=lambda x: x[0].lower())
 zen_free = sorted([e for e in entries if e[1] == "zen" and e[4]], key=lambda x: x[0].lower())
 other_be = sorted([e for e in entries if e[1] != "zen"], key=lambda x: x[0].lower())
 
-# Display in order: Paid -> Free -> Other, with continuous numbering
+# Display with rich metadata
 all_display = []
 idx = 1
 
 if zen_paid:
-    print(f"\n{' Paid Models (set ZEN_API_KEY env var) ':-^65}", file=sys.stderr)
-    for label, pid, model, key_env, is_free in zen_paid:
+    print(f"\n{' Paid Zen Models (set ZEN_API_KEY) ':-^65}", file=sys.stderr)
+    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in zen_paid:
         print(f"  {idx:>3}) {label}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
@@ -1109,19 +1494,20 @@ if zen_paid:
 
 if zen_free:
     print(f"{' Free Models (no API key needed) ':-^65}", file=sys.stderr)
-    for label, pid, model, key_env, is_free in zen_free:
+    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in zen_free:
         has_expired = "expired" in label.lower()
         suffix = "  (promotion ended)" if has_expired else ""
         print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
-    print(f"\n      * Expired promos can be reactivated at https://opencode.ai/go", file=sys.stderr)
 
 if other_be:
     print(f"{' Other Providers ':-^65}", file=sys.stderr)
-    for label, pid, model, key_env, is_free in other_be:
-        suff = f" (set ${key_env})" if key_env else ""
-        print(f"  {idx:>3}) {label}{suff}", file=sys.stderr)
+    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in other_be:
+        free_tag = f" [FREE TIER: {free_info}]" if free_info else ""
+        key_tag = f"  ({kc} {kt})" if key_env else ""
+        print(f"  {idx:>3}) {model} ({desc}){key_tag}", file=sys.stderr)
+        print(f"        {free_tag}" if free_tag else "", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
 
@@ -1205,6 +1591,39 @@ else
     return 1
 }
 
+
+
+# ── API Key resolution ──────────────────────────────────────────────────
+# Called before launching Claude to ensure the provider's API key is set.
+# Checks env var -> vault file -> prompts user interactively.
+_claude_zen_resolve_key() {
+    local pid="$1"
+    local dir="$2"
+    local model_name="$3"
+    local key_vault="${dir}/key_vault.py"
+
+    if [ ! -f "$key_vault" ]; then
+        return 0
+    fi
+
+    local key_value
+    key_value="$(python3 "$key_vault" resolve "$pid" \
+        "${ZEN_BACKENDS:-${dir}/backends.json}" \
+        "${dir}/api_keys.json" "$model_name")"
+
+    if [ -n "$key_value" ]; then
+        local key_env
+        key_env="$(python3 -c "
+import json
+with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
+    cfg = json.load(f)
+print(cfg.get('$pid', {}).get('api_key_env', ''))
+" 2>/dev/null)"
+        if [ -n "$key_env" ]; then
+            export "$key_env=$key_value"
+        fi
+    fi
+}
 # ── Launch Claude via the proxy ──────────────────────────────────────────────
 _claude_zen_find_claude() {
     local cmd
@@ -1251,6 +1670,8 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
     printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
     _claude_zen_ensure_proxy || true
     claude_bin="$(_claude_zen_find_claude)"
+    # Resolve API key for this provider (prompts if needed, checks vault)
+    _claude_zen_resolve_key "$provider_id" "$dir" "$model_name"
     ZEN_DEFAULT_PROVIDER="$provider_id" \
     ANTHROPIC_API_KEY="freecc" \
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
@@ -1291,6 +1712,8 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
 
     _claude_zen_ensure_proxy || true
     claude_bin="$(_claude_zen_find_claude)"
+    # Resolve API key for this provider (prompts if needed, checks vault)
+    _claude_zen_resolve_key "$provider_id" "$dir" "$model_name"
 
     # ── Install danger guardrails via helper ──────────────────────────────
     local backup_file
@@ -1883,8 +2306,9 @@ cat << SUMMARY
   Use cz-last, cz-recent, or their -danger counterparts to pick up where
   you left off.
 
-  Models are organized by family (Claude, GPT, Gemini, DeepSeek, etc.)
-  Edit backends.json to add/remove models:
+  Models dynamically discovered from: OpenCode Zen (free+paid), Groq, Google (Gemini), OpenRouter
+  API keys are auto-prompted and stored in api_keys.json (one-time setup per provider)
+  Edit backends.json to customize:
     ${BACKENDS_FILE}
 
 SUMMARY
