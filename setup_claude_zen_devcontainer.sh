@@ -1528,123 +1528,129 @@ PROVIDER_META = {
     },
     "groq": {
         "name": "Groq",
-        "free_tier_info": "14,400 req/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b)",
+        "free_tier_info": "14,400 req/day free tier",
     },
     "google": {
         "name": "Google (Gemini)",
-        "free_tier_info": "1,500 req/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
+        "free_tier_info": "1,500 req/day free tier",
     },
     "openrouter": {
         "name": "OpenRouter",
-        "free_tier_info": "Some models free (mistral-7b, phi-3-mini) - see openrouter.ai",
+        "free_tier_info": "Some models free - see openrouter.ai",
     },
     "together": {
         "name": "Together AI",
-        "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
+        "free_tier_info": "Free tier with rate limits",
     },
     "deepinfra": {
         "name": "DeepInfra",
-        "free_tier_info": "Free tier with rate limits (Llama-3, Mixtral, DeepSeek, etc.)",
+        "free_tier_info": "Free tier with rate limits",
     },
     "fireworks": {
         "name": "Fireworks AI",
-        "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
+        "free_tier_info": "Free tier with rate limits",
     },
 }
 
 def key_status(env_name):
-    """Return (status_char, status_text) for an API key env var."""
     val = os.environ.get(env_name, "") or ""
     if val:
-        return "\u2601", "configured"  # cloud emoji
-    return "\u2717", "not set"  # x mark
+        return "\u2601", "configured"
+    return "\u2717", "not set"
 
-# Build model entries with provider metadata
+# Build model entries: (label, provider_id, model_name, is_free, desc, free_info, key_char, key_text)
 entries = []
 for pid, bc in cfg.items():
     if not isinstance(bc, dict): continue
     pname = bc.get("provider_name", pid)
-    api_key_env = bc.get("api_key_env", "")
     meta = PROVIDER_META.get(pid, {})
     desc = meta.get("name", pname)
     free_info = meta.get("free_tier_info", "")
-    key_char, key_text = key_status(api_key_env)
+    key_char, key_text = key_status(bc.get("api_key_env", ""))
 
-    # Backend with multiple models grouped by family (e.g. Zen)
     models_dict = bc.get("models")
     if models_dict and isinstance(models_dict, dict):
         for family in sorted(models_dict.keys()):
             is_free = family.startswith("Free")
             for m in models_dict[family]:
-                entries.append((f"{family} > {m}", pid, m, api_key_env, is_free, desc, free_info, key_char, key_text))
+                entries.append((f"{family} > {m}", pid, m, is_free, desc, free_info, key_char, key_text))
         continue
 
-    # Traditional single-model backend
     model = bc.get("model", "")
-    label = f"{model} ({desc})"
-    entries.append((label, pid, model or "", api_key_env, False, desc, free_info, key_char, key_text))
+    entries.append((f"{model} ({desc})", pid, model or "", False, desc, free_info, key_char, key_text))
 
 # Sort within categories
-zen_paid = sorted([e for e in entries if e[1] == "zen" and not e[4]], key=lambda x: x[0].lower())
-zen_free = sorted([e for e in entries if e[1] == "zen" and e[4]], key=lambda x: x[0].lower())
+zen_paid = sorted([e for e in entries if e[1] == "zen" and not e[3]], key=lambda x: x[0].lower())
+zen_free = sorted([e for e in entries if e[1] == "zen" and e[3]], key=lambda x: x[0].lower())
 other_be = sorted([e for e in entries if e[1] != "zen"], key=lambda x: x[0].lower())
 
-# Display with rich metadata
-all_display = []
+# ── MAIN MENU ─────────────────────────────────────────────────────────────
+all_display = []   # (label, pid, model) for main menu
+paid_submenu = []  # (label, pid, model) for paid submenu
 idx = 1
 
+# Entry 1: Paid Zen models (submenu)
 if zen_paid:
-    print(f"\n{' Paid Zen Models (set ZEN_API_KEY) ':-^65}", file=sys.stderr)
-    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in zen_paid:
-        print(f"  {idx:>3}) {label}", file=sys.stderr)
-        all_display.append((label, pid, model))
-        idx += 1
-    if not os.environ.get("ZEN_API_KEY", ""):
-        print(f"\n      * Set ZEN_API_KEY to access paid models", file=sys.stderr)
-        print(f"      * Get one at https://opencode.ai/keys", file=sys.stderr)
+    paid_count = len(zen_paid)
+    print(f"  {idx:>3}) Paid Zen models (Claude, GPT, Gemini, etc. - requires ZEN_API_KEY)", file=sys.stderr)
+    all_display.append(("Paid Zen models (submenu)", "zen", "__submenu__"))
+    paid_submenu = [(label, pid, model) for label, pid, model, is_free, desc, free_info, kc, kt in zen_paid]
+    idx += 1
 
+# Other Providers: each model shown with free tier info
 if other_be:
-    print(f"{' Other Providers (set API key via env var) ':-^65}", file=sys.stderr)
-    last_pid = ""
-    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in other_be:
-        # Collapse models from same provider under one header line
-        if pid != last_pid:
-            last_pid = pid
-            meta_src = PROVIDER_META.get(pid, {})
-            prov_name = meta_src.get("name", desc)
-            free_tag = meta_src.get("free_tier_info", free_info)
-            model_count = sum(1 for e in other_be if e[1] == pid)
-            key_tag = f"  ({kc} {kt})" if key_env else ""
-            print(f"\n  {prov_name}{key_tag}", file=sys.stderr)
-            if free_tag and kt != "configured":
-                print(f"    {free_tag}", file=sys.stderr)
-        # Actually found an entry for this provider - look up models from the config
-        print(f"  {idx:>3}) {model}", file=sys.stderr)
+    print(f"\n{' Models with free tier access ':-^65}", file=sys.stderr)
+    for label, pid, model, is_free, desc, free_info, kc, kt in other_be:
+        free_tag = f" [{free_info}]" if free_info else " [free tier]"
+        print(f"  {idx:>3}) {desc} > {model}  {free_tag}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
 
-
-
+# Free Zen models at the very bottom
 if zen_free:
     print(f"{' Free Models (anonymous, no API key needed) ':-^65}", file=sys.stderr)
-    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in zen_free:
+    for label, pid, model, is_free, desc, free_info, kc, kt in zen_free:
         has_expired = "expired" in label.lower()
-        suffix = "  (promotion ended)" if has_expired else ""
+        suffix = "  (promotion ended)" if has_expired else "  [no API key needed]"
         print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
-print("\nSelect model:", file=sys.stderr)
-with open("/dev/tty", "r", encoding="utf-8") as tty:
-    c = tty.readline().strip()
-if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
-p = int(c) - 1
-if p < 0 or p >= len(all_display): print("Out of range.", file=sys.stderr); sys.exit(1)
 
-# Output: provider_id|model_name
-print(f"{all_display[p][1]}|{all_display[p][2]}")
+# ── SELECTION LOOP (menu + submenu) ────────────────────────────────────
+entry = None
+while True:
+    print("\nSelect model:", file=sys.stderr)
+    with open("/dev/tty", "r", encoding="utf-8") as tty:
+        c = tty.readline().strip()
+    if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
+    p = int(c) - 1
+    if p < 0 or p >= len(all_display): print("Out of range.", file=sys.stderr); sys.exit(1)
+
+    entry = all_display[p]
+
+    # If submenu selected, show paid Zen models and collect sub-selection
+    if entry[2] == "__submenu__":
+        print(f"\n{' Paid Zen Models (set ZEN_API_KEY env var) ':-^65}", file=sys.stderr)
+        for i, (label, pid, model) in enumerate(paid_submenu, 1):
+            print(f"  {i:>3}) {label}", file=sys.stderr)
+        if not os.environ.get("ZEN_API_KEY", ""):
+            print(f"\n      * Set ZEN_API_KEY to access paid models", file=sys.stderr)
+            print(f"      * Get one at https://opencode.ai/keys", file=sys.stderr)
+        print("\nSelect model (or 0 for main menu):", file=sys.stderr)
+        with open("/dev/tty", "r", encoding="utf-8") as tty:
+            c = tty.readline().strip()
+        if c == "0" or c.lower() == "b":
+            continue  # Back to main menu
+        if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
+        sp = int(c) - 1
+        if sp < 0 or sp >= len(paid_submenu): print("Out of range.", file=sys.stderr); sys.exit(1)
+        entry = paid_submenu[sp]
+
+    break  # Exit loop with valid entry
+
+print(f"{entry[1]}|{entry[2]}")
 PY
 }
-
 # ── Proxy lifecycle ───────────────────────────────────────────────────────────
 _claude_zen_ensure_proxy() {
     local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
