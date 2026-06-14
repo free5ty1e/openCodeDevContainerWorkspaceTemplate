@@ -1400,13 +1400,6 @@ result = {
         "provider_name": "ZEN",
         "models": zen_models_out,
     },
-    "openai": {
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY",
-        "api_key": "",
-        "model": "gpt-4o",
-        "provider_name": "OpenAI",
-    },
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
         "api_key_env": "GROQ_API_KEY",
@@ -1475,13 +1468,6 @@ else
         "models": {
             "Free": ["big-pickle"]
         }
-    },
-    "openai": {
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY",
-        "api_key": "",
-        "model": "gpt-4o",
-        "provider_name": "OpenAI"
     },
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
@@ -1564,10 +1550,6 @@ PROVIDER_META = {
         "name": "Fireworks AI",
         "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
     },
-    "openai": {
-        "name": "OpenAI",
-        "free_tier_info": "No free tier (paid API key required)",
-    },
 }
 
 def key_status(env_name):
@@ -1621,15 +1603,6 @@ if zen_paid:
         print(f"\n      * Set ZEN_API_KEY to access paid models", file=sys.stderr)
         print(f"      * Get one at https://opencode.ai/keys", file=sys.stderr)
 
-if zen_free:
-    print(f"{' Free Models (no API key needed) ':-^65}", file=sys.stderr)
-    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in zen_free:
-        has_expired = "expired" in label.lower()
-        suffix = "  (promotion ended)" if has_expired else ""
-        print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
-        all_display.append((label, pid, model))
-        idx += 1
-
 if other_be:
     print(f"{' Other Providers (set API key via env var) ':-^65}", file=sys.stderr)
     last_pid = ""
@@ -1650,6 +1623,16 @@ if other_be:
         all_display.append((label, pid, model))
         idx += 1
 
+
+
+if zen_free:
+    print(f"{' Free Models (anonymous, no API key needed) ':-^65}", file=sys.stderr)
+    for label, pid, model, key_env, is_free, desc, free_info, kc, kt in zen_free:
+        has_expired = "expired" in label.lower()
+        suffix = "  (promotion ended)" if has_expired else ""
+        print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
+        all_display.append((label, pid, model))
+        idx += 1
 print("\nSelect model:", file=sys.stderr)
 with open("/dev/tty", "r", encoding="utf-8") as tty:
     c = tty.readline().strip()
