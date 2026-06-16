@@ -242,8 +242,17 @@ build_wrapper_block() {
         -e "s|__MAX_THINKING_TOKENS__|${MAX_THINKING_TOKENS_DEFAULT}|g" \
         -e "s|__EFFORT_DEFAULT__|${EFFORT_DEFAULT}|g" \
         -e "s|__DANGEROUSLY_SKIP__|${DANGEROUSLY_SKIP_PERMISSIONS}|g" \
-        -e "s|__MODEL_FILE__|${MODEL_FILE}|g"
+        -e "s|__MODEL_FILE__|${MODEL_FILE}|g" \
+        -e "s|__SCRIPT_DIR__|${SCRIPT_DIR}|g" \
+        -e "s|__PERSISTENCE_DIR__|${PERSISTENCE_DIR}|g" \
+        -e "s|__CLAUDE_OLLAMA_PERSISTENCE_DIR__|${CLAUDE_PERSIST_DIR}|g"
 __MARKER_BEGIN__
+# These are resolved at setup time so the rc file contains literal paths — no $0,
+# no $(pwd), nothing that breaks in an interactive shell. Everything stays in the
+# workspace; the home folder is ephemeral and not used for any persistence.
+SCRIPT_DIR="__SCRIPT_DIR__"
+PERSISTENCE_DIR="__PERSISTENCE_DIR__"
+CLAUDE_OLLAMA_PERSISTENCE_DIR="__CLAUDE_OLLAMA_PERSISTENCE_DIR__"
 export OLLAMA_HOST="__LLM_HOST__"
 export CLAUDE_OLLAMA_MODEL_FILE="__MODEL_FILE__"
 # Default num_ctx baked in unconditionally so re-running the script upgrades it.
@@ -431,6 +440,14 @@ claude_cloud_launch() {
 _claude_ollama_install_danger_guardrails() {
     local workspace_root="$1" dir="$2" claude_md danger_dir backup_file
     claude_md="${workspace_root}/CLAUDE.md"
+    # Use CLAUDE_OLLAMA_PERSISTENCE_DIR consistently — respects the user's
+    # CLAUDE_OLLAMA_PERSIST_DIR override; falls back to SCRIPT_DIR/.claude_persist.
+    dir="${dir:-${CLAUDE_OLLAMA_PERSISTENCE_DIR}}"
+    [ -z "$dir" ] && dir="$(pwd)/.claude_config"
+    # Guard against pathological empty-path resolving "/" — never create /danger.
+    case "$dir" in
+        ""|"/") dir="$(pwd)/.claude_config" ;;
+    esac
     danger_dir="${dir}/danger"
     mkdir -p "$danger_dir"
     backup_file="${danger_dir}/CLAUDE.md.bak"
@@ -510,6 +527,8 @@ DANGEREOF
 _claude_ollama_cleanup_danger_guardrails() {
     local workspace_root="$1" dir="$2" backup_file="$3" exit_code="${4:-$?}"
     local claude_md="${workspace_root}/CLAUDE.md"
+    # Use CLAUDE_OLLAMA_PERSISTENCE_DIR consistently (respects overrides).
+    dir="${dir:-${CLAUDE_OLLAMA_PERSISTENCE_DIR}}"
     if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
         cp "$backup_file" "$claude_md"
     elif [ -f "$backup_file" ]; then
@@ -546,22 +565,23 @@ claude_ollama_launch_danger() {
     printf '\n'
 
     local backup_file
-    backup_file="$(_claude_ollama_install_danger_guardrails "$workspace_root" "${PERSISTENCE_DIR}")"
+    # Use CLAUDE_OLLAMA_PERSISTENCE_DIR for consistency with the rest of the script.
+    backup_file="$(_claude_ollama_install_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}")"
 
     printf 'Launching Claude on %s (danger mode)\n' "${launch_model}" >&2
     OLLAMA_HOST="${OLLAMA_HOST}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
-    ollama launch claude --model "${launch_model}" -- "$@"
+    ollama launch claude --model "${launch_model}" -- --dangerously-skip-permissions "$@"
 
-    _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${PERSISTENCE_DIR}" "$backup_file"
+    _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
 }
 
 claude_ollama_uninstall_danger_rules() {
-    local workspace_root="${PERSISTENCE_DIR%/*}"
+    local workspace_root="${CLAUDE_OLLAMA_PERSISTENCE_DIR%/*}"
     [ -z "$workspace_root" ] && workspace_root="$(pwd)"
     local claude_md="${workspace_root}/CLAUDE.md"
-    local backup_file="${PERSISTENCE_DIR}/danger/CLAUDE.md.bak"
+    local backup_file="${CLAUDE_OLLAMA_PERSISTENCE_DIR}/danger/CLAUDE.md.bak"
 
     if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
         cp "$backup_file" "$claude_md"
