@@ -531,9 +531,14 @@ def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
                         case "text":
                             text_parts.append(block.get("text", ""))
                         case "thinking":
-                            text_parts.append(
-                                block.get("signature", "") or block.get("text", "")
-                            )
+                            # Thinking blocks are Claude's internal reasoning;
+                            # their signature is meaningless to non-Anthropic
+                            # upstreams (Google, OpenRouter, etc.) and would
+                            # corrupt the conversation context.  Use the text
+                            # if available, otherwise skip entirely.
+                            think_text = block.get("text", "")
+                            if think_text:
+                                text_parts.append(think_text)
                         case "tool_use":
                             func_args = json.dumps(block.get("input", {}))
                             tool_calls.append({
