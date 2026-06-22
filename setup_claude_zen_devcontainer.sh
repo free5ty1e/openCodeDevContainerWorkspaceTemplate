@@ -1430,7 +1430,7 @@ result = {
         "api_key": "",
         "model": "",
         "provider_name": "Groq",
-        "models": {"Groq": all_models.get("groq", [])},
+        "models": {"Free": all_models.get("groq", [])},
     },
     "google": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -1438,7 +1438,7 @@ result = {
         "api_key": "",
         "model": "",
         "provider_name": "Google (Gemini)",
-        "models": {"Gemini": all_models.get("google", [])},
+        "models": {"Free": all_models.get("google", [])},
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
@@ -1454,7 +1454,7 @@ result = {
         "api_key": "",
         "model": "",
         "provider_name": "Together AI",
-        "models": {"Together": all_models.get("together", [])},
+        "models": {"Free": all_models.get("together", [])},
     },
     "deepinfra": {
         "base_url": "https://api.deepinfra.com/v1/openai",
@@ -1462,7 +1462,7 @@ result = {
         "api_key": "",
         "model": "",
         "provider_name": "DeepInfra",
-        "models": {"DeepInfra": all_models.get("deepinfra", [])},
+        "models": {"Free": all_models.get("deepinfra", [])},
     },
     "fireworks": {
         "base_url": "https://api.fireworks.ai/inference/v1",
@@ -1470,7 +1470,7 @@ result = {
         "api_key": "",
         "model": "",
         "provider_name": "Fireworks AI",
-        "models": {"Fireworks": all_models.get("fireworks", [])},
+        "models": {"Free": all_models.get("fireworks", [])},
     },
 }
 
@@ -1766,9 +1766,14 @@ while True:
                     "model": "",
                     "provider_name": cname,
                 }
-            # Add model list
-            free_models_list = [m for m in model_list if ":free" in m or "-free" in m]
-            paid_models_list = [m for m in model_list if ":free" not in m and "-free" not in m]
+            # Add model list — classify as free/paid
+            # Providers with free tiers: ALL models are free-tier models
+            if cpid in ("google", "groq", "deepinfra"):
+                free_models_list = model_list
+                paid_models_list = []
+            else:
+                free_models_list = [m for m in model_list if ":free" in m or "-free" in m]
+                paid_models_list = [m for m in model_list if ":free" not in m and "-free" not in m]
             cfg_all[cpid]["models"] = {}
             if free_models_list:
                 cfg_all[cpid]["models"]["Free"] = free_models_list
@@ -1781,6 +1786,14 @@ while True:
                 json.dump(cfg_all, fh, indent=4)
 
             print(f"  Added {len(model_list)} models from {cname}!", file=sys.stderr)
+            # Kill the running proxy so it restarts with fresh API keys on next launch
+            try:
+                pid_file = os.path.join(os.path.dirname(backends_file), "proxy.pid")
+                with open(pid_file) as pf:
+                    pid = int(pf.read().strip())
+                os.kill(pid, 15)  # SIGTERM
+            except Exception:
+                pass  # Proxy not running or no PID file
         except Exception as e:
             print(f"  Error updating backends.json: {e}", file=sys.stderr)
             continue
