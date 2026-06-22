@@ -1536,7 +1536,7 @@ unset -f cz cz_new ccz claude_zen_launch claude_zen_launch_danger \
 # ── Interactive model picker ──────────────────────────────────────────────────
 _claude_zen_pick() {
     python3 - "$@" << 'PY'
-import json, os, sys
+import json, os, sys, urllib.request
 f = os.environ.get("ZEN_BACKENDS") or "__BACKENDS_FILE__"
 try:
     with open(f) as fh:
