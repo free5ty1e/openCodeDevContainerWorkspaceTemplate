@@ -1428,7 +1428,7 @@ result = {
         "base_url": "https://api.groq.com/openai/v1",
         "api_key_env": "GROQ_API_KEY",
         "api_key": "",
-        "model": "llama-3.3-70b-versatile",
+        "model": "",
         "provider_name": "Groq",
         "models": {"Groq": all_models.get("groq", [])},
     },
@@ -1436,7 +1436,7 @@ result = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "api_key_env": "GOOGLE_API_KEY",
         "api_key": "",
-        "model": "gemini-1.5-flash",
+        "model": "",
         "provider_name": "Google (Gemini)",
         "models": {"Gemini": all_models.get("google", [])},
     },
@@ -1444,7 +1444,7 @@ result = {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
         "api_key": "",
-        "model": "openrouter/auto",
+        "model": "",
         "provider_name": "OpenRouter",
         "models": {"Free": all_models.get("openrouter_free", []), "Paid": all_models.get("openrouter_paid", [])},
     },
@@ -1452,7 +1452,7 @@ result = {
         "base_url": "https://api.together.xyz/v1",
         "api_key_env": "TOGETHER_API_KEY",
         "api_key": "",
-        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "model": "",
         "provider_name": "Together AI",
         "models": {"Together": all_models.get("together", [])},
     },
@@ -1460,7 +1460,7 @@ result = {
         "base_url": "https://api.deepinfra.com/v1/openai",
         "api_key_env": "DEEPINFRA_API_KEY",
         "api_key": "",
-        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        "model": "",
         "provider_name": "DeepInfra",
         "models": {"DeepInfra": all_models.get("deepinfra", [])},
     },
@@ -1468,7 +1468,7 @@ result = {
         "base_url": "https://api.fireworks.ai/inference/v1",
         "api_key_env": "FIREWORKS_API_KEY",
         "api_key": "",
-        "model": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "model": "",
         "provider_name": "Fireworks AI",
         "models": {"Fireworks": all_models.get("fireworks", [])},
     },
@@ -1497,7 +1497,7 @@ else
         "base_url": "https://api.groq.com/openai/v1",
         "api_key_env": "GROQ_API_KEY",
         "api_key": "",
-        "model": "llama-3.3-70b-versatile",
+        "model": "",
         "provider_name": "Groq"
     }
 }
@@ -1607,50 +1607,73 @@ for pid, bc in cfg.items():
 all_free = sorted([e for e in entries if e[3]], key=lambda x: x[0].lower())
 all_paid = sorted([e for e in entries if not e[3]], key=lambda x: x[0].lower())
 
+# Detect hidden providers (in PROVIDER_META but not actually in cfg with models)
+hidden_providers = {}
+for pid, meta in PROVIDER_META.items():
+    if pid == "zen": continue
+    be = cfg.get(pid, {})
+    has_models = bool(be.get("models") and any(be["models"].values()))
+    if not has_models:
+        hidden_providers[pid] = meta.get("name", pid)
+
 # Separate anonymous Zen free models from other free models
 anon_free = [e for e in all_free if e[1] == "zen"]
 free_with_tier = [e for e in all_free if e[1] != "zen"]
 
-# ── MAIN MENU ─────────────────────────────────────────────────────────────
-all_display = []   # (label, pid, model) for main menu
-paid_submenu = []  # (label, pid, model) for paid submenu
-idx = 1
-
-# Entry 1: All paid models (submenu)
-if all_paid:
-    print(f"  {idx:>3}) Paid models from all providers (requires API key)", file=sys.stderr)
-    all_display.append(("Paid models (submenu)", "_all_", "__submenu__"))
-    paid_submenu = [(label, pid, model) for label, pid, model, is_free, desc, free_info, kc, kt in all_paid]
-    idx += 1
-
-# Free models from providers with free tier (need API key but free to use)
-if free_with_tier:
-    print(f"\n{' Models with free tier access (set API key) ':-^65}", file=sys.stderr)
-    last_pid = ""
-    for label, pid, model, is_free, desc, free_info, kc, kt in free_with_tier:
-        if pid != last_pid:
-            last_pid = pid
-            meta_src = PROVIDER_META.get(pid, {})
-            prov_name = meta_src.get("name", desc)
-            free_tag = meta_src.get("free_tier_info", free_info) or ""
-            print(f"  \n  {prov_name}: {free_tag}", file=sys.stderr)
-        print(f"  {idx:>3}) {model}", file=sys.stderr)
-        all_display.append((label, pid, model))
-        idx += 1
-
-# Anonymous free Zen models (no API key needed)
-if anon_free:
-    print(f"{' Free Models (anonymous, no API key needed) ':-^65}", file=sys.stderr)
-    for label, pid, model, is_free, desc, free_info, kc, kt in anon_free:
-        has_expired = "expired" in label.lower()
-        suffix = "  (promotion ended)" if has_expired else "  [no API key needed]"
-        print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
-        all_display.append((label, pid, model))
-        idx += 1
-
-# ── SELECTION LOOP (menu + submenu) ────────────────────────────────────
+# ── MENU LOOP (supports re-display after provider configuration) ──────────
+backends_file = f
+reconfigured = True
 entry = None
+
 while True:
+    if reconfigured:
+        all_display = []
+        paid_submenu = []
+        idx = 1
+
+        # Entry 1: All paid models (submenu)
+        if all_paid:
+            print(f"  {idx:>3}) Paid models from all providers (requires API key)", file=sys.stderr)
+            all_display.append(("Paid models (submenu)", "_all_", "__submenu__"))
+            paid_submenu = [(label, pid, model) for label, pid, model, is_free, desc, free_info, kc, kt in all_paid]
+            idx += 1
+
+        # Free models from providers with free tier
+        if free_with_tier:
+            print(f"\n{' Models with free tier access (set API key) ':-^65}", file=sys.stderr)
+            last_pid = ""
+            for label, pid, model, is_free, desc, free_info, kc, kt in free_with_tier:
+                if pid != last_pid:
+                    last_pid = pid
+                    meta_src = PROVIDER_META.get(pid, {})
+                    prov_name = meta_src.get("name", desc)
+                    free_tag = meta_src.get("free_tier_info", free_info) or ""
+                    print(f"\n  {prov_name}: {free_tag}", file=sys.stderr)
+                print(f"  {idx:>3}) {model}", file=sys.stderr)
+                all_display.append((label, pid, model))
+                idx += 1
+
+        # Free Zen models (anonymous, no API key)
+        if anon_free:
+            print(f"{' Free Models (anonymous, no API key needed) ':-^65}", file=sys.stderr)
+            for label, pid, model, is_free, desc, free_info, kc, kt in anon_free:
+                has_expired = "expired" in label.lower()
+                suffix = "  (promotion ended)" if has_expired else "  [no API key needed]"
+                print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
+                all_display.append((label, pid, model))
+                idx += 1
+
+        # Configure providers section (for hidden/API-key-required providers)
+        if hidden_providers:
+            print(f"{' Configure Providers (enter API key to enable) ':-^65}", file=sys.stderr)
+            for cpid, cname in hidden_providers.items():
+                print(f"  {idx:>3}) Set up {cname} API key -> scan and add models", file=sys.stderr)
+                all_display.append((f"Configure {cname}", cpid, "__configure__"))
+                idx += 1
+
+        reconfigured = False
+
+    # ── SELECTION ────────────────────────────────────────────────────────
     print("\nSelect model:", file=sys.stderr)
     with open("/dev/tty", "r", encoding="utf-8") as tty:
         c = tty.readline().strip()
@@ -1660,7 +1683,7 @@ while True:
 
     entry = all_display[p]
 
-    # If submenu selected, show all paid models organized by provider
+    # Handle submenu (paid models)
     if entry[2] == "__submenu__":
         print(f"\n{' Paid Models (set API key via env var) ':-^65}", file=sys.stderr)
         sub_idx = 1
@@ -1673,9 +1696,9 @@ while True:
                 prov_name = meta_src.get("name", bc.get("provider_name", pid))
                 kc, kt = key_status(bc.get("api_key_env", ""))
                 print(f"\n  {prov_name}  ({kc} {kt})", file=sys.stderr)
-                api_key_env = bc.get("api_key_env", "")
-                if api_key_env:
-                    print(f"    Set ${api_key_env} to access", file=sys.stderr)
+                ek = bc.get("api_key_env", "")
+                if ek:
+                    print(f"    Set ${ek} to access", file=sys.stderr)
             print(f"  {sub_idx:>3}) {label}", file=sys.stderr)
             sub_idx += 1
         print("\nSelect model (or 0 for main menu):", file=sys.stderr)
@@ -1687,8 +1710,118 @@ while True:
         sp = int(c) - 1
         if sp < 0 or sp >= len(paid_submenu): print("Out of range.", file=sys.stderr); sys.exit(1)
         entry = paid_submenu[sp]
+        break
 
-    break
+    # Handle configure provider entry
+    if entry[2] == "__configure__":
+        cpid = entry[1]
+        cname = PROVIDER_META.get(cpid, {}).get("name", cpid)
+        backends_entry = cfg.get(cpid, {})
+        base_url = backends_entry.get("base_url", "")
+        api_key_env = backends_entry.get("api_key_env", "")
+        models_endpoint = "/models"
+
+        if not api_key_env:
+            print(f"  No API key variable known for {cname}", file=sys.stderr)
+            continue
+
+        # Check env var or vault
+        import subprocess as _sp
+        key_vault_path = os.path.join(os.path.dirname(os.path.dirname(backends_file)), "key_vault.py")
+        vault_file = os.path.join(os.path.dirname(backends_file), "api_keys.json")
+        
+        result = _sp.run(
+            ["python3", key_vault_path, "resolve", cpid, backends_file, vault_file, ""],
+            capture_output=True, text=True
+        )
+        key = result.stdout.strip()
+
+        if not key:
+            print(f"  No API key provided for {cname}. Skipping.", file=sys.stderr)
+            continue
+
+        # Fetch models for this provider
+        print(f"  Fetching models from {cname}...", file=sys.stderr)
+        url = base_url.rstrip('/') + "/models"
+        headers = {"User-Agent": "Mozilla/5.0", "Authorization": f"Bearer {key}"}
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+                model_list = [m.get("id", m.get("name", "")) for m in data.get("data", [])]
+                print(f"  Found {len(model_list)} models from {cname}!", file=sys.stderr)
+        except Exception as e:
+            print(f"  Error fetching models from {cname}: {e}", file=sys.stderr)
+            continue
+
+        # Update backends.json
+        try:
+            with open(backends_file) as fh:
+                cfg_all = json.load(fh)
+            if cpid not in cfg_all:
+                cfg_all[cpid] = {
+                    "base_url": base_url,
+                    "api_key_env": api_key_env,
+                    "api_key": "",
+                    "model": "",
+                    "provider_name": cname,
+                }
+            # Add model list
+            free_models_list = [m for m in model_list if ":free" in m or "-free" in m]
+            paid_models_list = [m for m in model_list if ":free" not in m and "-free" not in m]
+            cfg_all[cpid]["models"] = {}
+            if free_models_list:
+                cfg_all[cpid]["models"]["Free"] = free_models_list
+            if paid_models_list:
+                cfg_all[cpid]["models"]["Paid"] = paid_models_list
+            if not free_models_list and not paid_models_list:
+                cfg_all[cpid]["models"] = {cname: model_list}
+
+            with open(backends_file, 'w') as fh:
+                json.dump(cfg_all, fh, indent=4)
+
+            print(f"  Added {len(model_list)} models from {cname}!", file=sys.stderr)
+        except Exception as e:
+            print(f"  Error updating backends.json: {e}", file=sys.stderr)
+            continue
+
+        # Re-read config and rebuild menu
+        try:
+            with open(backends_file) as fh:
+                cfg = json.load(fh)
+        except Exception:
+            pass
+        
+        # Remove this provider from hidden list
+        hidden_providers.pop(cpid, None)
+        
+        # Rebuild all entries
+        entries = []
+        for pid, bc in cfg.items():
+            if not isinstance(bc, dict): continue
+            pname = bc.get("provider_name", pid)
+            meta = PROVIDER_META.get(pid, {})
+            desc = meta.get("name", pname)
+            free_info = meta.get("free_tier_info", "")
+            key_char, key_text = key_status(bc.get("api_key_env", ""))
+            models_dict = bc.get("models")
+            if models_dict and isinstance(models_dict, dict):
+                for family in sorted(models_dict.keys()):
+                    is_free = family.startswith("Free")
+                    for m in models_dict[family]:
+                        entries.append((f"{family} > {m}", pid, m, is_free, desc, free_info, key_char, key_text))
+                continue
+            model = bc.get("model", "")
+            entries.append((f"{model} ({desc})", pid, model or "", False, desc, free_info, key_char, key_text))
+
+        all_free = sorted([e for e in entries if e[3]], key=lambda x: x[0].lower())
+        all_paid = sorted([e for e in entries if not e[3]], key=lambda x: x[0].lower())
+        anon_free = [e for e in all_free if e[1] == "zen"]
+        free_with_tier = [e for e in all_free if e[1] != "zen"]
+        reconfigured = True
+        continue
+
+    break  # Exit loop with valid entry
 
 print(f"{entry[1]}|{entry[2]}")
 PY
