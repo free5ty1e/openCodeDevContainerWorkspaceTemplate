@@ -2012,7 +2012,7 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
     _claude_zen_ensure_proxy || true
     claude_bin="$(_claude_zen_find_claude)"
     ZEN_DEFAULT_PROVIDER="$provider_id" \
-    ANTHROPIC_API_KEY="freecc" \
+    ANTHROPIC_API_KEY="freecc:${provider_id}" \
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
     "$claude_bin" --model "$model_name" "$@"
 }
@@ -2061,7 +2061,7 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
 
     # ── Launch with auto-accept ────────────────────────────────────────────
     ZEN_DEFAULT_PROVIDER="$provider_id" \
-    ANTHROPIC_API_KEY="freecc" \
+    ANTHROPIC_API_KEY="freecc:${provider_id}" \
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
     "$claude_bin" --model "$model_name" --dangerously-skip-permissions "$@"
 
@@ -2353,13 +2353,13 @@ PY
                 printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
                 env ZEN_DEFAULT_PROVIDER="${provider_id}" \
                     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-                    ANTHROPIC_API_KEY="freecc" \
+                    ANTHROPIC_API_KEY="freecc:${provider_id}" \
                     "${claude_bin}" --model "${model_name}" --resume "${sid}" --dangerously-skip-permissions "$@"
                 _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
             else
                 exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
                     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-                    ANTHROPIC_API_KEY="freecc" \
+                    ANTHROPIC_API_KEY="freecc:${provider_id}" \
                     "${claude_bin}" --model "${model_name}" --resume "${sid}" "$@"
             fi
             ;;
@@ -2400,13 +2400,13 @@ else
         printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
         env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc" \
+            ANTHROPIC_API_KEY="freecc:${provider_id}" \
             "${claude_bin}" --model "${model_name}" --continue --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
 else
         exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc" \
+            ANTHROPIC_API_KEY="freecc:${provider_id}" \
             "${claude_bin}" --model "${model_name}" --continue "$@"
     fi
 }
@@ -2466,13 +2466,13 @@ else
         printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
         env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc" \
+            ANTHROPIC_API_KEY="freecc:${provider_id}" \
             "${claude_bin}" --model "${model_name}" --resume "$session_id" --dangerously-skip-permissions "$@"
         _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
 else
         exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc" \
+            ANTHROPIC_API_KEY="freecc:${provider_id}" \
             "${claude_bin}" --model "${model_name}" --resume "$session_id" "$@"
     fi
 }
