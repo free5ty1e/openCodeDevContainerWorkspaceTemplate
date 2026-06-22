@@ -337,6 +337,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "GROQ_API_KEY",
         "description": "Ultra-fast inference for open-source models",
         "free_tier_info": "14,400 requests/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b, etc.)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -347,6 +348,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "GOOGLE_API_KEY",
         "description": "Google's Gemini models via OpenAI-compatible API",
         "free_tier_info": "1,500 requests/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -367,6 +369,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "TOGETHER_API_KEY",
         "description": "Cloud platform for open-source models (Llama, Mistral, DeepSeek, etc.)",
         "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -387,6 +390,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "FIREWORKS_API_KEY",
         "description": "Fast inference for open-source and custom models",
         "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -1101,7 +1105,8 @@ def cmd_resolve(pid, model_name=""):
     Returns the key on stdout, empty if no key needed / user skipped.
     If model_name is in a "Free" family in backends.json, skip prompting.
     """
-    # Check if the selected model is free — skip key prompt entirely
+    # Check if the selected model is a Zen free model — skip key prompt
+    # (OpenRouter :free models still need the API key for routing)
     if model_name:
         try:
             with open(BACKENDS_FILE) as f:
@@ -1109,8 +1114,8 @@ def cmd_resolve(pid, model_name=""):
             be = cfg.get(pid, {})
             models_dict = be.get("models", {})
             for family, model_list in models_dict.items():
-                if family.startswith("Free") and model_name in model_list:
-                    return ""  # Free model — no API key needed
+                if family.startswith("Free") and model_name in model_list and pid == "zen":
+                    return ""  # Free Zen model — no API key needed
         except Exception:
             pass
 
@@ -1235,6 +1240,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "GROQ_API_KEY",
         "description": "Ultra-fast inference for open-source models",
         "free_tier_info": "14,400 requests/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b, etc.)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -1245,6 +1251,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "GOOGLE_API_KEY",
         "description": "Google's Gemini models via OpenAI-compatible API",
         "free_tier_info": "1,500 requests/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -1265,6 +1272,7 @@ PROVIDER_REGISTRY = {
         "api_key_env": "TOGETHER_API_KEY",
         "description": "Cloud platform for open-source models (Llama, Mistral, DeepSeek, etc.)",
         "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
@@ -1285,16 +1293,22 @@ PROVIDER_REGISTRY = {
         "api_key_env": "FIREWORKS_API_KEY",
         "description": "Fast inference for open-source and custom models",
         "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
+        "requires_key_for_listing": True,
         "supports_dynamic_discovery": True,
         "models_endpoint": "/models",
         "chat_endpoint": "/chat/completions",
     },
 }
 
-def fetch_models(base_url, models_endpoint, api_key_env):
+def fetch_models(base_url, models_endpoint, api_key_env, requires_key=False):
+    """Fetch models from a provider's API.
+    If requires_key is True and the API key is not set, skip silently.
+    """
+    api_key = os.environ.get(api_key_env, '')
+    if requires_key and not api_key:
+        return []  # Skip silently - no key configured
     url = base_url.rstrip('/') + models_endpoint
     headers = {"User-Agent": "Mozilla/5.0"}
-    api_key = os.environ.get(api_key_env, '')
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, headers=headers)
@@ -1324,11 +1338,12 @@ print('  Querying providers for available models...', file=sys.stderr)
 all_models = {}
 for pid, provider in PROVIDER_REGISTRY.items():
     if provider.get('supports_dynamic_discovery'):
-        models = fetch_models(provider['base_url'], provider['models_endpoint'], provider['api_key_env'])
-        if models:
+        req_key = provider.get('requires_key_for_listing', False)
+        models = fetch_models(provider['base_url'], provider['models_endpoint'], provider['api_key_env'], req_key)
+        if models is not None and len(models) > 0:
             print(f'  Found {len(models)} models from {provider["name"]}', file=sys.stderr)
             all_models[pid] = models
-        else:
+        elif not req_key or os.environ.get(provider['api_key_env'], ''):
             print(f'  No models found from {provider["name"]}', file=sys.stderr)
 
 if not all_models:
@@ -1366,6 +1381,15 @@ def classify(mid):
             return family
     return "Other"
 
+# Classify models as free/paid for each provider
+# OpenRouter :free suffix indicates free models
+for pid in list(all_models.keys()):
+    if pid == 'openrouter':
+        all_models[pid + '_free'] = [m for m in all_models[pid] if m.endswith(':free')]
+        all_models[pid + '_paid'] = [m for m in all_models[pid] if not m.endswith(':free')]
+        del all_models[pid]
+
+# Zen free models are already classified by the probe above
 families = {}
 zen_only = all_models.get('zen', [])
 for m in zen_only:
@@ -1422,7 +1446,7 @@ result = {
         "api_key": "",
         "model": "openrouter/auto",
         "provider_name": "OpenRouter",
-        "models": {"OpenRouter": all_models.get("openrouter", [])},
+        "models": {"Free": all_models.get("openrouter_free", []), "Paid": all_models.get("openrouter_paid", [])},
     },
     "together": {
         "base_url": "https://api.together.xyz/v1",
@@ -1579,37 +1603,45 @@ for pid, bc in cfg.items():
     model = bc.get("model", "")
     entries.append((f"{model} ({desc})", pid, model or "", False, desc, free_info, key_char, key_text))
 
-# Sort within categories
-zen_paid = sorted([e for e in entries if e[1] == "zen" and not e[3]], key=lambda x: x[0].lower())
-zen_free = sorted([e for e in entries if e[1] == "zen" and e[3]], key=lambda x: x[0].lower())
-other_be = sorted([e for e in entries if e[1] != "zen"], key=lambda x: x[0].lower())
+# Sort all entries
+all_free = sorted([e for e in entries if e[3]], key=lambda x: x[0].lower())
+all_paid = sorted([e for e in entries if not e[3]], key=lambda x: x[0].lower())
+
+# Separate anonymous Zen free models from other free models
+anon_free = [e for e in all_free if e[1] == "zen"]
+free_with_tier = [e for e in all_free if e[1] != "zen"]
 
 # ── MAIN MENU ─────────────────────────────────────────────────────────────
 all_display = []   # (label, pid, model) for main menu
 paid_submenu = []  # (label, pid, model) for paid submenu
 idx = 1
 
-# Entry 1: Paid Zen models (submenu)
-if zen_paid:
-    paid_count = len(zen_paid)
-    print(f"  {idx:>3}) Paid Zen models (Claude, GPT, Gemini, etc. - requires ZEN_API_KEY)", file=sys.stderr)
-    all_display.append(("Paid Zen models (submenu)", "zen", "__submenu__"))
-    paid_submenu = [(label, pid, model) for label, pid, model, is_free, desc, free_info, kc, kt in zen_paid]
+# Entry 1: All paid models (submenu)
+if all_paid:
+    print(f"  {idx:>3}) Paid models from all providers (requires API key)", file=sys.stderr)
+    all_display.append(("Paid models (submenu)", "_all_", "__submenu__"))
+    paid_submenu = [(label, pid, model) for label, pid, model, is_free, desc, free_info, kc, kt in all_paid]
     idx += 1
 
-# Other Providers: each model shown with free tier info
-if other_be:
-    print(f"\n{' Models with free tier access ':-^65}", file=sys.stderr)
-    for label, pid, model, is_free, desc, free_info, kc, kt in other_be:
-        free_tag = f" [{free_info}]" if free_info else " [free tier]"
-        print(f"  {idx:>3}) {desc} > {model}  {free_tag}", file=sys.stderr)
+# Free models from providers with free tier (need API key but free to use)
+if free_with_tier:
+    print(f"\n{' Models with free tier access (set API key) ':-^65}", file=sys.stderr)
+    last_pid = ""
+    for label, pid, model, is_free, desc, free_info, kc, kt in free_with_tier:
+        if pid != last_pid:
+            last_pid = pid
+            meta_src = PROVIDER_META.get(pid, {})
+            prov_name = meta_src.get("name", desc)
+            free_tag = meta_src.get("free_tier_info", free_info) or ""
+            print(f"  \n  {prov_name}: {free_tag}", file=sys.stderr)
+        print(f"  {idx:>3}) {model}", file=sys.stderr)
         all_display.append((label, pid, model))
         idx += 1
 
-# Free Zen models at the very bottom
-if zen_free:
+# Anonymous free Zen models (no API key needed)
+if anon_free:
     print(f"{' Free Models (anonymous, no API key needed) ':-^65}", file=sys.stderr)
-    for label, pid, model, is_free, desc, free_info, kc, kt in zen_free:
+    for label, pid, model, is_free, desc, free_info, kc, kt in anon_free:
         has_expired = "expired" in label.lower()
         suffix = "  (promotion ended)" if has_expired else "  [no API key needed]"
         print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
@@ -1628,25 +1660,35 @@ while True:
 
     entry = all_display[p]
 
-    # If submenu selected, show paid Zen models and collect sub-selection
+    # If submenu selected, show all paid models organized by provider
     if entry[2] == "__submenu__":
-        print(f"\n{' Paid Zen Models (set ZEN_API_KEY env var) ':-^65}", file=sys.stderr)
-        for i, (label, pid, model) in enumerate(paid_submenu, 1):
-            print(f"  {i:>3}) {label}", file=sys.stderr)
-        if not os.environ.get("ZEN_API_KEY", ""):
-            print(f"\n      * Set ZEN_API_KEY to access paid models", file=sys.stderr)
-            print(f"      * Get one at https://opencode.ai/keys", file=sys.stderr)
+        print(f"\n{' Paid Models (set API key via env var) ':-^65}", file=sys.stderr)
+        sub_idx = 1
+        last_pid = ""
+        for label, pid, model in paid_submenu:
+            if pid != last_pid:
+                last_pid = pid
+                bc = cfg.get(pid, {})
+                meta_src = PROVIDER_META.get(pid, {})
+                prov_name = meta_src.get("name", bc.get("provider_name", pid))
+                kc, kt = key_status(bc.get("api_key_env", ""))
+                print(f"\n  {prov_name}  ({kc} {kt})", file=sys.stderr)
+                api_key_env = bc.get("api_key_env", "")
+                if api_key_env:
+                    print(f"    Set ${api_key_env} to access", file=sys.stderr)
+            print(f"  {sub_idx:>3}) {label}", file=sys.stderr)
+            sub_idx += 1
         print("\nSelect model (or 0 for main menu):", file=sys.stderr)
         with open("/dev/tty", "r", encoding="utf-8") as tty:
             c = tty.readline().strip()
         if c == "0" or c.lower() == "b":
-            continue  # Back to main menu
+            continue
         if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
         sp = int(c) - 1
         if sp < 0 or sp >= len(paid_submenu): print("Out of range.", file=sys.stderr); sys.exit(1)
         entry = paid_submenu[sp]
 
-    break  # Exit loop with valid entry
+    break
 
 print(f"{entry[1]}|{entry[2]}")
 PY
