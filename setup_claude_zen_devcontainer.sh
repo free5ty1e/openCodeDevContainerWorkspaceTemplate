@@ -880,8 +880,13 @@ async def create_message(request: Request):
         payload["tools"] = openai_tools
 
     headers = {"Content-Type": "application/json"}
-    if be.api_key:
-        headers["Authorization"] = f"Bearer {be.api_key}"
+    # Read API key from the live environment variable on each request,
+    # so proxy restarts are NOT required when env vars change mid-session.
+    live_key = os.environ.get(be.api_key_env, "") if be.api_key_env else be.api_key
+    if not live_key:
+        live_key = be.api_key
+    if live_key:
+        headers["Authorization"] = f"Bearer {live_key}"
 
     client = _get_client()
 
@@ -1752,7 +1757,12 @@ while True:
         import subprocess as _sp
         key_vault_path = os.path.join(os.path.dirname(backends_file), "key_vault.py")
         vault_file = os.path.join(os.path.dirname(backends_file), "api_keys.json")
-        
+
+        # Show a clear prompt before the subprocess call (its stderr is captured)
+        env_name = backends_entry.get("api_key_env", "$KEY")
+        print(f"\n  {cname} needs an API key.", file=sys.stderr)
+        print(f"  Paste your {env_name} below, then press Enter:", file=sys.stderr)
+
         result = _sp.run(
             ["python3", key_vault_path, "resolve", cpid, backends_file, vault_file, ""],
             capture_output=True, text=True
