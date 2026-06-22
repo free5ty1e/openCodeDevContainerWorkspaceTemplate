@@ -189,6 +189,29 @@ NPM_GLOBAL_DIR="${HOME}/.npm-global"
 have() { command -v "$1" >/dev/null 2>&1; }
 export PATH="${NPM_GLOBAL_DIR}/bin:${PATH}"
 
+# ─── 0. Kill any running proxy (fresh start) ────────────────────────────────
+# Ensures the next cz launch picks up updated backends, API keys, and config.
+if [ -f "${PID_FILE}" ]; then
+    OLD_PID="$(cat "${PID_FILE}" 2>/dev/null)"
+    if [ -n "${OLD_PID}" ]; then
+        kill "${OLD_PID}" 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f "${PID_FILE}"
+fi
+# Also catch any orphaned proxy processes not tracked by PID file
+STALE_PIDS="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
+if [ -n "${STALE_PIDS}" ]; then
+    kill ${STALE_PIDS} 2>/dev/null || true
+    sleep 1
+    REMAINING="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
+    if [ -n "${REMAINING}" ]; then
+        kill -9 ${REMAINING} 2>/dev/null || true
+        sleep 1
+    fi
+fi
+unset OLD_PID STALE_PIDS REMAINING
+
 # ─── 1. Prerequisites: dedicated proxy venv ──────────────────────────────────
 # Use a venv inside the workspace config dir so packages are:
 #   - isolated from the system Python and any active devcontainer venv
