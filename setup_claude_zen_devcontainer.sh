@@ -1727,7 +1727,7 @@ while True:
 
         # Check env var or vault
         import subprocess as _sp
-        key_vault_path = os.path.join(os.path.dirname(os.path.dirname(backends_file)), "key_vault.py")
+        key_vault_path = os.path.join(os.path.dirname(backends_file), "key_vault.py")
         vault_file = os.path.join(os.path.dirname(backends_file), "api_keys.json")
         
         result = _sp.run(
@@ -1971,10 +1971,10 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
 " 2>/dev/null)
     fi
     printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
-    _claude_zen_ensure_proxy || true
-    claude_bin="$(_claude_zen_find_claude)"
     # Resolve API key for this provider (prompts if needed, checks vault)
     _claude_zen_resolve_key "$provider_id" "$dir" "$model_name"
+    _claude_zen_ensure_proxy || true
+    claude_bin="$(_claude_zen_find_claude)"
     ZEN_DEFAULT_PROVIDER="$provider_id" \
     ANTHROPIC_API_KEY="freecc" \
     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
@@ -2013,10 +2013,10 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
     printf '  Provider: %s  Model: %s\n' "$provider_id" "$model_name"
     printf '\n'
 
-    _claude_zen_ensure_proxy || true
-    claude_bin="$(_claude_zen_find_claude)"
     # Resolve API key for this provider (prompts if needed, checks vault)
     _claude_zen_resolve_key "$provider_id" "$dir" "$model_name"
+    _claude_zen_ensure_proxy || true
+    claude_bin="$(_claude_zen_find_claude)"
 
     # ── Install danger guardrails via helper ──────────────────────────────
     local backup_file
