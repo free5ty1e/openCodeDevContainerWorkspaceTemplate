@@ -412,7 +412,7 @@ _claude_ensure_litellm() {
             return 0
         fi
     fi
-    pip install 'litellm[proxy]' 2>&1 || pip install --break-system-packages 'litellm[proxy]' 2>&1 || {
+    pip install 'litellm[proxy]' 1>&2 || pip install --break-system-packages 'litellm[proxy]' 1>&2 || {
         printf 'Failed to install litellm[proxy].\n' >&2
         return 1
     }
