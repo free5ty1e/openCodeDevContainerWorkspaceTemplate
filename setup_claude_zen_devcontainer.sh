@@ -622,18 +622,52 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _truncatable_content(msg: dict) -> str:
-    """Extract the text content from a message for token estimation."""
+    """Extract all token-bearing text from a message for token estimation.
+    Includes tool_calls and tool_call_id which can be large."""
     c = msg.get("content", "")
+    text = ""
     if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-    return str(c)
+        text = c
+    elif isinstance(c, list):
+        text = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    else:
+        text = str(c)
+    # tool_calls (function names + arguments) can dwarf the content field
+    if msg.get("tool_calls"):
+        for tc in msg["tool_calls"]:
+            fn = tc.get("function", {})
+            text += " " + fn.get("name", "") + " " + fn.get("arguments", "")
+    # tool_call_id adds overhead for tool-role messages
+    if msg.get("role") == "tool":
+        text += " " + msg.get("tool_call_id", "")
+    return text
 
-def truncate_messages(messages: list[dict], max_tokens: int = 200000) -> list[dict]:
+def _truncate_content(text: str, max_chars: int = 3000) -> str:
+    """Truncate a long text, keeping the first portion with a marker."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[...truncated...]"
+
+def truncate_messages(messages: list[dict], max_tokens: int = 180000) -> list[dict]:
     """Drop oldest messages to keep total under max_tokens.
     Preserves the system message (if present as first element).
-    Ensures tool messages are never orphaned from their assistant."""
+    Ensures tool messages are never orphaned from their assistant.
+    Also truncates oversized individual message content."""
+    # First pass: truncate oversized content in individual messages
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, str) and len(c) > 3000:
+            if m.get("role") in ("user", "tool"):
+                m["content"] = _truncate_content(c)
+            elif m.get("role") == "assistant" and not m.get("tool_calls"):
+                m["content"] = _truncate_content(c)
+        elif isinstance(c, list):
+            for idx, block in enumerate(c):
+                if isinstance(block, dict) and block.get("type") == "text" and len(block.get("text", "")) > 3000:
+                    fixed = dict(block)
+                    fixed["text"] = _truncate_content(fixed["text"])
+                    c[idx] = fixed
+
     total = sum(_estimate_tokens(_truncatable_content(m)) for m in messages)
     if total <= max_tokens:
         return messages
@@ -649,6 +683,9 @@ def truncate_messages(messages: list[dict], max_tokens: int = 200000) -> list[di
     dropped_count = len(messages) - len(system) - len(body)
     if dropped_count:
         print(f"[PROXY] Truncated {dropped_count} old message(s) to fit {max_tokens} token limit", file=sys.stderr)
+    if total > max_tokens:
+        print(f"[PROXY] Still over limit after full drop ({total} est. tokens), keeping only last turn", file=sys.stderr)
+        body = body[-2:] if len(body) >= 2 else body
     return system + body
 
 
@@ -911,7 +948,7 @@ async def create_message(request: Request):
     # Truncate old messages to fit within the model's context window.
     # Google Gemma 4-31b has a 262,144 token limit; OpenRouter etc. vary.
     # Keeping ~200K tokens leaves room for the model's response.
-    openai_messages = truncate_messages(openai_messages, max_tokens=200000)
+    openai_messages = truncate_messages(openai_messages, max_tokens=180000)
 
     openai_tools = convert_tools(req.tools)
     upstream_model = be.model or req.model.split("/")[-1] if "/" in req.model else req.model
