@@ -568,10 +568,18 @@ def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_result":
+                        raw = block.get("content", "")
+                        if isinstance(raw, list):
+                            text = " ".join(
+                                b.get("text", "") for b in raw
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        else:
+                            text = str(raw) if raw is not None else ""
                         openai_messages.append({
                             "role": "tool",
                             "tool_call_id": block.get("tool_use_id", ""),
-                            "content": str(block.get("content", "")),
+                            "content": text,
                         })
                 if text_parts:
                     openai_messages.append({"role": "user", "content": "\n".join(text_parts)})
@@ -611,6 +619,37 @@ _enc = tiktoken.get_encoding("cl100k_base")
 
 def _estimate_tokens(text: str) -> int:
     return len(_enc.encode(text))
+
+
+def _truncatable_content(msg: dict) -> str:
+    """Extract the text content from a message for token estimation."""
+    c = msg.get("content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return str(c)
+
+def truncate_messages(messages: list[dict], max_tokens: int = 200000) -> list[dict]:
+    """Drop oldest messages to keep total under max_tokens.
+    Preserves the system message (if present as first element).
+    Ensures tool messages are never orphaned from their assistant."""
+    total = sum(_estimate_tokens(_truncatable_content(m)) for m in messages)
+    if total <= max_tokens:
+        return messages
+    system = [messages[0]] if messages and messages[0].get("role") == "system" else []
+    body = messages[len(system):]
+    while body and total > max_tokens:
+        dropped = body.pop(0)
+        total -= _estimate_tokens(_truncatable_content(dropped))
+        if dropped.get("role") == "assistant" and dropped.get("tool_calls"):
+            while body and body[0].get("role") == "tool":
+                orphan = body.pop(0)
+                total -= _estimate_tokens(_truncatable_content(orphan))
+    dropped_count = len(messages) - len(system) - len(body)
+    if dropped_count:
+        print(f"[PROXY] Truncated {dropped_count} old message(s) to fit {max_tokens} token limit", file=sys.stderr)
+    return system + body
 
 
 async def make_anthropic_stream(
@@ -868,6 +907,11 @@ async def create_message(request: Request):
                 openai_messages.insert(0, {"role": "system", "content": system_text})
         elif req.system:
             openai_messages.insert(0, {"role": "system", "content": req.system})
+
+    # Truncate old messages to fit within the model's context window.
+    # Google Gemma 4-31b has a 262,144 token limit; OpenRouter etc. vary.
+    # Keeping ~200K tokens leaves room for the model's response.
+    openai_messages = truncate_messages(openai_messages, max_tokens=200000)
 
     openai_tools = convert_tools(req.tools)
     upstream_model = be.model or req.model.split("/")[-1] if "/" in req.model else req.model
