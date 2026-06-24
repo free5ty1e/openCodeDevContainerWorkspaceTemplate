@@ -905,11 +905,14 @@ async def create_message(request: Request):
     except httpx.HTTPStatusError as e:
         detail = f"Upstream error: {e.response.status_code}"
         try:
-            detail += f" - {e.response.text[:200]}"
+            error_body = e.response.text[:500]
+            detail += f" - {error_body}"
+            print(f"[PROXY] Upstream {e.response.status_code}: {error_body[:200]}", file=sys.stderr)
         except Exception:
             pass
         raise HTTPException(status_code=502, detail=detail)
     except httpx.RequestError as e:
+        print(f"[PROXY] Upstream connection error: {e}", file=sys.stderr)
         raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
 
     if req.stream:
