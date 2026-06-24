@@ -409,8 +409,8 @@ _claude_ensure_litellm() {
         return 0
     fi
     printf 'Installing litellm proxy (Ollama Anthropic API workaround)...\n' >&2
-    pip install litellm 2>/dev/null || pip install --break-system-packages litellm 2>/dev/null || {
-        printf 'Failed to install litellm.\n' >&2
+    pip install 'litellm[proxy]' 2>/dev/null || pip install --break-system-packages 'litellm[proxy]' 2>/dev/null || {
+        printf 'Failed to install litellm[proxy].\n' >&2
         return 1
     }
     if ! command -v litellm >/dev/null 2>&1; then
