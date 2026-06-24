@@ -394,6 +394,67 @@ _claude_has_effort_flag() {
     return 1
 }
 
+# ── litellm proxy (routes through Ollama's working OpenAI API, bypassing        ─
+# the broken Anthropic handler: https://github.com/ollama/ollama/issues/13949)   ─
+_claude_find_free_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+_claude_ensure_litellm() {
+    if command -v litellm >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v "${HOME}/.local/bin/litellm" >/dev/null 2>&1; then
+        export PATH="${HOME}/.local/bin:${PATH}"
+        return 0
+    fi
+    printf 'Installing litellm proxy (Ollama Anthropic API workaround)...\n' >&2
+    pip install litellm 2>/dev/null || pip install --break-system-packages litellm 2>/dev/null || {
+        printf 'Failed to install litellm.\n' >&2
+        return 1
+    }
+    if ! command -v litellm >/dev/null 2>&1; then
+        export PATH="${HOME}/.local/bin:${PATH}"
+    fi
+    return 0
+}
+
+_claude_litellm_proxy_pid=""
+
+_claude_start_litellm_proxy() {
+    local model="$1"
+    _claude_ensure_litellm || return 1
+    local port
+    port="$(_claude_find_free_port)"
+    local host="${OLLAMA_HOST:-http://host.docker.internal:11434}"
+    litellm --model "ollama/${model}" \
+        --api_base "${host}" \
+        --port "${port}" \
+        --drop_params \
+        >/tmp/litellm-proxy.log 2>&1 &
+    _claude_litellm_proxy_pid="$!"
+    local i=0
+    while [ "$i" -lt 30 ]; do
+        if curl -sf "http://localhost:${port}/health" >/dev/null 2>&1; then
+            printf '%s' "${port}"
+            return 0
+        fi
+        sleep 1
+        i="$((i + 1))"
+    done
+    printf 'litellm proxy failed to start (check /tmp/litellm-proxy.log)\n' >&2
+    kill "${_claude_litellm_proxy_pid}" 2>/dev/null || true
+    _claude_litellm_proxy_pid=""
+    return 1
+}
+
+_claude_stop_litellm_proxy() {
+    if [ -n "${_claude_litellm_proxy_pid}" ]; then
+        kill "${_claude_litellm_proxy_pid}" 2>/dev/null || true
+        _claude_litellm_proxy_pid=""
+    fi
+}
+
 claude_local_launch() {
     if ! command -v ollama >/dev/null 2>&1; then
         printf '%s\n' "ollama CLI is not installed in this container." >&2
@@ -423,10 +484,22 @@ claude_local_launch() {
         extra_args+=(--dangerously-skip-permissions)
     fi
 
-    printf 'Launching Claude on %s\n' "${launch_model}" >&2
-    OLLAMA_HOST="${OLLAMA_HOST}" \
+    local proxy_port
+    if ! proxy_port="$(_claude_start_litellm_proxy "${launch_model}")"; then
+        return 1
+    fi
+
+    printf 'Launching Claude on %s (litellm proxy :%s)\n' "${launch_model}" "${proxy_port}" >&2
+    trap _claude_stop_litellm_proxy EXIT INT TERM
+
+    ANTHROPIC_BASE_URL="http://localhost:${proxy_port}" \
+    ANTHROPIC_API_KEY="" \
+    ANTHROPIC_AUTH_TOKEN="ollama" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
-    ollama launch claude --model "${launch_model}" -- "${extra_args[@]}" "${effort_args[@]}" "$@"
+    claude --model "${launch_model}" "${extra_args[@]}" "${effort_args[@]}" "$@"
+
+    _claude_stop_litellm_proxy
+    trap - EXIT INT TERM
 }
 
 claude_cloud_launch() {
@@ -568,12 +641,24 @@ claude_ollama_launch_danger() {
     # Use CLAUDE_OLLAMA_PERSISTENCE_DIR for consistency with the rest of the script.
     backup_file="$(_claude_ollama_install_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}")"
 
-    printf 'Launching Claude on %s (danger mode)\n' "${launch_model}" >&2
-    OLLAMA_HOST="${OLLAMA_HOST}" \
+    local proxy_port
+    if ! proxy_port="$(_claude_start_litellm_proxy "${launch_model}")"; then
+        _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
+        return 1
+    fi
+
+    trap _claude_stop_litellm_proxy EXIT INT TERM
+
+    printf 'Launching Claude on %s (danger mode, litellm proxy :%s)\n' "${launch_model}" "${proxy_port}" >&2
+    ANTHROPIC_BASE_URL="http://localhost:${proxy_port}" \
+    ANTHROPIC_API_KEY="" \
+    ANTHROPIC_AUTH_TOKEN="ollama" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
-    ollama launch claude --model "${launch_model}" -- --dangerously-skip-permissions "$@"
+    claude --model "${launch_model}" --dangerously-skip-permissions "$@"
 
+    _claude_stop_litellm_proxy
+    trap - EXIT INT TERM
     _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
 }
 
