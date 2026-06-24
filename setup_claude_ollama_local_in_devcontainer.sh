@@ -402,11 +402,15 @@ _claude_find_free_port() {
 
 _claude_ensure_litellm() {
     if command -v litellm >/dev/null 2>&1; then
-        return 0
+        if python3 -c 'import websockets' 2>/dev/null; then
+            return 0
+        fi
     fi
     if command -v "${HOME}/.local/bin/litellm" >/dev/null 2>&1; then
         export PATH="${HOME}/.local/bin:${PATH}"
-        return 0
+        if python3 -c 'import websockets' 2>/dev/null; then
+            return 0
+        fi
     fi
     printf 'Installing litellm proxy (Ollama Anthropic API workaround)...\n' >&2
     pip install 'litellm[proxy]' 2>/dev/null || pip install --break-system-packages 'litellm[proxy]' 2>/dev/null || {
