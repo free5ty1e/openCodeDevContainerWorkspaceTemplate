@@ -739,6 +739,10 @@ async def make_anthropic_stream(
         text = delta.get("content", "")
         if text:
             if not text_block_open:
+                if thinking_block_open:
+                    # Close the thinking block before starting the text block
+                    yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
+                    thinking_block_open = False
                 idx = 1 if thinking_block_open else 0
                 yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})}\n\n'
                 text_block_open = True
