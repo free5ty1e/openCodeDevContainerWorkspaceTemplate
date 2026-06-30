@@ -937,6 +937,12 @@ async def create_message(request: Request):
 
     anthropic_beta = request.headers.get("anthropic-beta", "")
     allow_thinking = "thinking-2025-01-02" in anthropic_beta
+    # Force thinking mode for Google/OpenRouter models that return reasoning_content
+    if pid in ("google", "openrouter"):
+        allow_thinking = True
+
+    # ... (rest of the function)
+
 
     openai_messages = convert_messages(req.messages)
     if req.system is not None:
