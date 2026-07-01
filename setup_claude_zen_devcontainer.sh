@@ -509,8 +509,15 @@ def set_if_not_none(d: dict, key: str, value: Any) -> None:
         d[key] = value
 
 
-def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
-    """Convert Anthropic messages to OpenAI chat format."""
+def convert_messages(anthropic_messages: list[dict], strip_tools: bool = False) -> list[dict]:
+    """Convert Anthropic messages to OpenAI chat format.
+
+    When strip_tools=False (default): tool_use blocks become OpenAI
+    tool_calls, and tool_result blocks become 'tool' role messages.
+    When strip_tools=True: tool_use and tool_result blocks are merged
+    into plain text.  This fallback is used when the upstream returns
+    403 (tool calling not supported).
+    """
     openai_messages = []
     system_content = None
 
@@ -540,21 +547,35 @@ def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
                             if think_text:
                                 text_parts.append(think_text)
                         case "tool_use":
-                            func_args = json.dumps(block.get("input", {}))
-                            tool_calls.append({
-                                "id": block.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
-                                "type": "function",
-                                "function": {
-                                    "name": block.get("name", "unknown"),
-                                    "arguments": func_args,
-                                },
-                            })
+                            if strip_tools:
+                                func_args = json.dumps(block.get("input", {}))
+                                tool_name = block.get("name", "unknown")
+                                text_parts.append(f"[Using tool: {tool_name}({func_args})]")
+                            else:
+                                func_args = json.dumps(block.get("input", {}))
+                                tool_calls.append({
+                                    "id": block.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": block.get("name", "unknown"),
+                                        "arguments": func_args,
+                                    },
+                                })
                         case "tool_result":
-                            pass
+                            if strip_tools:
+                                result_content = block.get("content", "")
+                                if isinstance(result_content, list):
+                                    result_text = "\n".join(
+                                        b.get("text", "") for b in result_content
+                                        if isinstance(b, dict) and b.get("type") == "text"
+                                    )
+                                else:
+                                    result_text = str(result_content)
+                                text_parts.append(f"[Tool result: {result_text[:500]}]")
                 msg_dict = {"role": "assistant"}
                 if text_parts:
                     msg_dict["content"] = "\n".join(text_parts)
-                if tool_calls:
+                if tool_calls and not strip_tools:
                     msg_dict["tool_calls"] = tool_calls
                 openai_messages.append(msg_dict)
             else:
@@ -568,19 +589,30 @@ def convert_messages(anthropic_messages: list[dict]) -> list[dict]:
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_result":
-                        raw = block.get("content", "")
-                        if isinstance(raw, list):
-                            text = " ".join(
-                                b.get("text", "") for b in raw
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            )
+                        if strip_tools:
+                            result_content = block.get("content", "")
+                            if isinstance(result_content, list):
+                                result_text = "\n".join(
+                                    b.get("text", "") for b in result_content
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                )
+                            else:
+                                result_text = str(result_content)
+                            text_parts.append(f"[Tool result from {block.get('tool_use_id', 'unknown')}: {result_text[:500]}]")
                         else:
-                            text = str(raw) if raw is not None else ""
-                        openai_messages.append({
-                            "role": "tool",
-                            "tool_call_id": block.get("tool_use_id", ""),
-                            "content": text,
-                        })
+                            raw = block.get("content", "")
+                            if isinstance(raw, list):
+                                text = " ".join(
+                                    b.get("text", "") for b in raw
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                )
+                            else:
+                                text = str(raw) if raw is not None else ""
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": block.get("tool_use_id", ""),
+                                "content": text,
+                            })
                 if text_parts:
                     openai_messages.append({"role": "user", "content": "\n".join(text_parts)})
             else:
@@ -693,102 +725,106 @@ async def make_anthropic_stream(
     openai_stream: AsyncIterator[dict],
     model: str,
     allow_thinking: bool = False,
+    upstream_resp: httpx.Response | None = None,
 ) -> AsyncIterator[str]:
     """Convert an OpenAI streaming response to Anthropic SSE format."""
+    try:
+        message_id = f"msg_{uuid.uuid4().hex}"
+        input_tokens = 0
+        finish_reason = None
 
-    message_id = f"msg_{uuid.uuid4().hex}"
-    input_tokens = 0
-    finish_reason = None
+        yield f'event: message_start\ndata: {json.dumps({"type": "message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":model,"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}})}\n\n'
 
-    yield f'event: message_start\ndata: {json.dumps({"type": "message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":model,"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}})}\n\n'
+        text_buffer = ""
+        tool_calls: dict[int, dict] = {}
+        thinking_block_open = False
+        text_block_open = False
 
-    text_buffer = ""
-    tool_calls: dict[int, dict] = {}
-    thinking_block_open = False
-    text_block_open = False
+        async for chunk in openai_stream:
+            choices = chunk.get("choices", [])
+            if not choices:
+                usage = chunk.get("usage")
+                if usage:
+                    input_tokens = usage.get("prompt_tokens", 0) or input_tokens
+                continue
 
-    async for chunk in openai_stream:
-        choices = chunk.get("choices", [])
-        if not choices:
+            delta = choices[0].get("delta", {})
+            finish = choices[0].get("finish_reason")
+            if finish:
+                finish_reason = finish
+
+            # Reasoning content
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if allow_thinking:
+                    if not thinking_block_open:
+                        yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})}\n\n'
+                        thinking_block_open = True
+                    yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":reasoning}})}\n\n'
+                else:
+                    if not text_block_open:
+                        yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})}\n\n'
+                        text_block_open = True
+                    yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":reasoning}})}\n\n'
+                text_buffer += reasoning
+
+            # Text content
+            text = delta.get("content", "")
+            if text:
+                if not text_block_open:
+                    if thinking_block_open:
+                        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
+                        thinking_block_open = False
+                    idx = 1 if thinking_block_open else 0
+                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})}\n\n'
+                    text_block_open = True
+                idx = 1 if thinking_block_open else 0
+                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":text}})}\n\n'
+                text_buffer += text
+
+            # Tool calls
+            tc_list = delta.get("tool_calls", [])
+            for tc in tc_list:
+                idx = tc.get("index", 0)
+                if idx not in tool_calls:
+                    tool_calls[idx] = {
+                        "id": tc.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": "",
+                    }
+                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx+2,"content_block":{"type":"tool_use","id":tool_calls[idx]["id"],"name":tool_calls[idx]["name"]}})}\n\n'
+                args_delta = tc.get("function", {}).get("arguments", "")
+                if args_delta:
+                    tool_calls[idx]["arguments"] += args_delta
+                    yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx+2,"delta":{"type":"input_json_delta","partial_json":args_delta}})}\n\n'
+
             usage = chunk.get("usage")
             if usage:
                 input_tokens = usage.get("prompt_tokens", 0) or input_tokens
-            continue
 
-        delta = choices[0].get("delta", {})
-        finish = choices[0].get("finish_reason")
-        if finish:
-            finish_reason = finish
-
-        # Reasoning content
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            if allow_thinking:
-                if not thinking_block_open:
-                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})}\n\n'
-                    thinking_block_open = True
-                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":reasoning}})}\n\n'
-            else:
-                if not text_block_open:
-                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})}\n\n'
-                    text_block_open = True
-                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":reasoning}})}\n\n'
-            text_buffer += reasoning
-
-        # Text content
-        text = delta.get("content", "")
-        if text:
-            if not text_block_open:
-                if thinking_block_open:
-                    # Close the thinking block before starting the text block
-                    yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
-                    thinking_block_open = False
-                idx = 1 if thinking_block_open else 0
-                yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})}\n\n'
-                text_block_open = True
+        # Close content blocks
+        if thinking_block_open:
+            yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
+        if text_block_open:
             idx = 1 if thinking_block_open else 0
-            yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":text}})}\n\n'
-            text_buffer += text
+            yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx})}\n\n'
+        for idx in sorted(tool_calls.keys()):
+            yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx+2})}\n\n'
 
-        # Tool calls
-        tc_list = delta.get("tool_calls", [])
-        for tc in tc_list:
-            idx = tc.get("index", 0)
-            if idx not in tool_calls:
-                tool_calls[idx] = {
-                    "id": tc.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": "",
-                }
-                yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx+2,"content_block":{"type":"tool_use","id":tool_calls[idx]["id"],"name":tool_calls[idx]["name"]}})}\n\n'
-            args_delta = tc.get("function", {}).get("arguments", "")
-            if args_delta:
-                tool_calls[idx]["arguments"] += args_delta
-                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx+2,"delta":{"type":"input_json_delta","partial_json":args_delta}})}\n\n'
+        # Estimate output tokens
+        output_tokens = _estimate_tokens(text_buffer)
+        for tc in tool_calls.values():
+            output_tokens += _estimate_tokens(tc.get("arguments", ""))
 
-        usage = chunk.get("usage")
-        if usage:
-            input_tokens = usage.get("prompt_tokens", 0) or input_tokens
+        stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+        anthropic_stop = stop_map.get(finish_reason, "end_turn")
 
-    # Close content blocks
-    if thinking_block_open:
-        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
-    if text_block_open:
-        idx = 1 if thinking_block_open else 0
-        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx})}\n\n'
-    for idx in sorted(tool_calls.keys()):
-        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx+2})}\n\n'
-
-    # Estimate output tokens
-    output_tokens = _estimate_tokens(text_buffer)
-    for tc in tool_calls.values():
-        output_tokens += _estimate_tokens(tc.get("arguments", ""))
-
-    stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
-    anthropic_stop = stop_map.get(finish_reason, "end_turn")
-
-    yield f'event: message_delta\ndata: {json.dumps({"type":"message_delta","delta":{"stop_reason":anthropic_stop,"stop_sequence":None},"usage":{"output_tokens":output_tokens}})}\n\n'
-    yield f'event: message_stop\ndata: {json.dumps({"type":"message_stop"})}\n\n'
+        yield f'event: message_delta\ndata: {json.dumps({"type":"message_delta","delta":{"stop_reason":anthropic_stop,"stop_sequence":None},"usage":{"output_tokens":output_tokens}})}\n\n'
+        yield f'event: message_stop\ndata: {json.dumps({"type":"message_stop"})}\n\n'
+    except GeneratorExit:
+        if upstream_resp is not None:
+            await upstream_resp.aclose()
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -853,7 +889,7 @@ def get_backend(request: Request) -> Backend:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0))
     yield
     if http_client:
         await http_client.aclose()
@@ -938,11 +974,8 @@ async def create_message(request: Request):
     anthropic_beta = request.headers.get("anthropic-beta", "")
     allow_thinking = "thinking-2025-01-02" in anthropic_beta
     # Force thinking mode for Google/OpenRouter models that return reasoning_content
-    if pid in ("google", "openrouter"):
+    if be.provider_id in ("google", "openrouter"):
         allow_thinking = True
-
-    # ... (rest of the function)
-
 
     openai_messages = convert_messages(req.messages)
     if req.system is not None:
@@ -986,29 +1019,48 @@ async def create_message(request: Request):
 
     client = _get_client()
 
-    try:
-        upstream_resp = await client.post(
-            f"{be.base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-        upstream_resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        detail = f"Upstream error: {e.response.status_code}"
+    # Try with tools first (normal). If the upstream returns 403 (doesn't
+    # support tool calling), retry once with tool blocks merged into text.
+    retried = False
+    while True:
         try:
-            error_body = e.response.text[:500]
-            detail += f" - {error_body}"
-            print(f"[PROXY] Upstream {e.response.status_code}: {error_body[:200]}", file=sys.stderr)
-        except Exception:
-            pass
-        raise HTTPException(status_code=502, detail=detail)
-    except httpx.RequestError as e:
-        print(f"[PROXY] Upstream connection error: {e}", file=sys.stderr)
-        raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
+            upstream_resp = await client.post(
+                f"{be.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            upstream_resp.raise_for_status()
+            break  # success
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            try:
+                error_body = e.response.text[:500]
+            except Exception:
+                error_body = ""
+            print(f"[PROXY] Upstream HTTP {status}: {error_body[:300]}", file=sys.stderr, flush=True)
+
+            # On 403, retry once without tools (common for backends that
+            # reject tool calling, e.g. DeepSeek on OpenCode Zen).
+            if status == 403 and not retried and (
+                openai_tools
+                or any(msg.get("tool_calls") or msg.get("role") == "tool" for msg in openai_messages)
+            ):
+                print(f"[PROXY] 403 - retrying without tools...", file=sys.stderr, flush=True)
+                openai_messages = convert_messages(req.messages, strip_tools=True)
+                payload["messages"] = openai_messages
+                payload.pop("tools", None)
+                retried = True
+                continue  # retry
+
+            raise HTTPException(status_code=502, detail=f"Upstream error: {status} - {error_body}")
+
+        except httpx.RequestError as e:
+            print(f"[PROXY] Connection to upstream failed: {e}", file=sys.stderr, flush=True)
+            raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
 
     if req.stream:
         return StreamingResponse(
-            make_anthropic_stream(_iter_openai_sse(upstream_resp), req.model, allow_thinking),
+            make_anthropic_stream(_iter_openai_sse(upstream_resp), req.model, allow_thinking, upstream_resp=upstream_resp),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -2262,6 +2314,44 @@ claude_zen_proxy_status() {
     echo "Proxy not running."; return 1
 }
 
+claude_zen_proxy_restart() {
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local port="${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}"
+    local pidf="${dir}/proxy.pid"
+
+    printf 'Force-restarting proxy on port %s...\n' "$port"
+
+    # Kill all proxy processes on this port (both tracked and orphaned)
+    local stale_pids
+    stale_pids="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
+    if [ -n "$stale_pids" ]; then
+        printf '  Killing stale proxy(es): %s\n' "$stale_pids"
+        kill $stale_pids 2>/dev/null || true
+        sleep 1
+        local remaining
+        remaining="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
+        if [ -n "$remaining" ]; then
+            printf '  Force-killing stalled proxy(es): %s\n' "$remaining"
+            kill -9 $remaining 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    rm -f "$pidf"
+
+    # Verify port is free
+    if ss -tlnp "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
+        printf '  Port %s still in use, waiting...\n' "$port"
+        sleep 2
+    fi
+
+    printf '  Starting fresh proxy...\n'
+    _claude_zen_ensure_proxy || {
+        printf '  Proxy failed to start. Check %s/proxy.log\n' "$dir" >&2
+        return 1
+    }
+    printf '  OK.\n'
+}
+
 # ── Danger guardrail helpers (shared by launch and session-resume) ──────────
 # Installs a temporary CLAUDE.md with git-restriction guardrails, backed up
 # from the original so it can be restored after Claude exits.
@@ -2603,6 +2693,45 @@ alias cz-resume='claude_zen_quick_resume'
 alias cz-danger-recent='claude_zen_list_recent --danger'
 alias cz-danger-last='claude_zen_resume_last --danger'
 alias cz-danger-resume='claude_zen_quick_resume --danger'
+alias cz-proxy-restart='claude_zen_proxy_restart'
+alias cz-help='claude_zen_help'
+alias cz-aliases='claude_zen_help'
+
+claude_zen_help() {
+    cat << HELPEOF
+Claude Zen - Claude Code via OpenAI-compatible proxy
+
+USAGE:
+  cz / cz-new           Start a new Claude Code session (model picker)
+  cz-danger             Same, with auto-accept permissions
+  cz-cloud              Use Anthropic cloud API directly (no proxy)
+  ccz                   Resume most recent cloud session
+
+  Session management:
+    cz-recent             List recent sessions, pick one to resume
+    cz-last               Resume the most recent session
+    cz-resume <id>        Resume a specific session by ID prefix
+    cz-danger-recent      Same as cz-recent with auto-accept
+    cz-danger-last        Same as cz-last with auto-accept
+    cz-danger-resume <id> Same as cz-resume with auto-accept
+
+  Proxy:
+    cz-proxy-start        Start the translation proxy daemon
+    cz-proxy-stop         Stop the proxy daemon
+    cz-proxy-status       Check if proxy is running
+    cz-proxy-restart      Force-kill all proxies and restart fresh
+
+  Model:
+    cz-model              Pick and save a default model
+    cz-model-current      Show currently selected model
+
+  Other:
+    cz-undo-danger        Remove danger-mode guardrails from CLAUDE.md
+    cz-aliases / cz-help  Show this help
+
+HELPEOF
+}
+
 __MARKER_END__
 WRAPEOF
 }
