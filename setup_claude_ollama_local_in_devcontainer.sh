@@ -22,6 +22,8 @@ have_command() {
 
 PERSISTENCE_DIR="$(pwd)/.claude_config"
 CONFIG_PATH="${HOME}/.config/claude-cli"
+LLM_HOST_FILE="${PERSISTENCE_DIR}/ollama-host"
+
 # Determine LLM_HOST based on arguments or interactive menu
 if [ -n "${1:-}" ]; then
     if [ "${1}" == "localhost" ]; then
@@ -32,13 +34,22 @@ if [ -n "${1:-}" ]; then
         log "ℹ️ Using custom host/IP: ${LLM_HOST}"
     fi
 else
+    # Check for existing host setting
+    EXISTING_HOST=""
+    if [ -f "${LLM_HOST_FILE}" ]; then
+        EXISTING_HOST="$(cat "${LLM_HOST_FILE}")"
+    fi
+
     log "No LLM host argument provided. Select an option:"
     printf '\n'
     printf '  1) Devcontainer (default - host.docker.internal)\n'
     printf '  2) Localhost\n'
     printf '  3) Enter custom IP/hostname\n'
+    if [ -n "${EXISTING_HOST}" ]; then
+        printf '  4) Use existing host: %s\n' "${EXISTING_HOST}"
+    fi
     printf '\n'
-    printf 'Enter choice [1-3]: '
+    printf 'Enter choice [1-4]: '
     read -r choice
     case "${choice}" in
         1)
@@ -55,6 +66,16 @@ else
             LLM_HOST="http://${custom_host}:11434"
             log "ℹ️ Using custom host: ${LLM_HOST}"
             ;;
+        4)
+            if [ -n "${EXISTING_HOST}" ]; then
+                LLM_HOST="${EXISTING_HOST}"
+                log "ℹ️ Using existing host: ${LLM_HOST}"
+            else
+                printf '\n%s\n' "No existing host found, defaulting to devcontainer host."
+                LLM_HOST="http://host.docker.internal:11434"
+                log "ℹ️ Using default devcontainer host: ${LLM_HOST}"
+            fi
+            ;;
         *)
             printf '\n%s\n' "Invalid choice, defaulting to devcontainer host."
             LLM_HOST="http://host.docker.internal:11434"
@@ -62,27 +83,14 @@ else
             ;;
     esac
 fi
+# Persist the selected host
+mkdir -p "${PERSISTENCE_DIR}"
+printf '%s\n' "${LLM_HOST}" > "${LLM_HOST_FILE}"
+
 MODEL_FILE="${PERSISTENCE_DIR}/selected-ollama-model"
 NPM_GLOBAL_DIR="${HOME}/.npm-global"
-# NOTE: Claude Code hard-clamps output tokens to 128000 internally; no env var can
-# exceed that. The "output token maximum" error is almost always a runaway model,
-# not a real limit. The actual fix is NUM_CTX below (see comment), which lets the
-# model fit Claude Code's large prompt so it stops naturally instead of rambling.
-# This value is still exported for the direct `claude`/`c-cloud` path.
 MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}"
-# Context window (num_ctx) baked into a derived Ollama model variant at launch.
-# Ollama serves models at a small default context (~4096) regardless of the
-# model's architectural maximum, which truncates Claude Code's large system
-# prompt and makes models ramble until they hit the output-token ceiling. Baking
-# a large num_ctx into a `<model>-ctx<N>` variant fixes this. Override by
-# exporting CLAUDE_OLLAMA_NUM_CTX before running this script. Set to 0 to disable.
-# With 48+ GB VRAM, 262144 (gemma4's max) is safe; tune down for lower VRAM.
-# NOTE: intentionally NOT reading from CLAUDE_OLLAMA_NUM_CTX here — the setup
-# script bakes the default unconditionally so re-running the script always
-# upgrades the wrapper to the latest defaults. Per-launch overrides like
-# 'CLAUDE_OLLAMA_NUM_CTX=131072 c' still work inside the shell.
 NUM_CTX="${CLAUDE_OLLAMA_NUM_CTX_SETUP:-262144}"
-# Thinking token budget and effort defaults. Same baking strategy as NUM_CTX.
 MAX_THINKING_TOKENS_DEFAULT="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS_SETUP:-16384}"
 EFFORT_DEFAULT="${CLAUDE_OLLAMA_EFFORT_SETUP:-low}"
 DANGEROUSLY_SKIP_PERMISSIONS="${CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS:-false}"
@@ -154,10 +162,8 @@ ensure_claude_cli() {
 ensure_persistence_link() {
     log "💾 Configuring persistence..."
 
-    # Ensure base persistence dir exists
     mkdir -p "${PERSISTENCE_DIR}"
 
-    # Link ~/.config/claude-cli -> PERSISTENCE_DIR
     mkdir -p "$(dirname "${CONFIG_PATH}")"
     if [ -L "${CONFIG_PATH}" ] || [ -f "${CONFIG_PATH}" ]; then
         rm -f "${CONFIG_PATH}"
@@ -167,17 +173,12 @@ ensure_persistence_link() {
     ln -s "${PERSISTENCE_DIR}" "${CONFIG_PATH}"
     log "✅ Config linked: ${CONFIG_PATH} -> ${PERSISTENCE_DIR}"
 
-    # Both scripts share one persist dir so `c` and `cz` see the same sessions/history.
     local claude_persist="${CLAUDE_PERSIST_DIR:-${SCRIPT_DIR}/.claude_persist}"
-    # Always ensure the target directory exists — a dangling symlink causes
-    # Claude Code to fail with ENOENT when trying to create jobs/sessions dirs.
     mkdir -p "${claude_persist}"
     if [ -L "${HOME}/.claude" ]; then
         local current_target
         current_target="$(readlink "${HOME}/.claude")"
         if [ "${current_target}" != "${claude_persist}" ]; then
-            # Old symlink pointed elsewhere (e.g. .claude_config/dot-claude).
-            # Migrate data if the old target had content and the new one is empty.
             if [ -d "${current_target}" ] && [ -z "$(ls -A "${claude_persist}" 2>/dev/null)" ]; then
                 log "📦 Migrating Claude data from ${current_target} to ${claude_persist}..."
                 cp -a "${current_target}/." "${claude_persist}/"
@@ -198,7 +199,6 @@ ensure_persistence_link() {
     fi
     log "✅ ~/.claude linked -> ${claude_persist}"
 
-    # Persist ~/.claude.json (user ID, project settings, onboarding state)
     local persisted_claude_json="${PERSISTENCE_DIR}/dot-claude.json"
     if [ -L "${HOME}/.claude.json" ]; then
         local current_target
@@ -247,31 +247,16 @@ build_wrapper_block() {
         -e "s|__PERSISTENCE_DIR__|${PERSISTENCE_DIR}|g" \
         -e "s|__CLAUDE_OLLAMA_PERSISTENCE_DIR__|${CLAUDE_PERSIST_DIR}|g"
 __MARKER_BEGIN__
-# These are resolved at setup time so the rc file contains literal paths — no $0,
-# no $(pwd), nothing that breaks in an interactive shell. Everything stays in the
-# workspace; the home folder is ephemeral and not used for any persistence.
+# Environment configuration
 SCRIPT_DIR="__SCRIPT_DIR__"
 PERSISTENCE_DIR="__PERSISTENCE_DIR__"
 CLAUDE_OLLAMA_PERSISTENCE_DIR="__CLAUDE_OLLAMA_PERSISTENCE_DIR__"
-export OLLAMA_HOST="__LLM_HOST__"
+export ANTHROPIC_BASE_URL="__LLM_HOST__"
 export CLAUDE_OLLAMA_MODEL_FILE="__MODEL_FILE__"
-# Default num_ctx baked in unconditionally so re-running the script upgrades it.
-# Per-launch override still works: CLAUDE_OLLAMA_NUM_CTX=131072 c
 export CLAUDE_OLLAMA_NUM_CTX="__NUM_CTX__"
-# Local model thinking defaults. Keep thinking enabled by default, but bound the
-# thinking budget to prevent runaway long traces that can trigger output cap
-# errors in Claude Code for broad prompts like "analyze this repo".
-# With 48+ GB VRAM, 16384 thinking tokens is safe; tune down for lower VRAM.
-# Baked unconditionally so re-running the script always upgrades the defaults.
-# Per-launch: CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 c
 export CLAUDE_OLLAMA_THINKING="enabled"
 export CLAUDE_OLLAMA_MAX_THINKING_TOKENS="__MAX_THINKING_TOKENS__"
-# Default Claude effort level for local Ollama launches. Lower effort keeps
-# thinking enabled but curbs runaway long responses on broad prompts.
-# Baked unconditionally; override per-launch: CLAUDE_OLLAMA_EFFORT=medium c
 export CLAUDE_OLLAMA_EFFORT="__EFFORT_DEFAULT__"
-# Claude Code clamps this to 128000 internally; it only matters for the direct
-# `claude`/`c-cloud` path since `ollama launch claude` sets its own value.
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-__MAX_OUTPUT_TOKENS__}"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
@@ -287,7 +272,7 @@ import re
 import sys
 from urllib.request import urlopen
 
-host = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+host = os.environ.get("ANTHROPIC_BASE_URL", "http://host.docker.internal:11434")
 try:
     with urlopen(f"{host}/api/tags", timeout=5) as response:
         payload = json.load(response)
@@ -300,10 +285,6 @@ if not models:
     print("No Ollama models returned by host API.", file=sys.stderr)
     sys.exit(1)
 
-# Hide auto-generated "<base>-ctx<N>" variants from the chooser when their base
-# model is also present. The launch logic recreates/uses the ctx variant
-# automatically, so showing both just clutters the list. A "-ctx<N>" model whose
-# base is missing is kept so it stays selectable.
 ctx_suffix = re.compile(r"-ctx\d+$")
 names = {m.get("name", "") for m in models}
 visible = [
@@ -353,22 +334,16 @@ claude_current_ollama_model() {
 }
 
 _claude_ensure_ctx_variant() {
-    # Ensure a large-context variant of the given model exists on the host Ollama,
-    # then echo the model name to actually launch. This is the real fix for the
-    # "output token maximum" error: a roomy num_ctx lets the model fit Claude
-    # Code's prompt and stop naturally instead of rambling until it is truncated.
     local base="$1"
     local num_ctx="${CLAUDE_OLLAMA_NUM_CTX:-__NUM_CTX__}"
-    local host="${OLLAMA_HOST:-http://host.docker.internal:11434}"
+    local host="${ANTHROPIC_BASE_URL:-http://host.docker.internal:11434}"
 
-    # Disabled, or the selected model is already a ctx-tuned variant: use as-is.
     if [ -z "${num_ctx}" ] || [ "${num_ctx}" = "0" ] || printf '%s' "${base}" | grep -qiE 'ctx[0-9]+'; then
         printf '%s' "${base}"
         return 0
     fi
 
     local variant="${base}-ctx${num_ctx}"
-    # Create the variant once (idempotent); reuses the base model's blobs.
     if ! curl -fsS "${host}/api/tags" 2>/dev/null | grep -q "\"${variant}\""; then
         printf 'Creating Ollama variant %s (num_ctx=%s)...\n' "${variant}" "${num_ctx}" >&2
         if ! curl -fsS "${host}/api/create" \
@@ -392,70 +367,6 @@ _claude_has_effort_flag() {
         esac
     done
     return 1
-}
-
-# ── litellm proxy (routes through Ollama's working OpenAI API, bypassing        ─
-# the broken Anthropic handler: https://github.com/ollama/ollama/issues/13949)   ─
-_claude_find_free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
-}
-
-_claude_ensure_litellm() {
-    if command -v litellm >/dev/null 2>&1; then
-        if python3 -c 'import websockets' 2>/dev/null; then
-            return 0
-        fi
-    fi
-    if command -v "${HOME}/.local/bin/litellm" >/dev/null 2>&1; then
-        export PATH="${HOME}/.local/bin:${PATH}"
-        if python3 -c 'import websockets' 2>/dev/null; then
-            return 0
-        fi
-    fi
-    pip install 'litellm[proxy]' 1>&2 || pip install --break-system-packages 'litellm[proxy]' 1>&2 || {
-        printf 'Failed to install litellm[proxy].\n' >&2
-        return 1
-    }
-    if ! command -v litellm >/dev/null 2>&1; then
-        export PATH="${HOME}/.local/bin:${PATH}"
-    fi
-    return 0
-}
-
-_claude_litellm_proxy_pid=""
-
-_claude_start_litellm_proxy() {
-    local model="$1"
-    _claude_ensure_litellm || return 1
-    local port
-    port="$(_claude_find_free_port)"
-    local host="${OLLAMA_HOST:-http://host.docker.internal:11434}"
-    litellm --model "ollama/${model}" \
-        --api_base "${host}" \
-        --port "${port}" \
-        --drop_params \
-        >/tmp/litellm-proxy.log 2>&1 &
-    _claude_litellm_proxy_pid="$!"
-    local i=0
-    while [ "$i" -lt 30 ]; do
-        if curl -sf "http://localhost:${port}/health" >/dev/null 2>&1; then
-            printf '%s' "${port}"
-            return 0
-        fi
-        sleep 1
-        i="$((i + 1))"
-    done
-    printf 'litellm proxy failed to start (check /tmp/litellm-proxy.log)\n' >&2
-    kill "${_claude_litellm_proxy_pid}" 2>/dev/null || true
-    _claude_litellm_proxy_pid=""
-    return 1
-}
-
-_claude_stop_litellm_proxy() {
-    if [ -n "${_claude_litellm_proxy_pid}" ]; then
-        kill "${_claude_litellm_proxy_pid}" 2>/dev/null || true
-        _claude_litellm_proxy_pid=""
-    fi
 }
 
 claude_local_launch() {
@@ -487,131 +398,12 @@ claude_local_launch() {
         extra_args+=(--dangerously-skip-permissions)
     fi
 
-    local proxy_port
-    if ! proxy_port="$(_claude_start_litellm_proxy "${launch_model}")"; then
-        return 1
-    fi
+    printf 'Launching Claude on %s...\n' "${launch_model}" >&2
 
-    printf 'Launching Claude on %s (litellm proxy :%s)\n' "${launch_model}" "${proxy_port}" >&2
-    trap _claude_stop_litellm_proxy EXIT INT TERM
-
-    ANTHROPIC_BASE_URL="http://localhost:${proxy_port}" \
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     claude --model "${launch_model}" "${extra_args[@]}" "${effort_args[@]}" "$@"
-
-    _claude_stop_litellm_proxy
-    trap - EXIT INT TERM
-}
-
-claude_cloud_launch() {
-    claude "$@"
-}
-
-# ── Danger mode: auto-accept permissions with git guardrails ────────────────
-# Installs a temporary CLAUDE.md with git-restriction guardrails, backed up
-# from the original so it can be restored after Claude exits.
-
-_claude_ollama_install_danger_guardrails() {
-    local workspace_root="$1" dir="$2" claude_md danger_dir backup_file
-    claude_md="${workspace_root}/CLAUDE.md"
-    # Use CLAUDE_OLLAMA_PERSISTENCE_DIR consistently — respects the user's
-    # CLAUDE_OLLAMA_PERSIST_DIR override; falls back to SCRIPT_DIR/.claude_persist.
-    dir="${dir:-${CLAUDE_OLLAMA_PERSISTENCE_DIR}}"
-    [ -z "$dir" ] && dir="$(pwd)/.claude_config"
-    # Guard against pathological empty-path resolving "/" — never create /danger.
-    case "$dir" in
-        ""|"/") dir="$(pwd)/.claude_config" ;;
-    esac
-    danger_dir="${dir}/danger"
-    mkdir -p "$danger_dir"
-    backup_file="${danger_dir}/CLAUDE.md.bak"
-    if [ -f "$claude_md" ]; then
-        cp "$claude_md" "$backup_file"
-    else
-        rm -f "$backup_file"
-        touch "$backup_file"
-    fi
-    local rules_file="${danger_dir}/danger_rules.md"
-    if [ ! -f "$rules_file" ]; then
-        cat > "$rules_file" << 'DANGEREOF'
-# ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
-
-You are running with **automatic permission approval**. Every tool call you
-make is executed WITHOUT confirmation. This is a safety-critical mode.
-
-## MANDATORY RESTRICTIONS — Git write operations
-
-Only the following **Staging & Read** operations are allowed:
-
-### ✅ ALLOWED Git Operations
-| Command | Purpose |
-|---------|---------|
-| `git add <file>` | Stage a file (fine-grained) |
-| `git add -p` | Stage interactively by hunk |
-| `git add -A` | Stage all changes |
-| `git status` | View working tree state |
-| `git diff` | View unstaged changes |
-| `git diff --cached` | View staged changes |
-| `git log` | View commit history |
-| `git show` | View a commit |
-| `git blame` | Annotate a file |
-| `git restore <file>` | Discard unstaged local changes |
-| `git stash push` | Save WIP temporarily |
-| `git stash list` | View stashes |
-| `git stash show` | View stash contents |
-
-### ❌ FORBIDDEN Git Operations
-| Operation | Reason |
-|-----------|--------|
-| `git commit` | Would record changes permanently |
-| `git push` / `git push --force` | Would publish to remote |
-| `git branch` / `git checkout -b` | Would create branches |
-| `git merge` / `git rebase` | Would alter history |
-| `git tag` | Would tag releases |
-| `git fetch` / `git pull` | Would contact remote |
-| `git reset --hard` / `git reset --mixed` | Destructive history reset |
-| `git revert` / `git cherry-pick` | Would create new commits |
-| `git rm` / `git mv` | Would remove/rename tracked files |
-| `git submodule` | Complex git mutation |
-| `git worktree` | Would create worktrees |
-| `git gc` / `git prune` / `git repack` | Repository maintenance |
-| `git clean -fd` / `-fdX` | Aggressive file removal |
-| `git stash drop` / `git stash pop` / `git stash clear` | Destructive stash ops |
-| `git config` (with global/system) | Would change git settings |
-
-### File System Cautions
-- You can read, write, and edit files normally.
-- **Do not delete files** without the user explicitly asking — even though
-  you auto-accept permissions, ask for verbal confirmation on deletes.
-- **Do not run shell commands** that modify the system (install packages,
-  change system config) without asking first.
-
-### Enforcement
-- If you are asked to do a forbidden git operation, say:
-  "⛔ This operation is blocked by Danger Mode guardrails."
-- If in doubt, err on the side of refusing. The user can always switch to
-  normal mode (`c`) for git-write operations.
-
-DANGEREOF
-    fi
-    cp "$rules_file" "$claude_md"
-    printf '%s' "$backup_file"
-}
-
-_claude_ollama_cleanup_danger_guardrails() {
-    local workspace_root="$1" dir="$2" backup_file="$3" exit_code="${4:-$?}"
-    local claude_md="${workspace_root}/CLAUDE.md"
-    # Use CLAUDE_OLLAMA_PERSISTENCE_DIR consistently (respects overrides).
-    dir="${dir:-${CLAUDE_OLLAMA_PERSISTENCE_DIR}}"
-    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
-        cp "$backup_file" "$claude_md"
-    elif [ -f "$backup_file" ]; then
-        rm -f "$claude_md"
-    fi
-    rm -f "$backup_file"
-    return "$exit_code"
 }
 
 claude_ollama_launch_danger() {
@@ -629,7 +421,6 @@ claude_ollama_launch_danger() {
     local launch_model
     launch_model="$(_claude_ensure_ctx_variant "${selected_model}")"
 
-    # Derive workspace root from PERSISTENCE_DIR
     local workspace_root="${PERSISTENCE_DIR%/*}"
     [ -z "$workspace_root" ] && workspace_root="$(pwd)"
 
@@ -641,62 +432,21 @@ claude_ollama_launch_danger() {
     printf '\n'
 
     local backup_file
-    # Use CLAUDE_OLLAMA_PERSISTENCE_DIR for consistency with the rest of the script.
     backup_file="$(_claude_ollama_install_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}")"
 
-    local proxy_port
-    if ! proxy_port="$(_claude_start_litellm_proxy "${launch_model}")"; then
-        _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
-        return 1
-    fi
+    printf 'Launching Claude on %s (danger mode)...\n' "${launch_model}" >&2
 
-    trap _claude_stop_litellm_proxy EXIT INT TERM
-
-    printf 'Launching Claude on %s (danger mode, litellm proxy :%s)\n' "${launch_model}" "${proxy_port}" >&2
-    ANTHROPIC_BASE_URL="http://localhost:${proxy_port}" \
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
     claude --model "${launch_model}" --dangerously-skip-permissions "$@"
 
-    _claude_stop_litellm_proxy
-    trap - EXIT INT TERM
     _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
 }
 
-claude_ollama_uninstall_danger_rules() {
-    local workspace_root="${CLAUDE_OLLAMA_PERSISTENCE_DIR%/*}"
-    [ -z "$workspace_root" ] && workspace_root="$(pwd)"
-    local claude_md="${workspace_root}/CLAUDE.md"
-    local backup_file="${CLAUDE_OLLAMA_PERSISTENCE_DIR}/danger/CLAUDE.md.bak"
-
-    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
-        cp "$backup_file" "$claude_md"
-        printf 'Restored original CLAUDE.md\n'
-        rm -f "$backup_file"
-    elif [ -f "$claude_md" ]; then
-        if grep -q 'DANGER MODE GUARDRAILS' "$claude_md" 2>/dev/null; then
-            rm -f "$claude_md"
-            printf 'Removed danger CLAUDE.md\n'
-        else
-            printf 'CLAUDE.md is not a danger rules file — leaving untouched\n'
-        fi
-    else
-        printf 'No CLAUDE.md found\n'
-    fi
-}
-
-c() {
-    claude_local_launch "$@"
-}
-
-c_new() {
-    claude_local_launch "$@"
-}
-
-cc() {
-    claude --continue "$@"
+claude_cloud_launch() {
+    claude "$@"
 }
 
 alias c-new='c_new'
@@ -753,6 +503,41 @@ PY
     done
 }
 
+update_vscode_tasks() {
+    log "📝 Updating VS Code tasks..."
+    local tasks_file=".vscode/tasks.json"
+    mkdir -p ".vscode"
+    if [ ! -f "$tasks_file" ]; then
+        printf '{"version": "2.0.0", "tasks": []}' > "$tasks_file"
+    fi
+
+    python3 - "$tasks_file" << 'PY'
+import json, sys, os
+tasks_file = sys.argv[1]
+with open(tasks_file, 'r') as f:
+    data = json.load(f)
+
+new_tasks = [
+    {"label": "Claude Local (c)", "type": "shell", "command": "bash -ic 'c'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Local New (c-new)", "type": "shell", "command": "bash -ic 'c-new'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Local Danger (c-danger)", "type": "shell", "command": "bash -ic 'c-danger'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Cloud (c-cloud)", "type": "shell", "command": "bash -ic 'c-cloud'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Continue (c-continue)", "type": "shell", "command": "bash -ic 'c-continue'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Local Medium (c-med)", "type": "shell", "command": "bash -ic 'c-med'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Local High (c-hi)", "type": "shell", "command": "bash -ic 'c-hi'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Local Max (c-max)", "type": "shell", "command": "bash -ic 'c-max'", "problemMatcher": [], "group": "build"},
+]
+
+existing_tasks = {t["label"]: t for t in data.get("tasks", [])}
+for nt in new_tasks:
+    existing_tasks[nt["label"]] = nt
+
+data["tasks"] = list(existing_tasks.values())
+with open(tasks_file, 'w') as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
 print_summary() {
     local shell_rc=".bashrc"
     case "${SHELL}" in
@@ -800,5 +585,5 @@ ensure_claude_cli
 ensure_persistence_link
 check_ollama_host
 install_shell_wrappers
+update_vscode_tasks
 print_summary
-  
