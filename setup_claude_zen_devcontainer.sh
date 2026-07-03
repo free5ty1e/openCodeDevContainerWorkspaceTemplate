@@ -1284,23 +1284,9 @@ def cmd_resolve(pid, model_name=""):
     Returns the key on stdout, empty if no key needed / user skipped.
     If model_name is in a "Free" family in backends.json, skip prompting.
     """
-    # Check if the selected model is a Zen free model — skip key prompt
-    # (OpenRouter :free models still need the API key for routing)
-    if model_name:
-        try:
-            with open(BACKENDS_FILE) as f:
-                cfg = json.load(f)
-            be = cfg.get(pid, {})
-            models_dict = be.get("models", {})
-            for family, model_list in models_dict.items():
-                if family.startswith("Free") and model_name in model_list and pid == "zen":
-                    return ""  # Free Zen model — no API key needed
-        except Exception:
-            pass
-
     key_env = get_key_env(pid)
     if not key_env:
-        return ""  # No API key needed for this provider
+        return ""
 
     # 1. Environment variable already set?
     val = os.environ.get(key_env, "") or ""
@@ -1313,7 +1299,20 @@ def cmd_resolve(pid, model_name=""):
     if stored:
         return stored
 
-    # 3. Prompt user
+    # 3. Check if free model — skip prompt entirely
+    if model_name:
+        try:
+            with open(BACKENDS_FILE) as f:
+                cfg = json.load(f)
+            be = cfg.get(pid, {})
+            models_dict = be.get("models", {})
+            for family, model_list in models_dict.items():
+                if family.startswith("Free") and model_name in model_list and pid == "zen":
+                    return ""
+        except Exception:
+            pass
+
+    # 4. Prompt user
     meta = get_provider_meta(pid)
     provider_name = meta.get("name", pid)
     description = meta.get("description", "")
@@ -2352,6 +2351,28 @@ claude_zen_proxy_restart() {
     printf '  OK.\n'
 }
 
+claude_zen_reset_key() {
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local backends_file="${ZEN_BACKENDS:-${dir}/backends.json}"
+    local vault_file="${dir}/api_keys.json"
+    local key_vault="${dir}/key_vault.py"
+    local new_key
+
+    new_key="$(python3 -c "import uuid; print(uuid.uuid4().hex)")" || {
+        printf 'Failed to generate new key.\n' >&2
+        return 1
+    }
+
+    python3 "$key_vault" set zen "$backends_file" "$vault_file" "$new_key"
+    export ZEN_API_KEY="$new_key"
+
+    printf '\n'
+    printf '  New anonymous key: %s\n' "$new_key"
+    printf '  Restarting proxy with fresh identity...\n'
+
+    claude_zen_proxy_restart
+}
+
 # ── Danger guardrail helpers (shared by launch and session-resume) ──────────
 # Installs a temporary CLAUDE.md with git-restriction guardrails, backed up
 # from the original so it can be restored after Claude exits.
@@ -2694,6 +2715,7 @@ alias cz-danger-recent='claude_zen_list_recent --danger'
 alias cz-danger-last='claude_zen_resume_last --danger'
 alias cz-danger-resume='claude_zen_quick_resume --danger'
 alias cz-proxy-restart='claude_zen_proxy_restart'
+alias cz-fresh-key='claude_zen_reset_key'
 alias cz-help='claude_zen_help'
 alias cz-aliases='claude_zen_help'
 
@@ -2720,6 +2742,7 @@ USAGE:
     cz-proxy-stop         Stop the proxy daemon
     cz-proxy-status       Check if proxy is running
     cz-proxy-restart      Force-kill all proxies and restart fresh
+    cz-fresh-key          Generate a new anonymous key (bypass free usage limits)
 
   Model:
     cz-model              Pick and save a default model
