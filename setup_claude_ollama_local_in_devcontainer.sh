@@ -258,8 +258,8 @@ export CLAUDE_OLLAMA_THINKING="enabled"
 export CLAUDE_OLLAMA_MAX_THINKING_TOKENS="__MAX_THINKING_TOKENS__"
 export CLAUDE_OLLAMA_EFFORT="__EFFORT_DEFAULT__"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-__MAX_OUTPUT_TOKENS__}"
-export CLAUDE_OLLAMA_TIMEOUT_MS="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
-export ANTHROPIC_TIMEOUT="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+export CLAUDE_OLLAMA_TIMEOUT_MS="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
+export API_TIMEOUT_MS="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
 export CLAUDE_OLLAMA_CTX_STRATEGY="${CLAUDE_OLLAMA_CTX_STRATEGY:-}"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
@@ -501,12 +501,12 @@ claude_local_launch() {
         extra_args+=(--debug)
     fi
 
-    local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+    local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
     printf 'Launching Claude on %s (request timeout: %sms)...\n' "${launch_model}" "${timeout_ms}" >&2
 
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
-    ANTHROPIC_TIMEOUT="${timeout_ms}" \
+    API_TIMEOUT_MS="${timeout_ms}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     claude --model "${launch_model}" "${extra_args[@]}" "${effort_args[@]}" "$@"
     local _claude_exit=$?
@@ -554,12 +554,12 @@ claude_ollama_launch_danger() {
         extra_args+=(--debug)
     fi
 
-    local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+    local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
     printf 'Launching Claude on %s (request timeout: %sms, danger mode)...\n' "${launch_model}" "${timeout_ms}" >&2
 
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
-    ANTHROPIC_TIMEOUT="${timeout_ms}" \
+    API_TIMEOUT_MS="${timeout_ms}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
     claude --model "${launch_model}" --dangerously-skip-permissions "${extra_args[@]}" "$@"
@@ -589,7 +589,7 @@ alias c-cloud='claude_cloud_launch'
 alias c-continue='cc'
 alias c-med='CLAUDE_OLLAMA_EFFORT=medium c'
 alias c-hi='CLAUDE_OLLAMA_EFFORT=high c'
-alias c-max='CLAUDE_OLLAMA_EFFORT=high CLAUDE_OLLAMA_NUM_CTX=262144 CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 CLAUDE_OLLAMA_TIMEOUT_MS=1200000 c'
+alias c-max='CLAUDE_OLLAMA_EFFORT=high CLAUDE_OLLAMA_NUM_CTX=262144 CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 CLAUDE_OLLAMA_TIMEOUT_MS=3600000 c'
 alias ollama-model='claude_pick_ollama_model'
 alias ollama-model-current='claude_current_ollama_model'
 __MARKER_END__
