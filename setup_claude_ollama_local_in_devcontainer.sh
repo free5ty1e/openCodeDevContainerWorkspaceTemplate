@@ -258,6 +258,9 @@ export CLAUDE_OLLAMA_THINKING="enabled"
 export CLAUDE_OLLAMA_MAX_THINKING_TOKENS="__MAX_THINKING_TOKENS__"
 export CLAUDE_OLLAMA_EFFORT="__EFFORT_DEFAULT__"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-__MAX_OUTPUT_TOKENS__}"
+export CLAUDE_OLLAMA_TIMEOUT_MS="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+export ANTHROPIC_TIMEOUT="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+export CLAUDE_OLLAMA_CTX_STRATEGY="${CLAUDE_OLLAMA_CTX_STRATEGY:-}"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
 unalias c c-new c-danger c-cloud c-continue 2>/dev/null || true
@@ -335,10 +338,33 @@ claude_current_ollama_model() {
 
 _claude_ensure_ctx_variant() {
     local base="$1"
-    local num_ctx="${CLAUDE_OLLAMA_NUM_CTX:-__NUM_CTX__}"
+    local strategy="${2:-${CLAUDE_OLLAMA_CTX_STRATEGY:-standard}}"
     local host="${ANTHROPIC_BASE_URL:-http://host.docker.internal:11434}"
 
-    if [ -z "${num_ctx}" ] || [ "${num_ctx}" = "0" ] || printf '%s' "${base}" | grep -qiE 'ctx[0-9]+'; then
+    # "default" → no ctx override, return base model name as-is
+    if [ "${strategy}" = "default" ]; then
+        printf '%s' "${base}"
+        return 0
+    fi
+
+    local num_ctx=""
+    case "${strategy}" in
+        standard)
+            num_ctx="${CLAUDE_OLLAMA_NUM_CTX:-__NUM_CTX__}"
+            ;;
+        custom=*)
+            num_ctx="${strategy#custom=}"
+            ;;
+        *)
+            if printf '%s' "${strategy}" | grep -qE '^[0-9]+$'; then
+                num_ctx="${strategy}"
+            else
+                num_ctx="${CLAUDE_OLLAMA_NUM_CTX:-__NUM_CTX__}"
+            fi
+            ;;
+    esac
+
+    if [ -z "${num_ctx}" ] || [ "${num_ctx}" = "0" ]; then
         printf '%s' "${base}"
         return 0
     fi
@@ -369,6 +395,76 @@ _claude_has_effort_flag() {
     return 1
 }
 
+_claude_get_model_max_ctx() {
+    local model="$1"
+    local host="${ANTHROPIC_BASE_URL:-http://host.docker.internal:11434}"
+    curl -fsS "${host}/api/show" -d "{\"model\":\"${model}\"}" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    mi = data.get("model_info", {})
+    for key in mi:
+        kl = key.lower()
+        if "context_length" in kl:
+            print(int(mi[key]))
+            sys.exit(0)
+except Exception:
+    pass
+print("0")
+' 2>/dev/null || printf '0'
+}
+
+_claude_ctx_strategy_select() {
+    local model="$1"
+
+    if [ -n "${CLAUDE_OLLAMA_CTX_STRATEGY:-}" ]; then
+        printf "  Using env ctx strategy: %s\n" "${CLAUDE_OLLAMA_CTX_STRATEGY}" >&2
+        printf '%s' "${CLAUDE_OLLAMA_CTX_STRATEGY}"
+        return 0
+    fi
+
+    printf '\n' >&2
+    printf "  Context strategy for %s:\n" "${model}" >&2
+    printf "  1) Model default (no ctx override)\n" >&2
+    printf "  2) Standard override (__NUM_CTX__ tokens)\n" >&2
+    printf "  3) Maximum (auto-detect from model)\n" >&2
+    printf "  4) Custom value\n" >&2
+    printf '\n' >&2
+    printf "Enter choice [1-4] (default: 2): " >&2
+    read -r choice </dev/tty
+    choice="${choice:-2}"
+
+    case "${choice}" in
+        1) strategy="default" ;;
+        2) strategy="standard" ;;
+        3)
+            local max_ctx
+            max_ctx="$(_claude_get_model_max_ctx "${model}")"
+            if [ -n "${max_ctx}" ] && printf '%s' "${max_ctx}" | grep -qE '^[0-9]+$' && [ "${max_ctx}" != "0" ]; then
+                strategy="custom=${max_ctx}"
+                printf "  Auto-detected max context: %s tokens\n" "${max_ctx}" >&2
+            else
+                printf "  Could not auto-detect; using standard (%s tokens).\n" "__NUM_CTX__" >&2
+                strategy="standard"
+            fi
+            ;;
+        4)
+            printf "Enter context size in tokens (e.g., 488576): " >&2
+            read -r custom_ctx </dev/tty
+            if printf '%s' "${custom_ctx}" | grep -qE '^[0-9]+$' && [ -n "${custom_ctx}" ]; then
+                strategy="custom=${custom_ctx}"
+            else
+                printf "  Invalid value; using standard (%s).\n" "__NUM_CTX__" >&2
+                strategy="standard"
+            fi
+            ;;
+        *) strategy="standard" ;;
+    esac
+
+    printf "  Using context strategy: %s\n" "${strategy}" >&2
+    printf '%s' "${strategy}"
+}
+
 claude_local_launch() {
     if ! command -v ollama >/dev/null 2>&1; then
         printf '%s\n' "ollama CLI is not installed in this container." >&2
@@ -381,8 +477,12 @@ claude_local_launch() {
     fi
 
     printf '%s\n' "${selected_model}" > "${CLAUDE_OLLAMA_MODEL_FILE}"
+
+    local ctx_strategy
+    ctx_strategy="$(_claude_ctx_strategy_select "${selected_model}")"
     local launch_model
-    launch_model="$(_claude_ensure_ctx_variant "${selected_model}")"
+    launch_model="$(_claude_ensure_ctx_variant "${selected_model}" "${ctx_strategy}")"
+
     local -a effort_args=()
     if ! _claude_has_effort_flag "$@"; then
         case "${CLAUDE_OLLAMA_EFFORT:-low}" in
@@ -397,13 +497,25 @@ claude_local_launch() {
        printf '%s' "$@" | grep -qw -- '--dangerously-skip-permissions'; then
         extra_args+=(--dangerously-skip-permissions)
     fi
+    if [ -n "${CLAUDE_OLLAMA_DEBUG:-}" ]; then
+        extra_args+=(--debug)
+    fi
 
-    printf 'Launching Claude on %s...\n' "${launch_model}" >&2
+    local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+    printf 'Launching Claude on %s (request timeout: %sms)...\n' "${launch_model}" "${timeout_ms}" >&2
 
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
+    ANTHROPIC_TIMEOUT="${timeout_ms}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     claude --model "${launch_model}" "${extra_args[@]}" "${effort_args[@]}" "$@"
+    local _claude_exit=$?
+    if [ "${_claude_exit}" -ne 0 ]; then
+        printf '\n⚠️  Claude exited with code %s. ' "${_claude_exit}" >&2
+        printf 'Try CLAUDE_OLLAMA_DEBUG=1 c to see detailed errors, ' >&2
+        printf 'or check the Ollama server logs at the host.\n' >&2
+        return "${_claude_exit}"
+    fi
 }
 
 claude_ollama_launch_danger() {
@@ -418,8 +530,11 @@ claude_ollama_launch_danger() {
     fi
 
     printf '%s\n' "${selected_model}" > "${CLAUDE_OLLAMA_MODEL_FILE}"
+
+    local ctx_strategy
+    ctx_strategy="$(_claude_ctx_strategy_select "${selected_model}")"
     local launch_model
-    launch_model="$(_claude_ensure_ctx_variant "${selected_model}")"
+    launch_model="$(_claude_ensure_ctx_variant "${selected_model}" "${ctx_strategy}")"
 
     local workspace_root="${PERSISTENCE_DIR%/*}"
     [ -z "$workspace_root" ] && workspace_root="$(pwd)"
@@ -434,29 +549,47 @@ claude_ollama_launch_danger() {
     local backup_file
     backup_file="$(_claude_ollama_install_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}")"
 
-    printf 'Launching Claude on %s (danger mode)...\n' "${launch_model}" >&2
+    local -a extra_args=()
+    if [ -n "${CLAUDE_OLLAMA_DEBUG:-}" ]; then
+        extra_args+=(--debug)
+    fi
+
+    local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-1200000}"
+    printf 'Launching Claude on %s (request timeout: %sms, danger mode)...\n' "${launch_model}" "${timeout_ms}" >&2
 
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
+    ANTHROPIC_TIMEOUT="${timeout_ms}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
-    claude --model "${launch_model}" --dangerously-skip-permissions "$@"
+    claude --model "${launch_model}" --dangerously-skip-permissions "${extra_args[@]}" "$@"
+    local _claude_exit=$?
 
     _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
+
+    if [ "${_claude_exit}" -ne 0 ]; then
+        printf '\n⚠️  Claude exited with code %s. ' "${_claude_exit}" >&2
+        printf 'Try CLAUDE_OLLAMA_DEBUG=1 c-danger to see detailed errors, ' >&2
+        printf 'or check the Ollama server logs at the host.\n' >&2
+        return "${_claude_exit}"
+    fi
 }
 
 claude_cloud_launch() {
     claude "$@"
 }
 
+alias c='claude_local_launch'
+alias c_new='claude_local_launch'
 alias c-new='c_new'
+alias cc='CLAUDE_OLLAMA_CTX_STRATEGY= claude --continue'
 alias c-danger='claude_ollama_launch_danger'
 alias c-undo-danger='claude_ollama_uninstall_danger_rules'
 alias c-cloud='claude_cloud_launch'
 alias c-continue='cc'
 alias c-med='CLAUDE_OLLAMA_EFFORT=medium c'
 alias c-hi='CLAUDE_OLLAMA_EFFORT=high c'
-alias c-max='CLAUDE_OLLAMA_EFFORT=high CLAUDE_OLLAMA_NUM_CTX=262144 CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 c'
+alias c-max='CLAUDE_OLLAMA_EFFORT=high CLAUDE_OLLAMA_NUM_CTX=262144 CLAUDE_OLLAMA_MAX_THINKING_TOKENS=32768 CLAUDE_OLLAMA_TIMEOUT_MS=1200000 c'
 alias ollama-model='claude_pick_ollama_model'
 alias ollama-model-current='claude_current_ollama_model'
 __MARKER_END__
