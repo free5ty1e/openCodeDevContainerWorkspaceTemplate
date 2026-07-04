@@ -2864,6 +2864,52 @@ else
     printf '  Warning: smoke test failed (proxy module may have syntax errors)\n'
 fi
 
+# ─── 8.5. VS Code tasks ───────────────────────────────────────────────
+update_vscode_tasks() {
+    printf '  Updating VS Code tasks...\n'
+    local tasks_file="${SCRIPT_DIR}/.vscode/tasks.json"
+    mkdir -p "${SCRIPT_DIR}/.vscode"
+    if [ ! -f "$tasks_file" ]; then
+        printf '{"version": "2.0.0", "tasks": []}' > "$tasks_file"
+    fi
+
+    python3 - "$tasks_file" << 'PY'
+import json, sys
+tasks_file = sys.argv[1]
+with open(tasks_file, 'r') as f:
+    data = json.load(f)
+
+new_tasks = [
+    {"label": "Claude Zen (cz)", "type": "shell", "command": "bash -ic 'cz'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen New (cz-new)", "type": "shell", "command": "bash -ic 'cz-new'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Danger (cz-danger)", "type": "shell", "command": "bash -ic 'cz-danger'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Cloud (cz-cloud)", "type": "shell", "command": "bash -ic 'cz-cloud'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Continue (ccz)", "type": "shell", "command": "bash -ic 'ccz'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Last (cz-last)", "type": "shell", "command": "bash -ic 'cz-last'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Recent (cz-recent)", "type": "shell", "command": "bash -ic 'cz-recent'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Danger Last (cz-danger-last)", "type": "shell", "command": "bash -ic 'cz-danger-last'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Danger Recent (cz-danger-recent)", "type": "shell", "command": "bash -ic 'cz-danger-recent'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Model (cz-model)", "type": "shell", "command": "bash -ic 'cz-model'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Proxy Start (cz-proxy-start)", "type": "shell", "command": "bash -ic 'cz-proxy-start'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Proxy Stop (cz-proxy-stop)", "type": "shell", "command": "bash -ic 'cz-proxy-stop'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Proxy Status (cz-proxy-status)", "type": "shell", "command": "bash -ic 'cz-proxy-status'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Proxy Restart (cz-proxy-restart)", "type": "shell", "command": "bash -ic 'cz-proxy-restart'", "problemMatcher": [], "group": "build"},
+    {"label": "Claude Zen Fresh Key (cz-fresh-key)", "type": "shell", "command": "bash -ic 'cz-fresh-key'", "problemMatcher": [], "group": "build"},
+]
+
+existing_tasks = {t["label"]: t for t in data.get("tasks", [])}
+for nt in new_tasks:
+    existing_tasks[nt["label"]] = nt
+
+data["tasks"] = list(existing_tasks.values())
+with open(tasks_file, 'w') as f:
+    json.dump(data, f, indent=2)
+PY
+    printf '  Done.\n'
+}
+
+update_vscode_tasks
+
 # ─── 9. Summary ───────────────────────────────────────────────────────────────
 SHELL_RC=".bashrc"; case "${SHELL:-}" in *zsh) SHELL_RC=".zshrc" ;; esac
 
@@ -2894,6 +2940,8 @@ cat << SUMMARY
     cz-proxy-start      Start the proxy daemon
     cz-proxy-stop       Stop it
     cz-proxy-status     Check if running
+    cz-proxy-restart    Force-kill and restart the proxy
+    cz-fresh-key        Generate new anonymous key (bypass free usage limits)
     cz-undo-danger      Remove danger guardrails from workspace CLAUDE.md
 
   Coexistence with ollama setup (setup_claude_ollama_local_in_devcontainer.sh):
