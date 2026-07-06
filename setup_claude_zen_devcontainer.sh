@@ -889,7 +889,7 @@ def get_backend(request: Request) -> Backend:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(7200.0, connect=30.0))
     yield
     if http_client:
         await http_client.aclose()
@@ -999,7 +999,7 @@ async def create_message(request: Request):
     payload = {
         "model": upstream_model,
         "messages": openai_messages,
-        "max_tokens": req.max_tokens or 4096,
+        "max_tokens": req.max_tokens or 16384,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
