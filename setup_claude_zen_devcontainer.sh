@@ -1284,6 +1284,20 @@ def cmd_resolve(pid, model_name=""):
     Returns the key on stdout, empty if no key needed / user skipped.
     If model_name is in a "Free" family in backends.json, skip prompting.
     """
+    # Check if the selected model is a Zen free model — no API key needed
+    # (OpenRouter :free models still need the API key for routing)
+    if model_name:
+        try:
+            with open(BACKENDS_FILE) as f:
+                cfg = json.load(f)
+            be = cfg.get(pid, {})
+            models_dict = be.get("models", {})
+            for family, model_list in models_dict.items():
+                if family.startswith("Free") and model_name in model_list and pid == "zen":
+                    return ""
+        except Exception:
+            pass
+
     key_env = get_key_env(pid)
     if not key_env:
         return ""
@@ -1299,20 +1313,7 @@ def cmd_resolve(pid, model_name=""):
     if stored:
         return stored
 
-    # 3. Check if free model — skip prompt entirely
-    if model_name:
-        try:
-            with open(BACKENDS_FILE) as f:
-                cfg = json.load(f)
-            be = cfg.get(pid, {})
-            models_dict = be.get("models", {})
-            for family, model_list in models_dict.items():
-                if family.startswith("Free") and model_name in model_list and pid == "zen":
-                    return ""
-        except Exception:
-            pass
-
-    # 4. Prompt user
+    # 3. Prompt user
     meta = get_provider_meta(pid)
     provider_name = meta.get("name", pid)
     description = meta.get("description", "")
@@ -2076,7 +2077,7 @@ else
         rm -f "$pidf"
     fi
 
-    "${proxy_python}" "$proxy_script" \
+    ZEN_API_KEY="" "${proxy_python}" "$proxy_script" \
         --backends "$backends_file" \
         --port "$port" \
         >> "$logf" 2>&1 &
@@ -2110,16 +2111,21 @@ _claude_zen_resolve_key() {
         "${ZEN_BACKENDS:-${dir}/backends.json}" \
         "${dir}/api_keys.json" "$model_name")"
 
-    if [ -n "$key_value" ]; then
-        local key_env
-        key_env="$(python3 -c "
+    local key_env
+    key_env="$(python3 -c "
 import json
 with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
     cfg = json.load(f)
 print(cfg.get('$pid', {}).get('api_key_env', ''))
 " 2>/dev/null)"
+
+    if [ -n "$key_value" ]; then
         if [ -n "$key_env" ]; then
             export "$key_env=$key_value"
+        fi
+    else
+        if [ -n "$key_env" ]; then
+            unset "$key_env" 2>/dev/null || true
         fi
     fi
 }
@@ -2356,19 +2362,13 @@ claude_zen_reset_key() {
     local backends_file="${ZEN_BACKENDS:-${dir}/backends.json}"
     local vault_file="${dir}/api_keys.json"
     local key_vault="${dir}/key_vault.py"
-    local new_key
 
-    new_key="$(python3 -c "import uuid; print(uuid.uuid4().hex)")" || {
-        printf 'Failed to generate new key.\n' >&2
-        return 1
-    }
-
-    python3 "$key_vault" set zen "$backends_file" "$vault_file" "$new_key"
-    export ZEN_API_KEY="$new_key"
+    python3 "$key_vault" set zen "$backends_file" "$vault_file" ""
+    unset ZEN_API_KEY
 
     printf '\n'
-    printf '  New anonymous key: %s\n' "$new_key"
-    printf '  Restarting proxy with fresh identity...\n'
+    printf '  Cleared stored anonymous key.\n'
+    printf '  Restarting proxy with fresh anonymous identity...\n'
 
     claude_zen_proxy_restart
 }
@@ -2742,7 +2742,7 @@ USAGE:
     cz-proxy-stop         Stop the proxy daemon
     cz-proxy-status       Check if proxy is running
     cz-proxy-restart      Force-kill all proxies and restart fresh
-    cz-fresh-key          Generate a new anonymous key (bypass free usage limits)
+    cz-fresh-key          Clear stored key and restart anonymous session
 
   Model:
     cz-model              Pick and save a default model
@@ -2910,6 +2910,23 @@ PY
 
 update_vscode_tasks
 
+# ── Kill stale proxy daemon (may be poisoned with old ZEN_API_KEY from env) ──
+printf '  Killing stale proxy process(es) on port %s...\n' "${PROXY_PORT}"
+stale_pids="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
+if [ -n "$stale_pids" ]; then
+    kill $stale_pids 2>/dev/null || true
+    sleep 1
+    remaining="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
+    if [ -n "$remaining" ]; then
+        kill -9 $remaining 2>/dev/null || true
+        sleep 1
+    fi
+    printf '  Done.\n'
+else
+    printf '  None running.\n'
+fi
+rm -f "${PID_FILE}"
+
 # ─── 9. Summary ───────────────────────────────────────────────────────────────
 SHELL_RC=".bashrc"; case "${SHELL:-}" in *zsh) SHELL_RC=".zshrc" ;; esac
 
@@ -2941,7 +2958,7 @@ cat << SUMMARY
     cz-proxy-stop       Stop it
     cz-proxy-status     Check if running
     cz-proxy-restart    Force-kill and restart the proxy
-    cz-fresh-key        Generate new anonymous key (bypass free usage limits)
+    cz-fresh-key        Clear stored key and restart anonymous session
     cz-undo-danger      Remove danger guardrails from workspace CLAUDE.md
 
   Coexistence with ollama setup (setup_claude_ollama_local_in_devcontainer.sh):
