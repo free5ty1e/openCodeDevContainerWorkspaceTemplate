@@ -99,31 +99,49 @@ MARKER_END="# <<< claude-ollama-devcontainer <<<"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_PERSIST_DIR="${CLAUDE_OLLAMA_PERSIST_DIR:-${SCRIPT_DIR}/.claude_persist}"
 
-ensure_ollama_prereqs() {
-    if have_command zstd; then
+ensure_ollama_removed() {
+    # The 'ollama' binary is NOT needed inside the devcontainer — all API calls to
+    # the host Ollama server go through curl/urllib over HTTP (OLLAMA_HOST).
+    # Installing via ollama.com/install.sh also starts a server that binds port
+    # 11434 inside the container, which conflicts with the host's Ollama instance.
+    #
+    # This step prompts the user to optionally remove any in-container ollama
+    # installation found on $PATH.
+
+    if ! have_command ollama; then
+        log "✅ Ollama not found inside devcontainer (no installation to remove)"
         return 0
     fi
 
-    log "📦 Installing Ollama prerequisites..."
-    sudo apt-get update
-    sudo apt-get install -y zstd
-}
+    printf '\n⚠️  Ollama is installed inside this devcontainer (binary at %s)\n' "$(command -v ollama)"
+    printf '   This can conflict with the host machine'\''s Ollama server on port 11434.\n'
+    printf '   Do you want to remove the in-container Ollama installation? [y/N]: '
+    read -r remove_ollama
+    case "${remove_ollama}" in
+        y|Y|yes|YES)
+            log "🛠️  Removing in-container Ollama..."
 
-ensure_ollama_cli() {
-    if have_command ollama; then
-        log "✅ Ollama found at $(command -v ollama)"
-        return 0
-    fi
+            # Stop ollama server if running
+            if have_command systemctl; then
+                sudo systemctl stop ollama 2>/dev/null || true
+                sudo systemctl disable ollama 2>/dev/null || true
+            fi
+            sudo pkill -x ollama 2>/dev/null || true
 
-    if ! have_command curl; then
-        log "❌ curl is required to install Ollama."
-        exit 1
-    fi
+            # Remove systemd service files
+            sudo rm -f /etc/systemd/system/ollama.service
+            sudo rm -rf /etc/systemd/system/ollama.service.d 2>/dev/null || true
 
-    ensure_ollama_prereqs
-    log "🛠️  Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sudo sh
-    log "✅ Ollama found at $(command -v ollama)"
+            # Remove the binary
+            local binary
+            binary="$(command -v ollama)"
+            sudo rm -f "${binary}"
+            log "✅ Removed ollama binary (${binary}) — port 11434 is now free"
+            ;;
+        *)
+            log "⏭️  Skipping ollama removal (existing binary kept)"
+            ;;
+    esac
 }
 
 ensure_node_cli() {
@@ -260,6 +278,7 @@ export CLAUDE_OLLAMA_EFFORT="__EFFORT_DEFAULT__"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-__MAX_OUTPUT_TOKENS__}"
 export CLAUDE_OLLAMA_TIMEOUT_MS="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
 export API_TIMEOUT_MS="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
+export ANTHROPIC_TIMEOUT="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
 export CLAUDE_OLLAMA_CTX_STRATEGY="${CLAUDE_OLLAMA_CTX_STRATEGY:-}"
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
@@ -414,6 +433,26 @@ print("0")
 ' 2>/dev/null || printf '0'
 }
 
+_claude_find_binary() {
+    local cmd
+    cmd="$(command -v claude 2>/dev/null)" && { echo "$cmd"; return 0; }
+    for p in \
+        /home/vscode/.npm-global/bin/claude \
+        /root/.npm-global/bin/claude \
+        /usr/local/bin/claude \
+        /usr/bin/claude; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    cmd="$(find /home/vscode/.vscode-server/extensions -maxdepth 4 \
+        -path '*/anthropic.claude-code-*/resources/native-binary/claude' \
+        -type f -executable 2>/dev/null | head -1)"
+    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
+    cmd="$(find /home/vscode /root /usr/local -maxdepth 8 -name claude -type f -executable 2>/dev/null | head -1)"
+    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
+    printf '\nError: claude binary not found. Install it with:\n  npm install -g @anthropic-ai/claude-code\n\n' >&2
+    return 1
+}
+
 _claude_ctx_strategy_select() {
     local model="$1"
 
@@ -466,11 +505,6 @@ _claude_ctx_strategy_select() {
 }
 
 claude_local_launch() {
-    if ! command -v ollama >/dev/null 2>&1; then
-        printf '%s\n' "ollama CLI is not installed in this container." >&2
-        return 1
-    fi
-
     local selected_model
     if ! selected_model="$(_claude_pick_ollama_model_impl)"; then
         return 1
@@ -504,11 +538,15 @@ claude_local_launch() {
     local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
     printf 'Launching Claude on %s (request timeout: %sms)...\n' "${launch_model}" "${timeout_ms}" >&2
 
+    local _claude_bin
+    _claude_bin="$(_claude_find_binary)" || return $?
+
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
     API_TIMEOUT_MS="${timeout_ms}" \
+    ANTHROPIC_TIMEOUT="${timeout_ms}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
-    claude --model "${launch_model}" "${extra_args[@]}" "${effort_args[@]}" "$@"
+    "${_claude_bin}" --model "${launch_model}" "${extra_args[@]}" "${effort_args[@]}" "$@"
     local _claude_exit=$?
     if [ "${_claude_exit}" -ne 0 ]; then
         printf '\n⚠️  Claude exited with code %s. ' "${_claude_exit}" >&2
@@ -519,11 +557,6 @@ claude_local_launch() {
 }
 
 claude_ollama_launch_danger() {
-    if ! command -v ollama >/dev/null 2>&1; then
-        printf '%s\n' "ollama CLI is not installed in this container." >&2
-        return 1
-    fi
-
     local selected_model
     if ! selected_model="$(_claude_pick_ollama_model_impl)"; then
         return 1
@@ -557,12 +590,16 @@ claude_ollama_launch_danger() {
     local timeout_ms="${CLAUDE_OLLAMA_TIMEOUT_MS:-3600000}"
     printf 'Launching Claude on %s (request timeout: %sms, danger mode)...\n' "${launch_model}" "${timeout_ms}" >&2
 
+    local _claude_bin
+    _claude_bin="$(_claude_find_binary)" || return $?
+
     ANTHROPIC_API_KEY="" \
     ANTHROPIC_AUTH_TOKEN="ollama" \
     API_TIMEOUT_MS="${timeout_ms}" \
+    ANTHROPIC_TIMEOUT="${timeout_ms}" \
     MAX_THINKING_TOKENS="${CLAUDE_OLLAMA_MAX_THINKING_TOKENS:-16384}" \
     CLAUDE_OLLAMA_DANGEROUSLY_SKIP_PERMISSIONS=true \
-    claude --model "${launch_model}" --dangerously-skip-permissions "${extra_args[@]}" "$@"
+    "${_claude_bin}" --model "${launch_model}" --dangerously-skip-permissions "${extra_args[@]}" "$@"
     local _claude_exit=$?
 
     _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
@@ -713,7 +750,7 @@ print_summary() {
 }
 
 log "🚀 Starting Claude environment setup..."
-ensure_ollama_cli
+ensure_ollama_removed
 ensure_claude_cli
 ensure_persistence_link
 check_ollama_host
