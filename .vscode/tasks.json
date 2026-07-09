@@ -115,6 +115,167 @@
       },
       "group": "build",
       "detail": "Download and install the latest version of OpenCode from GitHub without rebuilding the container"
+    },
+    {
+      "label": "Claude Zen (cz)",
+      "type": "shell",
+      "command": "bash -ic 'cz'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen New (cz-new)",
+      "type": "shell",
+      "command": "bash -ic 'cz-new'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Danger (cz-danger)",
+      "type": "shell",
+      "command": "bash -ic 'cz-danger'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Cloud (cz-cloud)",
+      "type": "shell",
+      "command": "bash -ic 'cz-cloud'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Continue (ccz)",
+      "type": "shell",
+      "command": "bash -ic 'ccz'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Last (cz-last)",
+      "type": "shell",
+      "command": "bash -ic 'cz-last'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Recent (cz-recent)",
+      "type": "shell",
+      "command": "bash -ic 'cz-recent'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Danger Last (cz-danger-last)",
+      "type": "shell",
+      "command": "bash -ic 'cz-danger-last'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Danger Recent (cz-danger-recent)",
+      "type": "shell",
+      "command": "bash -ic 'cz-danger-recent'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Model (cz-model)",
+      "type": "shell",
+      "command": "bash -ic 'cz-model'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Proxy Start (cz-proxy-start)",
+      "type": "shell",
+      "command": "bash -ic 'cz-proxy-start'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Proxy Stop (cz-proxy-stop)",
+      "type": "shell",
+      "command": "bash -ic 'cz-proxy-stop'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Proxy Status (cz-proxy-status)",
+      "type": "shell",
+      "command": "bash -ic 'cz-proxy-status'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Proxy Restart (cz-proxy-restart)",
+      "type": "shell",
+      "command": "bash -ic 'cz-proxy-restart'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Zen Fresh Key (cz-fresh-key)",
+      "type": "shell",
+      "command": "bash -ic 'cz-fresh-key'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Local (c)",
+      "type": "shell",
+      "command": "bash -ic 'c'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Local New (c-new)",
+      "type": "shell",
+      "command": "bash -ic 'c-new'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Local Danger (c-danger)",
+      "type": "shell",
+      "command": "bash -ic 'c-danger'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Cloud (c-cloud)",
+      "type": "shell",
+      "command": "bash -ic 'c-cloud'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Continue (c-continue)",
+      "type": "shell",
+      "command": "bash -ic 'c-continue'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Local Medium (c-med)",
+      "type": "shell",
+      "command": "bash -ic 'c-med'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Local High (c-hi)",
+      "type": "shell",
+      "command": "bash -ic 'c-hi'",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Claude Local Max (c-max)",
+      "type": "shell",
+      "command": "bash -ic 'c-max'",
+      "problemMatcher": [],
+      "group": "build"
     }
   ]
 }
