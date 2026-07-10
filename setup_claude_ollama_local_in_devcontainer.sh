@@ -465,9 +465,9 @@ _claude_ctx_strategy_select() {
     printf '\n' >&2
     printf "  Context strategy for %s:\n" "${model}" >&2
     printf "  1) Model default (no ctx override)\n" >&2
-    printf "  2) Standard override (__NUM_CTX__ tokens)\n" >&2
+    printf "  2) Standard override (__NUM_CTX__ tokens, recommended)\n" >&2
     printf "  3) Maximum (auto-detect from model)\n" >&2
-    printf "  4) Custom value\n" >&2
+    printf "  4) Custom value (type integer)\n" >&2
     printf '\n' >&2
     printf "Enter choice [1-4] (default: 2): " >&2
     read -r choice </dev/tty
@@ -481,19 +481,20 @@ _claude_ctx_strategy_select() {
             max_ctx="$(_claude_get_model_max_ctx "${model}")"
             if [ -n "${max_ctx}" ] && printf '%s' "${max_ctx}" | grep -qE '^[0-9]+$' && [ "${max_ctx}" != "0" ]; then
                 strategy="custom=${max_ctx}"
-                printf "  Auto-detected max context: %s tokens\n" "${max_ctx}" >&2
+                printf "  ✓ Auto-detected max context: %s tokens\n" "${max_ctx}" >&2
             else
-                printf "  Could not auto-detect; using standard (%s tokens).\n" "__NUM_CTX__" >&2
+                printf "  ⚠️ Could not auto-detect; using standard (__NUM_CTX__ tokens).\n" >&2
                 strategy="standard"
             fi
             ;;
         4)
-            printf "Enter context size in tokens (e.g., 488576): " >&2
+            printf "  📝 Enter custom context size in tokens (e.g., 488576, 262144): " >&2
             read -r custom_ctx </dev/tty
             if printf '%s' "${custom_ctx}" | grep -qE '^[0-9]+$' && [ -n "${custom_ctx}" ]; then
                 strategy="custom=${custom_ctx}"
+                printf "  ✓ Using custom context size: %s tokens\n" "${custom_ctx}" >&2
             else
-                printf "  Invalid value; using standard (%s).\n" "__NUM_CTX__" >&2
+                printf "  ⚠️ Invalid value; using standard (__NUM_CTX__ tokens).\n" >&2
                 strategy="standard"
             fi
             ;;
