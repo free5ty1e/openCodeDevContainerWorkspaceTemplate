@@ -284,7 +284,7 @@ export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
 unalias c c-new c-danger c-cloud c-continue 2>/dev/null || true
 unset -f c c_new cc c-danger c-continue claude_launch claude_local_launch claude_cloud_launch claude_pick_ollama_model claude_current_ollama_model _claude_pick_ollama_model_impl _claude_ensure_ctx_variant _claude_has_effort_flag \
-      _claude_ollama_install_danger_guardrails _claude_ollama_cleanup_danger_guardrails claude_ollama_launch_danger claude_ollama_uninstall_danger_rules 2>/dev/null || true
+      _claude_ollama_install_danger_guardrails claude_ollama_launch_danger claude_ollama_uninstall_danger_rules 2>/dev/null || true
 
 _claude_pick_ollama_model_impl() {
     python3 - <<'PY'
@@ -505,6 +505,78 @@ _claude_ctx_strategy_select() {
     printf '%s' "${strategy}"
 }
 
+_claude_ollama_install_danger_guardrails() {
+    local workspace_root="$1"
+    local persist_dir="$2"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    local backup_file="${persist_dir}/CLAUDE.md.bak"
+
+    local start_marker="# --- DANGER GUARDRAILS START ---"
+    local end_marker="# --- DANGER GUARDRAHILS END ---"
+    local guardrails="
+# --- DANGER GUARDRAILS START ---
+- Prohibit all write operations with 'az' azure CLI (e.g., az resource create, az vm start, az group delete). Read operations are permitted.
+- Prohibit all write operations with 'gh' (GitHub CLI) except for 'gh edit' when updating a PR description. All other mutations (create, delete, merge, etc.) are prohibited.
+# --- DANGER GUARDRAHILS END ---"
+
+    # If CLAUDE.md doesn't exist, create it
+    if [ ! -f "$claude_md" ]; then
+        printf '%s\n' "# Project Instructions" > "$claude_md"
+    fi
+
+    # Backup existing file
+    cp "$claude_md" "$backup_file"
+
+    # Idempotent update: replace existing block or append to end
+    if grep -q "$start_marker" "$claude_md"; then
+        # Replace existing block
+        # Use a temporary file to avoid issues with sed -i on some systems
+        sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
+        # We need to re-insert the guardrails at the same spot or just append
+        # For simplicity, we'll remove the old ones and append the new ones
+        # But the user wants to preserve other rules, so we just append
+        cat "${claude_md}.tmp" > "$claude_md"
+        printf '\n%s\n' "$guardrails" >> "$claude_md"
+        rm -f "${claude_md}.tmp"
+    else
+        printf '\n%s\n' "$guardrails" >> "$claude_md"
+    fi
+
+    log "✅ Danger guardrails installed in CLAUDE.md"
+    echo "$backup_file"
+}
+
+_claude_ollama_uninstall_danger_guardrails() {
+    local workspace_root="$1"
+    local persist_dir="$2"
+    local claude_md="${workspace_root}/CLAUDE.md"
+
+    if [ -f "$claude_md" ]; then
+        local start_marker="# --- DANGER GUARDRAILS START ---"
+        local end_marker="# --- DANGER GUARDRAHILS END ---"
+        # Remove everything between markers including markers
+        sed -i "/$start_marker/,/$end_marker/d" "$claude_md"
+        log "✅ Danger guardrails removed from CLAUDE.md"
+    fi
+}
+
+
+claude_ollama_install_danger_rules() {
+    local workspace_root
+    workspace_root=$(pwd)
+    local persist_dir="${CLAUDE_OLLAMA_PERSISTENCE_DIR:-${SCRIPT_DIR}/.claude_persist}"
+    _claude_ollama_install_danger_guardrails "$workspace_root" "$persist_dir" >/dev/null
+    printf '  \u2705 Danger guardrails installed in CLAUDE.md\n'
+}
+
+claude_ollama_uninstall_danger_rules() {
+    # This is called via the c-undo-danger alias
+    local workspace_root
+    workspace_root=$(pwd)
+    local persist_dir="${CLAUDE_OLLAMA_PERSISTENCE_DIR:-${SCRIPT_DIR}/.claude_persist}"
+    _claude_ollama_uninstall_danger_guardrails "$workspace_root" "$persist_dir"
+}
+
 claude_local_launch() {
     local selected_model
     if ! selected_model="$(_claude_pick_ollama_model_impl)"; then
@@ -603,7 +675,6 @@ claude_ollama_launch_danger() {
     "${_claude_bin}" --model "${launch_model}" --dangerously-skip-permissions "${extra_args[@]}" "$@"
     local _claude_exit=$?
 
-    _claude_ollama_cleanup_danger_guardrails "$workspace_root" "${CLAUDE_OLLAMA_PERSISTENCE_DIR}" "$backup_file"
 
     if [ "${_claude_exit}" -ne 0 ]; then
         printf '\n⚠️  Claude exited with code %s. ' "${_claude_exit}" >&2
@@ -623,6 +694,8 @@ alias c-new='c_new'
 alias cc='CLAUDE_OLLAMA_CTX_STRATEGY= claude --continue'
 alias c-danger='claude_ollama_launch_danger'
 alias c-undo-danger='claude_ollama_uninstall_danger_rules'
+alias c-danger-guardrails-install='claude_ollama_install_danger_rules'
+alias c-danger-guardrails-remove='claude_ollama_uninstall_danger_rules'
 alias c-cloud='claude_cloud_launch'
 alias c-continue='cc'
 alias c-med='CLAUDE_OLLAMA_EFFORT=medium c'

@@ -2232,7 +2232,6 @@ print(bc.get('model', '') or bc.get('provider_name', '$sel'))
     "$claude_bin" --model "$model_name" --dangerously-skip-permissions "$@"
 
     # ── Cleanup via helper ────────────────────────────────────────────────
-    _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
 }
 
 # Remove danger guardrails from CLAUDE.md without launching (cleanup utility)
@@ -2248,16 +2247,40 @@ claude_zen_uninstall_danger_rules() {
         printf 'Restored original CLAUDE.md\n'
         rm -f "$backup_file"
     elif [ -f "$claude_md" ]; then
-        # Check if it's our danger rules file
-        if grep -q 'DANGER MODE GUARDRAILS' "$claude_md" 2>/dev/null; then
+        # Remove only the guardrail block, preserving any custom content
+        if grep -q '# --- DANGER GUARDRAILS START ---' "$claude_md" 2>/dev/null; then
+            local start_marker="# --- DANGER GUARDRAILS START ---"
+            local end_marker="# --- DANGER GUARDRAILS END ---"
+            sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
+            if [ -s "${claude_md}.tmp" ]; then
+                mv "${claude_md}.tmp" "$claude_md"
+            else
+                rm -f "$claude_md" "${claude_md}.tmp"
+            fi
+            printf 'Removed danger guardrails from CLAUDE.md\n'
+        elif grep -q 'DANGER MODE GUARDRAILS' "$claude_md" 2>/dev/null; then
+            # Old format without markers — file was all danger rules (cp'd), no custom content lost
             rm -f "$claude_md"
-            printf 'Removed danger CLAUDE.md\n'
+            printf 'Removed danger CLAUDE.md (old format, no custom content)\n'
         else
             printf 'CLAUDE.md is not a danger rules file — leaving untouched\n'
         fi
 else
         printf 'No CLAUDE.md found\n'
     fi
+}
+
+
+claude_zen_install_danger_rules() {
+    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
+    local workspace_root="${dir%/.claude_config}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+    _claude_zen_install_danger_guardrails "$workspace_root" "$dir" >/dev/null
+    printf '  \u2705 Danger guardrails installed in CLAUDE.md\n'
+}
+
+claude_zen_remove_danger_rules() {
+    claude_zen_uninstall_danger_rules
 }
 
 claude_zen_cloud_launch() {
@@ -2391,6 +2414,7 @@ else
     local rules_file="${danger_dir}/danger_rules.md"
     if [ ! -f "$rules_file" ]; then
     cat > "$rules_file" << 'DANGEREOF'
+# --- DANGER GUARDRAILS START ---
 # ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
 
 You are running with **automatic permission approval**. Every tool call you
@@ -2449,9 +2473,26 @@ Only the following **Staging & Read** operations are allowed:
 - If in doubt, err on the side of refusing. The user can always switch to
   normal mode (`cz`) for git-write operations.
 
+# --- DANGER GUARDRAILS END ---
 DANGEREOF
     fi
-    cp "$rules_file" "$claude_md"
+
+    # Merge guardrails into CLAUDE.md idempotently using markers
+    local start_marker="# --- DANGER GUARDRAILS START ---"
+    local end_marker="# --- DANGER GUARDRAILS END ---"
+    local guardrails
+    guardrails="$(cat "$rules_file")"
+
+    if [ ! -f "$claude_md" ]; then
+        printf '# Project Instructions\n\n%s\n' "$guardrails" > "$claude_md"
+    elif grep -qF "$start_marker" "$claude_md"; then
+        sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
+        cat "${claude_md}.tmp" > "$claude_md"
+        printf '\n%s\n' "$guardrails" >> "$claude_md"
+        rm -f "${claude_md}.tmp"
+    else
+        printf '\n%s\n' "$guardrails" >> "$claude_md"
+    fi
     printf '  🔒 Danger guardrails installed (CLAUDE.md)\n'
     printf '%s' "$backup_file"
 }
@@ -2575,7 +2616,6 @@ PY
                     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
                     ANTHROPIC_API_KEY="freecc:${provider_id}" \
                     "${claude_bin}" --model "${model_name}" --resume "${sid}" --dangerously-skip-permissions "$@"
-                _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
             else
                 exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
                     ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
@@ -2622,7 +2662,6 @@ else
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc:${provider_id}" \
             "${claude_bin}" --model "${model_name}" --continue --dangerously-skip-permissions "$@"
-        _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
 else
         exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
@@ -2688,7 +2727,6 @@ else
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
             ANTHROPIC_API_KEY="freecc:${provider_id}" \
             "${claude_bin}" --model "${model_name}" --resume "$session_id" --dangerously-skip-permissions "$@"
-        _claude_zen_cleanup_danger_guardrails "$workspace_root" "$dir" "$backup_file"
 else
         exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
             ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
@@ -2708,6 +2746,8 @@ alias cz-proxy-start='claude_zen_proxy_start'
 alias cz-proxy-stop='claude_zen_proxy_stop'
 alias cz-proxy-status='claude_zen_proxy_status'
 alias cz-undo-danger='claude_zen_uninstall_danger_rules'
+alias cz-danger-guardrails-install='claude_zen_install_danger_rules'
+alias cz-danger-guardrails-remove='claude_zen_remove_danger_rules'
 alias cz-recent='claude_zen_list_recent'
 alias cz-last='claude_zen_resume_last'
 alias cz-resume='claude_zen_quick_resume'
@@ -2749,8 +2789,10 @@ USAGE:
     cz-model-current      Show currently selected model
 
   Other:
-    cz-undo-danger        Remove danger-mode guardrails from CLAUDE.md
-    cz-aliases / cz-help  Show this help
+    cz-undo-danger                Remove danger-mode guardrails from CLAUDE.md
+    cz-danger-guardrails-install  Install danger-mode guardrails in CLAUDE.md
+    cz-danger-guardrails-remove   Remove danger-mode guardrails from CLAUDE.md
+    cz-aliases / cz-help          Show this help
 
 HELPEOF
 }
