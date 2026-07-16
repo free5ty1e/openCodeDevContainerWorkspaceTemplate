@@ -1396,6 +1396,24 @@ printf '  Created %s\n' "${KEY_VAULT_SCRIPT}"
 # ─── 5. Backends config ───────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 5: Backends config ==="
 printf '  Querying OpenCode Zen API for available models...\n'
+
+# Preserve any existing api_key values from previous backends.json
+if [ -f "${BACKENDS_FILE}" ]; then
+    python3 - "${BACKENDS_FILE}" << 'PY' >/dev/null
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+    api_keys = {p: e.get('api_key', '') for p, e in data.items() if isinstance(e, dict) and e.get('api_key')}
+    if api_keys:
+        with open(path + '.apikeys', 'w') as f:
+            json.dump(api_keys, f)
+except Exception:
+    pass
+PY
+fi
+
 python3 << 'PY' > "${BACKENDS_FILE}"
 """Generate backends.json dynamically by querying ALL providers' APIs."""
 import json, os, sys, urllib.request
@@ -1682,6 +1700,29 @@ else
 }
 JSONEOF
     printf '  Created %s (fallback)\n' "${BACKENDS_FILE}"
+fi
+
+# Restore api_key values from previous backends.json
+if [ -f "${BACKENDS_FILE}.apikeys" ]; then
+    python3 - "${BACKENDS_FILE}" << 'PY' >/dev/null
+import json, sys
+path = sys.argv[1]
+cache_path = path + '.apikeys'
+try:
+    with open(cache_path) as f:
+        api_keys = json.load(f)
+    with open(path) as f:
+        data = json.load(f)
+    for pid, key in api_keys.items():
+        if pid in data and isinstance(data[pid], dict):
+            data[pid]['api_key'] = key
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=4)
+except Exception:
+    pass
+import os
+os.unlink(cache_path)
+PY
 fi
 
 # ─── 6. Shell wrappers ────────────────────────────────────────────────────────
