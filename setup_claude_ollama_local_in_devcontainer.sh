@@ -569,7 +569,7 @@ Only the following **Staging & Read** operations are allowed:
 
 ### Enforcement
 - If you are asked to do a forbidden git operation, say:
-  "⛔ This operation is blocked by Danger Mode guardrails."
+  \"⛔ This operation is blocked by Danger Mode guardrails.\"
 - If in doubt, err on the side of refusing. The user can always switch to
   normal mode (\`c\`) for git-write operations.
 

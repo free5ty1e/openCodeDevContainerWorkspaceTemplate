@@ -2453,7 +2453,6 @@ else
         touch "$backup_file"
     fi
     local rules_file="${danger_dir}/danger_rules.md"
-    if [ ! -f "$rules_file" ]; then
     cat > "$rules_file" << 'DANGEREOF'
 # --- DANGER GUARDRAILS START ---
 # ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
@@ -2549,7 +2548,6 @@ Only read operations and updating PR descriptions via `gh edit` are permitted.
 
 # --- DANGER GUARDRAILS END ---
 DANGEREOF
-    fi
 
     # Merge guardrails into CLAUDE.md idempotently using markers
     local start_marker="# --- DANGER GUARDRAILS START ---"
