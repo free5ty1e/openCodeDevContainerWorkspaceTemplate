@@ -2473,6 +2473,39 @@ Only the following **Staging & Read** operations are allowed:
 - If in doubt, err on the side of refusing. The user can always switch to
   normal mode (`cz`) for git-write operations.
 
+## MANDATORY RESTRICTIONS — az (Azure CLI)
+
+Read-only operations are permitted. All write/mutation operations are prohibited.
+
+### ❌ FORBIDDEN az Operations
+| Operation | Reason |
+|-----------|--------|
+| `az resource create` / `az resource delete` / `az resource update` | Would create or delete Azure resources |
+| `az vm start` / `az vm stop` / `az vm delete` | Would modify VM state |
+| `az group create` / `az group delete` | Would modify resource groups |
+| `az network *` (write subcommands) | Would modify network configuration |
+| (any other az write operation) | Mutations are prohibited |
+
+## MANDATORY RESTRICTIONS — gh (GitHub CLI)
+
+Only read operations and updating PR descriptions via `gh edit` are permitted.
+
+### ✅ ALLOWED gh Operations
+| Command | Purpose |
+|---------|---------|
+| `gh edit` (PR description only) | Update PR descriptions |
+| `gh pr view` / `gh issue view` / `gh repo view` | Read repository data |
+| (any read-only gh command) | Read operations are permitted |
+
+### ❌ FORBIDDEN gh Operations
+| Operation | Reason |
+|-----------|--------|
+| `gh pr create` / `gh pr merge` / `gh pr close` | Would create or modify pull requests |
+| `gh issue create` / `gh issue close` / `gh issue comment` | Would modify issues |
+| `gh release create` | Would create releases |
+| `gh repo fork` / `gh repo create` / `gh repo delete` | Would create or delete repositories |
+| (any other gh write/mutation operation) | Mutations are prohibited |
+
 # --- DANGER GUARDRAILS END ---
 DANGEREOF
     fi
