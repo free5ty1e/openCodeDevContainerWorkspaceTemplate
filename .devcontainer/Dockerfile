@@ -3,7 +3,9 @@ FROM --platform=linux/amd64 ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 # ── System packages ───────────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     jq \
@@ -37,12 +39,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     icu-devtools \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Node.js 22 (NodeSource) ───────────────────────────────────────────────────
+# ── Node.js 22 LTS (NodeSource) + npm ───────────────────────────────────────
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
+    && npm install -g npm@12.0.2 \
     && node --version \
-    && npm --version
+    && npm --version \
+    && npx --version
 
 # ── Prettier (for markdown formatting) ───────────────────────────────────────
 RUN npm install -g prettier

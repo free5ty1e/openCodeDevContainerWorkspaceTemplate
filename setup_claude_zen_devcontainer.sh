@@ -291,9 +291,10 @@ unalias cz cz-new cz-cloud cz-danger ccz cz-model cz-model-current \
        cz-proxy-start cz-proxy-stop cz-proxy-status cz-test-free-models \
        cz-undo-danger 2>/dev/null || true
 unset -f cz cz_new ccz _cz_find_claude _cz_ensure_proxy \
-         _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
-         _cz_test_free_models \
-         cz_proxy_start cz_proxy_stop cz_proxy_status 2>/dev/null || true
+          _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
+          _cz_test_free_models \
+          _cz_zen_models_endpoint _cz_fetch_zen_models _cz_fetch_free_models \
+          cz_proxy_start cz_proxy_stop cz_proxy_status 2>/dev/null || true
 
 # ── Find the claude binary ─────────────────────────────────────────────────
 _cz_find_claude() {
@@ -454,7 +455,66 @@ _cz_cloud_launch() {
     "$b" "$@"
 }
 
-# ── Model picker ───────────────────────────────────────────────────────────
+# ── Dynamic model discovery (free models change frequently) ───────────────
+_cz_zen_models_endpoint() {
+    local env_file="__ENV_FILE__"
+    local url="https://opencode.ai/zen/v1/chat/completions"
+    local eu
+    if [ -f "$env_file" ]; then
+        eu="$(sed -n 's/^UPSTREAM_CHAT_COMPLETIONS_URL=//p' "$env_file" 2>/dev/null | head -1)"
+        [ -n "$eu" ] && url="$eu"
+    fi
+    case "$url" in
+        */models)         printf '%s\n' "$url" ;;
+        */chat/completions) printf '%s/models\n' "${url%/chat/completions}" ;;
+        *)                printf '%s/models\n' "${url%/}" ;;
+    esac
+}
+
+_cz_fetch_zen_models() {
+    # Fetch the live model id list from the upstream /models endpoint.
+    # Prints one model id per line. Uses a short-lived cache with offline fallback.
+    local cache="__PERSISTENCE_DIR__/zen_models_cache.txt"
+
+    # serve from cache if fetched within the last 10 minutes
+    if [ -f "$cache" ] && [ -n "$(find "$cache" -mmin -10 -print -quit 2>/dev/null)" ]; then
+        sed '/^[[:space:]]*$/d;/^#/d' "$cache"
+        return 0
+    fi
+
+    local murl fetched
+    murl="$(_cz_zen_models_endpoint)"
+    fetched="$(curl -s --connect-timeout 5 --max-time 12 "$murl" 2>/dev/null | python3 -c '
+import json, sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+ids = [m.get("id", "") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+print("\n".join(ids))
+' 2>/dev/null)"
+
+    if [ -n "$fetched" ]; then
+        printf '# cached %s from %s\n' "$(date +%Y-%m-%dT%H:%M%S)" "$murl" > "$cache"
+        printf '%s\n' "$fetched" >> "$cache"
+        printf '%s\n' "$fetched"
+    else
+        printf '%s\n' \
+            "big-pickle" "hy3-free" "laguna-s-2.1-free" "ling-3.0-flash-fin-free" \
+            "deepseek-v4-flash-free" "nemotron-3-ultra-free" "muse-spark-1.2-contributor-free" \
+            "mimo-v2.5-free" "nemotron-3.5-lightning-free" \
+            "claude-sonnet-4-6" "gpt-5.5" "gemini-3.5-flash" "deepseek-v4-flash" \
+            "glm-5.1" "kimi-k2.6" "minimax-m2.7" "qwen3.5-plus"
+    fi
+}
+
+_cz_fetch_free_models() {
+    _cz_fetch_zen_models | grep -xE 'big-pickle|[a-zA-Z0-9._+-]+-free' || true
+}
+
+# ── Model picker (dynamic: mirrors the live upstream model list) ──────────
 _cz_model_pick() {
     local env_file="__ENV_FILE__"
 
@@ -467,87 +527,96 @@ _cz_model_pick() {
     current_model="$(sed -n 's/^UPSTREAM_MODEL=//p' "$env_file" 2>/dev/null | head -1)"
     [ -z "$current_model" ] && current_model="hy3-free"
 
+    local all_list free_list paid_list
+    all_list="$(mktemp 2>/dev/null || printf '/tmp/cz-all-%s' "$$")"
+    free_list="$(mktemp 2>/dev/null || printf '/tmp/cz-free-%s' "$$")"
+    paid_list="$(mktemp 2>/dev/null || printf '/tmp/cz-paid-%s' "$$")"
+
+    _cz_fetch_zen_models > "$all_list"
+    grep -xE 'big-pickle|[a-zA-Z0-9._+-]+-free' "$all_list" > "$free_list"
+    grep -vxE 'big-pickle|[a-zA-Z0-9._+-]+-free' "$all_list" > "$paid_list"
+
+    local free_count paid_count n paid_start custom_num choice new_model idx pid pidf m
+    free_count="$(wc -l < "$free_list" | tr -d ' ')"
+    paid_count="$(wc -l < "$paid_list" | tr -d ' ')"
+    paid_start=$((free_count + 1))
+    custom_num=$((free_count + paid_count + 1))
+
     printf '\n'
     printf '  Current model: %s\n' "$current_model"
     printf '  Tip: run cz-test-free-models to see which free models respond right now.\n'
     printf '\n'
-    printf '  Free models (no API key needed):\n'
-    printf '    1) hy3-free\n'
-    printf '    2) big-pickle\n'
-    printf '    3) laguna-s-2.1-free\n'
-    printf '    4) deepseek-v4-flash-free\n'
-    printf '    5) muse-spark-1.2-contributor-free\n'
-    printf '    6) mimo-v2.5-free\n'
-    printf '    7) nemotron-3-ultra-free\n'
-    printf '    8) nemotron-3.5-lightning-free\n'
-    printf '    9) ling-3.0-flash-fin-free\n'
+    if [ "$free_count" -gt 0 ]; then
+        printf '  Free models (no API key needed):\n'
+        n=0
+        while IFS= read -r m; do
+            n=$((n + 1))
+            printf '  %2d) %s\n' "$n" "$m"
+        done < "$free_list"
+    else
+        printf '  (No free models found upstream)\n'
+    fi
     printf '\n'
-    printf '  Paid models (requires UPSTREAM_API_KEY in .env.zen):\n'
-    printf '   10) claude-sonnet-4-6\n'
-    printf '   11) gpt-5.5\n'
-    printf '   12) gemini-3.5-flash\n'
-    printf '   13) deepseek-v4-flash\n'
-    printf '   14) glm-5.1\n'
-    printf '   15) kimi-k2.6\n'
-    printf '   16) minimax-m2.7\n'
-    printf '   17) qwen3.5-plus\n'
+    if [ "$paid_count" -gt 0 ]; then
+        printf '  Paid models (requires UPSTREAM_API_KEY in .env.zen):\n'
+        n=$paid_start
+        while IFS= read -r m; do
+            printf '  %2d) %s\n' "$n" "$m"
+            n=$((n + 1))
+        done < "$paid_list"
+    else
+        printf '  (No paid models found upstream)\n'
+    fi
     printf '\n'
-    printf '   18) Enter custom model name\n'
+    printf '  %2d) Enter custom model name\n' "$custom_num"
     printf '\n'
-    printf '  Select model (1-18, or Enter to keep current): '
+    printf '  Select model (1-%d, or Enter to keep current): ' "$custom_num"
 
-    local choice
     if [ -t 0 ]; then
         read -r choice
     elif [ -t 1 ]; then
         read -r choice </dev/tty || true
     fi
 
-    local new_model=""
-    case "${choice}" in
-        1)  new_model="hy3-free" ;;
-        2)  new_model="big-pickle" ;;
-        3)  new_model="laguna-s-2.1-free" ;;
-        4)  new_model="deepseek-v4-flash-free" ;;
-        5)  new_model="muse-spark-1.2-contributor-free" ;;
-        6)  new_model="mimo-v2.5-free" ;;
-        7)  new_model="nemotron-3-ultra-free" ;;
-        8)  new_model="nemotron-3.5-lightning-free" ;;
-        9)  new_model="ling-3.0-flash-fin-free" ;;
-        10) new_model="claude-sonnet-4-6" ;;
-        11) new_model="gpt-5.5" ;;
-        12) new_model="gemini-3.5-flash" ;;
-        13) new_model="deepseek-v4-flash" ;;
-        14) new_model="glm-5.1" ;;
-        15) new_model="kimi-k2.6" ;;
-        16) new_model="minimax-m2.7" ;;
-        17) new_model="qwen3.5-plus" ;;
-        18)
+    new_model=""
+    if [ -z "$choice" ]; then
+        printf '  Keeping current model: %s\n' "$current_model"
+        rm -f "$all_list" "$free_list" "$paid_list"
+        return 0
+    fi
+
+    if printf '%s' "$choice" | grep -qE '^[0-9]+$'; then
+        if [ "$choice" -ge 1 ] && [ "$choice" -le "$free_count" ]; then
+            new_model="$(sed -n "${choice}p" "$free_list")"
+        elif [ "$choice" -ge "$paid_start" ] && [ "$choice" -lt "$custom_num" ]; then
+            idx=$((choice - paid_start + 1))
+            new_model="$(sed -n "${idx}p" "$paid_list")"
+        elif [ "$choice" -eq "$custom_num" ]; then
             printf '  Enter model name: '
             if [ -t 0 ]; then
                 read -r new_model
             elif [ -t 1 ]; then
                 read -r new_model </dev/tty || true
             fi
-            ;;
-        "")
-            printf '  Keeping current model: %s\n' "$current_model"
-            return 0
-            ;;
-        *)
+        else
             printf '  Invalid choice.\n' >&2
+            rm -f "$all_list" "$free_list" "$paid_list"
             return 1
-            ;;
-    esac
+        fi
+    else
+        printf '  Invalid choice.\n' >&2
+        rm -f "$all_list" "$free_list" "$paid_list"
+        return 1
+    fi
 
     if [ -n "$new_model" ]; then
         sed -i "s|^UPSTREAM_MODEL=.*|UPSTREAM_MODEL=${new_model}|" "$env_file"
         printf '  Model set to: %s\n' "$new_model"
 
         # Restart proxy if running to pick up the change
-        local pidf="__PERSISTENCE_DIR__/proxy.pid"
+        pidf="__PERSISTENCE_DIR__/proxy.pid"
         if [ -f "$pidf" ]; then
-            local pid; pid=$(cat "$pidf" 2>/dev/null || true)
+            pid=$(cat "$pidf" 2>/dev/null || true)
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                 printf '  Restarting proxy to apply model change...\n'
                 kill "$pid" 2>/dev/null || true
@@ -560,6 +629,7 @@ _cz_model_pick() {
             fi
         fi
     fi
+    rm -f "$all_list" "$free_list" "$paid_list"
 }
 
 # ── Show current model ────────────────────────────────────────────────────
@@ -586,38 +656,30 @@ _cz_test_free_models() {
         [ -n "$env_upstream" ] && upstream_url="$env_upstream"
     fi
 
-    local models=(
-        "big-pickle"
-        "hy3-free"
-        "laguna-s-2.1-free"
-        "deepseek-v4-flash-free"
-        "muse-spark-1.2-contributor-free"
-        "mimo-v2.5-free"
-        "nemotron-3-ultra-free"
-        "nemotron-3.5-lightning-free"
-        "ling-3.0-flash-fin-free"
-    )
+    local free_list
+    free_list="$(mktemp 2>/dev/null || printf '/tmp/cz-test-free-%s' "$$")"
+    _cz_fetch_free_models > "$free_list" 2>/dev/null
 
-    local ok_models=""
-    local limited_models=""
-    local dead_models=""
-    local tmp payload code msg result
+    local ok_models="" limited_models="" dead_models=""
+    local model tmp payload code msg result
 
     printf '\n'
     printf '  Testing free models -> %s\n' "$upstream_url"
+    printf '  List is fetched live from the upstream /models endpoint.\n'
     printf '  Each sends one short prompt. 200 = responding, 429 = rate limited.\n'
     printf '\n'
     printf '  %-26s %6s  %s\n' "MODEL" "CODE" "RESULT"
     printf '  %-26s %6s  %s\n' "-----" "----" "------"
 
-    for model in "${models[@]}"; do
-        tmp="$(mktemp 2>/dev/null || echo "/tmp/cz-test-free-models-$$")"
+    while IFS= read -r model; do
+        [ -z "$model" ] && continue
+        tmp="$(mktemp 2>/dev/null || printf '/tmp/cz-probe-%s' "$$")"
         payload="{\"model\":\"${model}\",\"stream\":false,\"max_completion_tokens\":15,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}]}"
 
         code="$(curl -s -m 60 -o "$tmp" -w '%{http_code}' \
             -H "content-type: application/json" \
             -d "$payload" \
-            "$upstream_url" 2>/dev/null || echo "000")"
+            "$upstream_url" 2>/dev/null || printf '000')"
 
         msg="$(python3 - "$tmp" << 'PY' 2>/dev/null
 import json, sys
@@ -645,7 +707,8 @@ PY
 
         printf '  %-26s %6s  %s\n' "$model" "$code" "$result"
         rm -f "$tmp"
-    done
+    done < "$free_list"
+    rm -f "$free_list"
 
     printf '\n'
     if [ -n "$ok_models" ]; then
