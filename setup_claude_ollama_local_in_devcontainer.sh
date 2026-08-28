@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
 
+echo "DEPRECIATED!  This script is depreciated and no longer needed.  The accepted solution NOW for this in a devcontainer is as follows:"
+echo "First, install prerequisites, opencode, claude cli, and ollama..."
+echo "sudo apt-get update && sudo apt-get install zstd"
+echo "curl -fsSL https://opencode.ai/install | bash"
+echo "curl -fsSL https://claude.ai/install.sh | bash"
+echo "curl -fsSL https://ollama.com/install.sh | sh"
+echo ""
+echo "Then, you can run a command like the following to directly launch claude through ollama to point at your host machine:"
+echo "CLAUDE_CODE_AUTO_COMPACT_WINDOW=175000 CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=91 OLLAMA_HOST=http://host.docker.internal:11434 ollama launch claude --model nemotron-3.5-lightning:30b -- --dangerously-skip-permissions"
+echo ""
+echo ""
+read -p "Please press any key to continue with the depreciated script, or CTRL-C to take the above advice and cancel."
+
+
+
 set -euo pipefail
 
 if [ "${EUID}" -eq 0 ]; then
