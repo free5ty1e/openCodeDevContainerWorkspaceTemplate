@@ -2,160 +2,66 @@
 # ==============================================================================
 # setup_claude_zen_devcontainer.sh
 #
-# Portable setup script for running ANY OpenAI-compatible model through the
-# Claude Code CLI.  Uses a lightweight translation proxy to convert Anthropic
-# Messages ↔ OpenAI Chat Completions.
+# Sets up claude-code-zen-proxy so Claude Code CLI can run through OpenCode Zen
+# (or any OpenAI-compatible upstream) instead of the Anthropic API.
 #
 # ── What it does ──────────────────────────────────────────────────────────────
-#  1. Installs prerequisites: pip packages (fastapi, uvicorn, httpx, tiktoken)
-#  2. Creates a standalone translation proxy (proxy.py)
-#  3. Creates a JSON backends configuration file
-#  4. Creates shell aliases for launching Claude CLI through the proxy
-#  5. Migrates ~/.claude/ to the workspace ($SCRIPT_DIR/.claude_persist/) for full
-#     session/config persistence across devcontainer rebuilds via symlink
-#  6. Creates a symlink so Claude Code's memory survives rebuilds:
-#     $HOME/.claude/projects/<slug>/memory/ → $SCRIPT_DIR/.ai_memory/
-#  7. All state lives in .claude_config/, .ai_memory/, or .claude_persist/
-#     — critical data is never lost on rebuild
+#  1. Installs Node.js 20+ (if missing) and @anthropic-ai/claude-code CLI
+#  2. Clones claude-code-zen-proxy into the workspace
+#  3. Installs npm dependencies
+#  4. Creates .env.zen with your API key and model choice
+#  5. Installs shell aliases (cz, cz-danger, ccz, etc.)
+#  6. Migrates ~/.claude/ to workspace for persistence across rebuilds
+#  7. Symlinks .ai_memory/ into Claude Code's per-project memory slot
 #
-# ── How the proxy works ───────────────────────────────────────────────────────
-#   Claude CLI speaks the Anthropic Messages API (POST /v1/messages with SSE).
-#   OpenAI-compatible models speak the Chat Completions API (POST /v1/chat/completions).
-#   This proxy translates between the two protocols:
+# ── Architecture ──────────────────────────────────────────────────────────────
 #
-#     claude  ──ANTHROPIC_BASE_URL──►  zen-proxy (:8083)  ──Chat Completions──►  upstream
-#       (Anthropic Messages SSE)         ↕ translation          (OpenAI SSE)
-#
-# ── Coexistence with ollama+claude setup ──────────────────────────────────────
-#   Both scripts share ~/.claude -> .claude_persist/ so sessions/history are
-#   visible across models. Each script writes disjoint files into .clau le_config/.
-#   Run 'c' (ollama) and 'cz' (zen/proxy) in separate windows for different models.
-#   ┌──────────────────────┬───────────────────────────┬──────────────────────────┐
-#   │                      │  ollama+claude setup      │  zen+claude setup (this) │
-#   ├──────────────────────┼───────────────────────────┼──────────────────────────┤
-#   │ Persistence dir      │ .claude_config/           │ .claude_config/       │
-#   │ ~/.clau de ->        │ .claude_persist/          │ .claule_persist/    │
-#   │ Proxy port           │ N/A (ollama built-in)     │ 8083                     │
-#   │ Shell aliases        │ c, c-new, cc              │ cz, cz-new, ccz          │
-#   │ Shell markers        │ claude-ollama-devcontainer│ claude-zen-devcontainer   │
-#   │ ANTHROPIC_BASE_URL   │ not set (ollama launch)   │ http://127.0.0.1:8083     │
-#   │ Auth mechanism       │ ollama launch wrapper     │ ANTHROPIC_AUTH_TOKEN      │
-#   └──────────────────────┴───────────────────────────┴──────────────────────────┘
+#   claude CLI ──ANTHROPIC_BASE_URL──► zen-proxy (:4041) ──chat/completions──► upstream
+#     (Anthropic Messages SSE)          (Node.js)           (OpenAI SSE)
 #
 # ── Quick start ───────────────────────────────────────────────────────────────
 #   ./setup_claude_zen_devcontainer.sh
 #   source ~/.zshrc
-#   cz         # pick a model from any family → Claude CLI launches with it
+#   cz              # pick a model, launch Claude Code through the proxy
 #
-# ── Testing / validation ───────────────────────────────────────────────────────
-#   After setup, verify the proxy works end-to-end:
-#
-#   1. Check proxy is running:
-#        curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8083/
-#      Expected: 200
-#
-#   2. Test model list endpoint:
-#        curl -s http://127.0.0.1:8083/v1/models | python3 -m json.tool
-#
-#   3. Test non-streaming chat via proxy (single JSON response):
-#        curl -s -X POST http://127.0.0.1:8083/v1/messages \
-#          -H "Content-Type: application/json" -H "x-api-key: test" \
-#          -d '{"model":"claude-fable-5","max_tokens":50,"messages":[{"role":"user","content":"Say hi in one word"}],"stream":false}' \
-#          | python3 -m json.tool
-#      Expected: response with content[].text like "Hi"
-#
-#   4. Test streaming chat via proxy (SSE events):
-#        curl -s -N -X POST http://127.0.0.1:8083/v1/messages \
-#          -H "Content-Type: application/json" -H "x-api-key: test" \
-#          -d '{"model":"claude-fable-5","max_tokens":100,"messages":[{"role":"user","content":"Say hi in one word"}],"stream":true}'
-#      Expected: SSE events: message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop
-#
-#   5. Test end-to-end with Claude Code CLI print mode:
-#        echo "Say hi" | ANTHROPIC_BASE_URL=http://127.0.0.1:8083 ANTHROPIC_API_KEY=test \
-#          /path/to/claude --print --model claude-fable-5
-#      Expected: Claude responds via the proxy (exit 0, prints response)
-#
-#   6. Use the shell wrapper (recommended):
-#        source ~/.zshrc
-#        echo "What model are you?" | cz -p
-#      Expected: Claude responds via the proxy
-#
-# ── After setup: shell aliases ────────────────────────────────────────────────
-#   cz              Pick a model and launch Claude CLI through the proxy
+# ── Shell aliases ─────────────────────────────────────────────────────────────
+#   cz              Launch Claude Code through the zen proxy (model picker)
 #   cz-new          Same as cz
-#   cz-danger       Pick a model -> launch Claude CLI (auto-accept permissions)
-#   cz-cloud        Launch Claude CLI directly (cloud, no proxy)
-#   ccz             Continue most recent Claude cloud session
-#   cz-model        Pick/change the default model
-#   cz-model-current  Show currently selected model
-#   cz-proxy-start  Start the proxy daemon (auto-started on first use)
-#   cz-proxy-stop   Stop the proxy daemon
-#   cz-proxy-status Check proxy daemon status
-#   cz-undo-danger  Remove danger guardrails from workspace CLAUDE.md
-#
-# ── Backends configuration ────────────────────────────────────────────────────
-# Edit the JSON file at .claude_config/backends.json:
-#
-#   {
-#     "zen": {
-#       "base_url": "https://opencode.ai/zen/v1",
-#       "api_key_env": "ZEN_API_KEY",
-#       "model": "",
-#       "provider_name": "ZEN",
-#       "models": {
-#         "Claude":     ["claude-fable-5", "claude-opus-4-8", ...],   # paid — set ZEN_API_KEY
-#         "GPT":        ["gpt-5.5", "gpt-5.5-pro", ...],               # paid — set ZEN_API_KEY
-#         "Gemini":     ["gemini-3.5-flash", ...],                      # paid — set ZEN_API_KEY
-#         "DeepSeek":   [...],                                          # paid — set ZEN_API_KEY
-#         "xAI":        [...],                                          # paid — set ZEN_API_KEY
-#         "Other":      [...],                                          # paid — set ZEN_API_KEY
-#         "Free":       ["big-pickle", "deepseek-v4-flash-free", ...]       # free — no key needed
-#       }
-#     },
-#     "openai": {
-#       "base_url": "https://api.openai.com/v1",
-#       "api_key_env": "OPENAI_API_KEY",
-#       "model": "gpt-4o",
-#       "provider_name": "OpenAI"
-#     }
-#   }
-#
-# Set "model" to "" for Zen to pass through any model from the picker.
-# Add/remove models under the "models" dict to customize your list.
-#
-# ── Environment variables ─────────────────────────────────────────────────────
-#   CLAUDE_ZEN_CONFIG_DIR   Override persistence dir (default: .claude_config)
-#   CLAUDE_ZEN_PROXY_PORT   Override proxy port (default: 8083)
-#   ZEN_API_KEY             API key for OpenCode Zen (required for paid models; free models work without it)
-#   ANTHROPIC_AUTH_TOKEN    Proxy auth token (default: "freecc")
-#   ZEN_BACKENDS            Override path to backends JSON (default: backends.json)
-#   ZEN_HOST                Override proxy host (default: 0.0.0.0)
-#   ZEN_PORT                Override proxy port (default: 8083)
-#   ZEN_DEFAULT_PROVIDER    Override default provider ID (default: first backend)
+#   cz-danger       Same, with --dangerously-skip-permissions
+#   cz-cloud        Launch Claude Code directly (no proxy, Anthropic cloud)
+#   ccz             Continue most recent Claude Code session
+#   cz-model        Change the upstream model (edits .env.zen)
+#   cz-model-current Show current model
+#   cz-proxy-start  Start the proxy as a background daemon
+#   cz-proxy-stop   Stop the daemon
+#   cz-proxy-status Check if the proxy is running
+#   cz-undo-danger  Remove danger guardrails from CLAUDE.md
 #
 # ── Requirements ──────────────────────────────────────────────────────────────
-#   - Python 3.12+ (system)
-#   - pip packages: fastapi, uvicorn, httpx, tiktoken
-#   - Claude Code CLI (@anthropic-ai/claude-code)
+#   - Node.js 20+  (installed by script if missing)
+#   - git
 #   - curl
+#   - An OpenCode Zen API key (or set UPSTREAM_API_KEY for another provider)
 #
 # ── Files created ─────────────────────────────────────────────────────────────
-#   .claude_config/
-#   ├── backends.json        Backend provider definitions (edit to add more)
-#   ├── proxy.py             Standalone translation proxy
-#   ├── selected-model       Last selected MODEL= string
-#   ├── proxy.log            Proxy daemon log
-#   ├── proxy.pid            Proxy daemon PID
-#   └── danger/              Danger-mode guardrails (CLAUDE.md backup + rules)
+#   .claude_zen/
+#   ├── repo/                  Cloned claude-code-zen-proxy
+#   ├── .env.zen               Your environment config (API key, model)
+#   ├── statusline.sh          Claude Code statusline (copied from .claude/)
+#   ├── zen-claude-settings.json  Claude Code settings (env + statusLine)
+#   └── proxy.log              Proxy daemon log (when using cz-proxy-start)
 #
-#   .ai_memory/
-#   └── (research files)     Claude Code memory files (symlinked from home folder)
-#                            Persists across devcontainer rebuilds
+#   .claude_persist/           Full ~/.claude copy (survives rebuilds)
+#   .ai_memory/                Claude Code memory files (survives rebuilds)
 #
-#   .claude_persist/
-#   └── (full ~/.claude copy) Migrated Claude config, sessions, tasks, history
-#                              Survives devcontainer rebuild via symlink:
-#                              ~/.claude -> .claude_persist/
+# ── Statusline ────────────────────────────────────────────────────────────────
+#   Every cz / cz-danger launch points Claude Code at zen-claude-settings.json,
+#   which wires in the statusline script (model, context usage %, git branch
+#   with dirty count, cumulative session tokens, cache hit rate, cost).
+#   The script is copied from (in order): ./statusline.sh, <workspace>/.claude/
+#   statusline.sh, or ~/.claude/statusline.sh. To make it portable, keep a copy
+#   of statusline.sh next to this setup script.
+#   Customize:  .claude_zen/statusline.sh
 # ==============================================================================
 set -euo pipefail
 
@@ -171,102 +77,72 @@ fi
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Use _SETUP suffix so the variable is NOT shadowed by an already-exported
-# CLAUDE_ZEN_CONFIG_DIR from a previous install (same pattern as the ollama
-# script). The baked wrapper exports CLAUDE_ZEN_CONFIG_DIR at shell-source
-# time; re-running the setup script must not inherit the old value.
-PERSISTENCE_DIR="${CLAUDE_ZEN_CONFIG_DIR_SETUP:-${SCRIPT_DIR}/.claude_config}"
-PROXY_PORT="${CLAUDE_ZEN_PROXY_PORT:-8083}"
-PROXY_SCRIPT="${PERSISTENCE_DIR}/proxy.py"
-BACKENDS_FILE="${PERSISTENCE_DIR}/backends.json"
-SELECTED_MODEL_FILE="${PERSISTENCE_DIR}/selected-model"
-PID_FILE="${PERSISTENCE_DIR}/proxy.pid"
+PERSISTENCE_DIR="${SCRIPT_DIR}/.claude_zen"
+REPO_DIR="${PERSISTENCE_DIR}/repo"
+ENV_FILE="${PERSISTENCE_DIR}/.env.zen"
 LOG_FILE="${PERSISTENCE_DIR}/proxy.log"
+PID_FILE="${PERSISTENCE_DIR}/proxy.pid"
+NPM_GLOBAL_DIR="${HOME}/.npm-global"
+PROXY_PORT="${ZEN_PORT:-4041}"
 MARKER_BEGIN="# >>> claude-zen-devcontainer >>>"
 MARKER_END="# <<< claude-zen-devcontainer <<<"
-NPM_GLOBAL_DIR="${HOME}/.npm-global"
+
+# Statusline integration
+STATUSLINE_SOURCE="${SCRIPT_DIR}/.claude/statusline.sh"
+STATUSLINE_SCRIPT="${PERSISTENCE_DIR}/statusline.sh"
+SETTINGS_FILE="${PERSISTENCE_DIR}/zen-claude-settings.json"
+
+PROXY_REPO_URL="https://github.com/chandan11248/claude-code-zen-proxy.git"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 export PATH="${NPM_GLOBAL_DIR}/bin:${PATH}"
 
-# ─── 0. Kill any running proxy (fresh start) ────────────────────────────────
-# Ensures the next cz launch picks up updated backends, API keys, and config.
+# ─── 0. Kill any running proxy from previous install ────────────────────────
 if [ -f "${PID_FILE}" ]; then
-    OLD_PID="$(cat "${PID_FILE}" 2>/dev/null)"
+    OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
     if [ -n "${OLD_PID}" ]; then
         kill "${OLD_PID}" 2>/dev/null || true
         sleep 1
     fi
     rm -f "${PID_FILE}"
 fi
-# Also catch any orphaned proxy processes not tracked by PID file
-STALE_PIDS="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
-if [ -n "${STALE_PIDS}" ]; then
-    kill ${STALE_PIDS} 2>/dev/null || true
-    sleep 1
-    REMAINING="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
-    if [ -n "${REMAINING}" ]; then
-        kill -9 ${REMAINING} 2>/dev/null || true
-        sleep 1
+
+# ─── 1. Node.js ───────────────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 1: Node.js ==="
+if have node; then
+    NODE_VER="$(node --version)"
+    printf '  Found: %s\n' "${NODE_VER}"
+    # Check major version >= 20
+    NODE_MAJOR="${NODE_VER#v}"
+    NODE_MAJOR="${NODE_MAJOR%%.*}"
+    if [ "${NODE_MAJOR}" -lt 20 ] 2>/dev/null; then
+        printf '  Warning: Node.js %s found but 20+ is required. Attempting upgrade...\n' "${NODE_VER}" >&2
+        if have nvm; then
+            nvm install 20
+        elif have apt-get; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
+            sudo apt-get install -y nodejs 2>/dev/null
+        fi
     fi
-fi
-unset OLD_PID STALE_PIDS REMAINING
-
-# ─── 1. Prerequisites: dedicated proxy venv ──────────────────────────────────
-# Use a venv inside the workspace config dir so packages are:
-#   - isolated from the system Python and any active devcontainer venv
-#   - always found by the proxy regardless of what 'python3' resolves to
-#   - persisted across devcontainer rebuilds (lives on the workspace volume)
-printf '\n%s\n' "=== Step 1: Proxy Python environment ==="
-PROXY_VENV="${PERSISTENCE_DIR}/proxy-venv"
-# Find the base Python executable, bypassing any active venv shim.
-# sys._base_executable points at the real interpreter even inside a venv.
-SYSTEM_PY="$(python3 -c 'import sys; print(sys._base_executable)' 2>/dev/null || command -v python3)"
-printf '  Base Python: %s (%s)\n' "${SYSTEM_PY}" "$(${SYSTEM_PY} --version 2>&1)"
-
-USE_SYSTEM_PY_FLAG="${PERSISTENCE_DIR}/.USE_SYSTEM_PY"
-
-if [ -x "${PROXY_VENV}/bin/python3" ] && "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; then
-    # Venv exists and pip is usable
-    printf '  Proxy venv already exists. Ensuring packages...\n'
-    "${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
-    printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
-
-elif [ -f "${USE_SYSTEM_PY_FLAG}" ] || { [ -x "${PROXY_VENV}/bin/python3" ] && ! "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; }; then
-    # Either previously fell back to system Python, or the venv exists but is
-    # broken (no pip -- happens when ensurepip is unavailable).
-    # Fall back to system Python with --break-system-packages.
-    if [ -x "${PROXY_VENV}/bin/python3" ] && ! "${PROXY_VENV}/bin/python3" -m pip --version >/dev/null 2>&1; then
-    printf '  Warning: proxy venv is incomplete (pip not installed).\n'
-        printf '  Removing broken venv and falling back to system Python.\n'
-        rm -rf "${PROXY_VENV}"
-        printf '%s\n' "${SYSTEM_PY}" > "${USE_SYSTEM_PY_FLAG}"
-        printf '  Using system Python. Ensuring packages...\n'
 else
-        printf '  Using system Python (from previous run). Ensuring packages...\n'
+    printf '  Installing Node.js 20...\n'
+    if have curl; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
+        sudo apt-get install -y nodejs 2>/dev/null
+    else
+        printf '  Error: curl not found. Install Node.js 20+ manually.\n' >&2
+        exit 1
     fi
-    pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1
-    printf '  ✓ Using system Python (packages installed with --break-system-packages)\n'
-
-else
-    # Try creating a venv first
-    printf '  Creating proxy venv at %s ...\n' "${PROXY_VENV}"
-    if "${SYSTEM_PY}" -m venv "${PROXY_VENV}" 2>/dev/null; then
-        printf '  Installing proxy dependencies into venv...\n'
-        "${PROXY_VENV}/bin/python3" -m pip install -q fastapi uvicorn httpx tiktoken
-        printf '  ✓ Proxy venv ready: %s\n' "${PROXY_VENV}/bin/python3"
-else
-    printf '  Warning: standard venv creation failed (ensurepip not available).\n'
-        printf '  Falling back to system Python with --break-system-packages.\n'
-        pip3 install --break-system-packages -q fastapi uvicorn httpx tiktoken 2>&1
-        printf '%s\n' "${SYSTEM_PY}" > "${USE_SYSTEM_PY_FLAG}"
-        printf '  ✓ Using system Python (packages installed via --break-system-packages)\n'
-        printf '    System Python: %s\n' "${SYSTEM_PY}"
+    if ! have node; then
+        printf '  Error: Node.js installation failed. Install manually:\n' >&2
+        printf '    https://nodejs.org/\n' >&2
+        exit 1
     fi
+    printf '  Installed: %s\n' "$(node --version)"
 fi
 
-# ─── 2. Claude CLI ─────────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 2: Claude CLI ==="
+# ─── 2. Claude Code CLI ───────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 2: Claude Code CLI ==="
 if have claude; then
     printf '  Found: %s\n' "$(command -v claude)"
 else
@@ -274,2607 +150,111 @@ else
     mkdir -p "${NPM_GLOBAL_DIR}"
     npm config set prefix "${NPM_GLOBAL_DIR}" 2>/dev/null || true
     npm install -g @anthropic-ai/claude-code 2>&1 || {
-        printf '  WARNING: npm install failed.\n'
-        printf '  Install Claude CLI manually: npm install -g @anthropic-ai/claude-code\n' >&2
+        printf '  WARNING: npm install failed. Install manually:\n'
+        printf '    npm install -g @anthropic-ai/claude-code\n' >&2
     }
     if have claude; then
         printf '  Installed: %s\n' "$(command -v claude)"
-else
-    printf '  Warning: claude not in PATH yet. It may be at %s/bin/claude\n' "${NPM_GLOBAL_DIR}"
+    else
+        printf '  Warning: claude not in PATH yet. It may be at %s/bin/claude\n' "${NPM_GLOBAL_DIR}"
         printf '  Restart your shell or run: export PATH="%s/bin:\${PATH}"\n' "${NPM_GLOBAL_DIR}"
     fi
 fi
 
-# ─── 3. Persistence dir ───────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 3: Persistence dir ==="
+# ─── 3. Clone / update claude-code-zen-proxy ──────────────────────────────────
+printf '\n%s\n' "=== Step 3: claude-code-zen-proxy ==="
 mkdir -p "${PERSISTENCE_DIR}"
-
-# ─── 4. Proxy script ──────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 4: Proxy script ==="
-cat > "${PROXY_SCRIPT}" << 'PYEOF'
-"""Lightweight Anthropic-to-OpenAI translation proxy.
-
-Usage:
-    python3 proxy.py --backends /path/to/backends.json
-
-Listens on ZEN_HOST:ZEN_PORT (default 0.0.0.0:8083).
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import sys
-import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import httpx
-import tiktoken
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
-
-
-# ---------------------------------------------------------------------------
-# Backend configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Backend:
-    provider_id: str
-    base_url: str
-    api_key: str
-    model: str
-    provider_name: str = ""
-    api_key_env: str = ""
-    models: dict | None = None
-    # Enhanced metadata for rich model picker
-    description: str = ""
-    free_tier_info: str = ""
-    requires_api_key: bool = False
-
-# ---------------------------------------------------------------------------
-# Provider Registry with rich metadata for model picker
-# ---------------------------------------------------------------------------
-
-PROVIDER_REGISTRY = {
-    "zen": {
-        "name": "OpenCode Zen",
-        "base_url": "https://opencode.ai/zen/v1",
-        "api_key_env": "ZEN_API_KEY",
-        "description": "Free and paid models from multiple providers via OpenCode proxy",
-        "free_tier_info": "Free models available without API key (big-pickle, deepseek-v4-flash-free, nemotron-3-ultra-free, north-mini-code-free)",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "groq": {
-        "name": "Groq",
-        "base_url": "https://api.groq.com/openai/v1",
-        "api_key_env": "GROQ_API_KEY",
-        "description": "Ultra-fast inference for open-source models",
-        "free_tier_info": "14,400 requests/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b, etc.)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "google": {
-        "name": "Google (Gemini)",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "api_key_env": "GOOGLE_API_KEY",
-        "description": "Google's Gemini models via OpenAI-compatible API",
-        "free_tier_info": "1,500 requests/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "openrouter": {
-        "name": "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "description": "Access to 100+ models via single API",
-        "free_tier_info": "Some models free (mistral-7b, phi-3-mini, etc.) - check OpenRouter for current list",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "together": {
-        "name": "Together AI",
-        "base_url": "https://api.together.xyz/v1",
-        "api_key_env": "TOGETHER_API_KEY",
-        "description": "Cloud platform for open-source models (Llama, Mistral, DeepSeek, etc.)",
-        "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "deepinfra": {
-        "name": "DeepInfra",
-        "base_url": "https://api.deepinfra.com/v1/openai",
-        "api_key_env": "DEEPINFRA_API_KEY",
-        "description": "Serverless inference for open-source LLMs",
-        "free_tier_info": "Free tier with rate limits (Llama-3, Mixtral, DeepSeek, etc.)",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "fireworks": {
-        "name": "Fireworks AI",
-        "base_url": "https://api.fireworks.ai/inference/v1",
-        "api_key_env": "FIREWORKS_API_KEY",
-        "description": "Fast inference for open-source and custom models",
-        "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "together": {
-        "name": "Together AI",
-        "base_url": "https://api.together.xyz/v1",
-        "api_key_env": "TOGETHER_API_KEY",
-        "description": "Cloud platform for open-source models",
-        "free_tier_info": "Free tier with rate limits",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "deepinfra": {
-        "name": "DeepInfra",
-        "base_url": "https://api.deepinfra.com/v1/openai",
-        "api_key_env": "DEEPINFRA_API_KEY",
-        "description": "Serverless inference for open-source LLMs",
-        "free_tier_info": "Free tier with rate limits",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "fireworks": {
-        "name": "Fireworks AI",
-        "base_url": "https://api.fireworks.ai/inference/v1",
-        "api_key_env": "FIREWORKS_API_KEY",
-        "description": "Fast inference for open-source and custom models",
-        "free_tier_info": "Free tier with rate limits",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-}
-
-# ---------------------------------------------------------------------------
-# API Key Vault - persistent storage with prompting
-# ---------------------------------------------------------------------------
-
-import base64
-import hashlib
-
-class APIKeyVault:
-    """Persistent API key storage with optional encryption/obfuscation."""
-    
-    def __init__(self, vault_path: str):
-        self.vault_path = Path(vault_path)
-        self.vault_path.parent.mkdir(parents=True, exist_ok=True)
-        self._vault = {}
-        self._load()
-    
-    def _load(self):
-        if self.vault_path.exists():
-            try:
-                with open(self.vault_path, 'r') as f:
-                    self._vault = json.load(f)
-            except Exception:
-                self._vault = {}
-    
-    def _save(self):
-        try:
-            with open(self.vault_path, 'w') as f:
-                json.dump(self._vault, f, indent=2)
-        except Exception as e:
-            print(f"Warning: could not save API key vault: {e}", file=sys.stderr)
-    
-    def get_key(self, provider_id: str) -> str | None:
-        """Get API key for a provider."""
-        return self._vault.get(provider_id)
-    
-    def set_key(self, provider_id: str, key: str):
-        """Store API key for a provider."""
-        self._vault[provider_id] = key
-        self._save()
-    
-    def has_key(self, provider_id: str) -> bool:
-        """Check if provider has a stored key."""
-        return provider_id in self._vault and bool(self._vault[provider_id])
-    
-    def remove_key(self, provider_id: str):
-        """Remove stored key for a provider."""
-        if provider_id in self._vault:
-            del self._vault[provider_id]
-            self._save()
-
-# ---------------------------------------------------------------------------
-# Anthropic → OpenAI request conversion (adapted from claude-code-proxy)
-# ---------------------------------------------------------------------------
-
-def set_if_not_none(d: dict, key: str, value: Any) -> None:
-    if value is not None:
-        d[key] = value
-
-
-def convert_messages(anthropic_messages: list[dict], strip_tools: bool = False) -> list[dict]:
-    """Convert Anthropic messages to OpenAI chat format.
-
-    When strip_tools=False (default): tool_use blocks become OpenAI
-    tool_calls, and tool_result blocks become 'tool' role messages.
-    When strip_tools=True: tool_use and tool_result blocks are merged
-    into plain text.  This fallback is used when the upstream returns
-    403 (tool calling not supported).
-    """
-    openai_messages = []
-    system_content = None
-
-    for msg in anthropic_messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        if role == "system":
-            system_content = content if isinstance(content, str) else ""
-            continue
-
-        if role == "assistant":
-            if isinstance(content, list):
-                text_parts = []
-                tool_calls = []
-                for block in content:
-                    match block.get("type"):
-                        case "text":
-                            text_parts.append(block.get("text", ""))
-                        case "thinking":
-                            # Thinking blocks are Claude's internal reasoning;
-                            # their signature is meaningless to non-Anthropic
-                            # upstreams (Google, OpenRouter, etc.) and would
-                            # corrupt the conversation context.  Use the text
-                            # if available, otherwise skip entirely.
-                            think_text = block.get("text", "")
-                            if think_text:
-                                text_parts.append(think_text)
-                        case "tool_use":
-                            if strip_tools:
-                                func_args = json.dumps(block.get("input", {}))
-                                tool_name = block.get("name", "unknown")
-                                text_parts.append(f"[Using tool: {tool_name}({func_args})]")
-                            else:
-                                func_args = json.dumps(block.get("input", {}))
-                                tool_calls.append({
-                                    "id": block.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
-                                    "type": "function",
-                                    "function": {
-                                        "name": block.get("name", "unknown"),
-                                        "arguments": func_args,
-                                    },
-                                })
-                        case "tool_result":
-                            if strip_tools:
-                                result_content = block.get("content", "")
-                                if isinstance(result_content, list):
-                                    result_text = "\n".join(
-                                        b.get("text", "") for b in result_content
-                                        if isinstance(b, dict) and b.get("type") == "text"
-                                    )
-                                else:
-                                    result_text = str(result_content)
-                                text_parts.append(f"[Tool result: {result_text[:500]}]")
-                msg_dict = {"role": "assistant"}
-                if text_parts:
-                    msg_dict["content"] = "\n".join(text_parts)
-                if tool_calls and not strip_tools:
-                    msg_dict["tool_calls"] = tool_calls
-                openai_messages.append(msg_dict)
-            else:
-                openai_messages.append({"role": "assistant", "content": str(content)})
-            continue
-
-        if role == "user":
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_result":
-                        if strip_tools:
-                            result_content = block.get("content", "")
-                            if isinstance(result_content, list):
-                                result_text = "\n".join(
-                                    b.get("text", "") for b in result_content
-                                    if isinstance(b, dict) and b.get("type") == "text"
-                                )
-                            else:
-                                result_text = str(result_content)
-                            text_parts.append(f"[Tool result from {block.get('tool_use_id', 'unknown')}: {result_text[:500]}]")
-                        else:
-                            raw = block.get("content", "")
-                            if isinstance(raw, list):
-                                text = " ".join(
-                                    b.get("text", "") for b in raw
-                                    if isinstance(b, dict) and b.get("type") == "text"
-                                )
-                            else:
-                                text = str(raw) if raw is not None else ""
-                            openai_messages.append({
-                                "role": "tool",
-                                "tool_call_id": block.get("tool_use_id", ""),
-                                "content": text,
-                            })
-                if text_parts:
-                    openai_messages.append({"role": "user", "content": "\n".join(text_parts)})
-            else:
-                openai_messages.append({"role": "user", "content": str(content)})
-            continue
-
-    if system_content:
-        openai_messages.insert(0, {"role": "system", "content": system_content})
-
-    return openai_messages
-
-
-def convert_tools(anthropic_tools: list[dict] | None) -> list[dict]:
-    """Convert Anthropic tool format to OpenAI function format."""
-    if not anthropic_tools:
-        return []
-    tools = []
-    for tool in anthropic_tools:
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": tool.get("name", "unknown"),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {}),
-            },
-        })
-    return tools
-
-
-# ---------------------------------------------------------------------------
-# OpenAI → Anthropic SSE conversion
-# ---------------------------------------------------------------------------
-
-_enc = tiktoken.get_encoding("cl100k_base")
-
-
-def _estimate_tokens(text: str) -> int:
-    return len(_enc.encode(text))
-
-
-def _truncatable_content(msg: dict) -> str:
-    """Extract all token-bearing text from a message for token estimation.
-    Includes tool_calls and tool_call_id which can be large."""
-    c = msg.get("content", "")
-    text = ""
-    if isinstance(c, str):
-        text = c
-    elif isinstance(c, list):
-        text = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-    else:
-        text = str(c)
-    # tool_calls (function names + arguments) can dwarf the content field
-    if msg.get("tool_calls"):
-        for tc in msg["tool_calls"]:
-            fn = tc.get("function", {})
-            text += " " + fn.get("name", "") + " " + fn.get("arguments", "")
-    # tool_call_id adds overhead for tool-role messages
-    if msg.get("role") == "tool":
-        text += " " + msg.get("tool_call_id", "")
-    return text
-
-def _truncate_content(text: str, max_chars: int = 3000) -> str:
-    """Truncate a long text, keeping the first portion with a marker."""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n[...truncated...]"
-
-def truncate_messages(messages: list[dict], max_tokens: int = 180000) -> list[dict]:
-    """Drop oldest messages to keep total under max_tokens.
-    Preserves the system message (if present as first element).
-    Ensures tool messages are never orphaned from their assistant.
-    Also truncates oversized individual message content."""
-    # First pass: truncate oversized content in individual messages
-    for m in messages:
-        c = m.get("content", "")
-        if isinstance(c, str) and len(c) > 3000:
-            if m.get("role") in ("user", "tool"):
-                m["content"] = _truncate_content(c)
-            elif m.get("role") == "assistant" and not m.get("tool_calls"):
-                m["content"] = _truncate_content(c)
-        elif isinstance(c, list):
-            for idx, block in enumerate(c):
-                if isinstance(block, dict) and block.get("type") == "text" and len(block.get("text", "")) > 3000:
-                    fixed = dict(block)
-                    fixed["text"] = _truncate_content(fixed["text"])
-                    c[idx] = fixed
-
-    total = sum(_estimate_tokens(_truncatable_content(m)) for m in messages)
-    if total <= max_tokens:
-        return messages
-    system = [messages[0]] if messages and messages[0].get("role") == "system" else []
-    body = messages[len(system):]
-    while body and total > max_tokens:
-        dropped = body.pop(0)
-        total -= _estimate_tokens(_truncatable_content(dropped))
-        if dropped.get("role") == "assistant" and dropped.get("tool_calls"):
-            while body and body[0].get("role") == "tool":
-                orphan = body.pop(0)
-                total -= _estimate_tokens(_truncatable_content(orphan))
-    dropped_count = len(messages) - len(system) - len(body)
-    if dropped_count:
-        print(f"[PROXY] Truncated {dropped_count} old message(s) to fit {max_tokens} token limit", file=sys.stderr)
-    if total > max_tokens:
-        print(f"[PROXY] Still over limit after full drop ({total} est. tokens), keeping only last turn", file=sys.stderr)
-        body = body[-2:] if len(body) >= 2 else body
-    return system + body
-
-
-async def make_anthropic_stream(
-    openai_stream: AsyncIterator[dict],
-    model: str,
-    allow_thinking: bool = False,
-    upstream_resp: httpx.Response | None = None,
-) -> AsyncIterator[str]:
-    """Convert an OpenAI streaming response to Anthropic SSE format."""
-    try:
-        message_id = f"msg_{uuid.uuid4().hex}"
-        input_tokens = 0
-        finish_reason = None
-
-        yield f'event: message_start\ndata: {json.dumps({"type": "message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":model,"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}})}\n\n'
-
-        text_buffer = ""
-        tool_calls: dict[int, dict] = {}
-        thinking_block_open = False
-        text_block_open = False
-
-        async for chunk in openai_stream:
-            choices = chunk.get("choices", [])
-            if not choices:
-                usage = chunk.get("usage")
-                if usage:
-                    input_tokens = usage.get("prompt_tokens", 0) or input_tokens
-                continue
-
-            delta = choices[0].get("delta", {})
-            finish = choices[0].get("finish_reason")
-            if finish:
-                finish_reason = finish
-
-            # Reasoning content
-            reasoning = delta.get("reasoning_content")
-            if reasoning:
-                if allow_thinking:
-                    if not thinking_block_open:
-                        yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})}\n\n'
-                        thinking_block_open = True
-                    yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":reasoning}})}\n\n'
-                else:
-                    if not text_block_open:
-                        yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})}\n\n'
-                        text_block_open = True
-                    yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":reasoning}})}\n\n'
-                text_buffer += reasoning
-
-            # Text content
-            text = delta.get("content", "")
-            if text:
-                if not text_block_open:
-                    if thinking_block_open:
-                        yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
-                        thinking_block_open = False
-                    idx = 1 if thinking_block_open else 0
-                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})}\n\n'
-                    text_block_open = True
-                idx = 1 if thinking_block_open else 0
-                yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":text}})}\n\n'
-                text_buffer += text
-
-            # Tool calls
-            tc_list = delta.get("tool_calls", [])
-            for tc in tc_list:
-                idx = tc.get("index", 0)
-                if idx not in tool_calls:
-                    tool_calls[idx] = {
-                        "id": tc.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": "",
-                    }
-                    yield f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":idx+2,"content_block":{"type":"tool_use","id":tool_calls[idx]["id"],"name":tool_calls[idx]["name"]}})}\n\n'
-                args_delta = tc.get("function", {}).get("arguments", "")
-                if args_delta:
-                    tool_calls[idx]["arguments"] += args_delta
-                    yield f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":idx+2,"delta":{"type":"input_json_delta","partial_json":args_delta}})}\n\n'
-
-            usage = chunk.get("usage")
-            if usage:
-                input_tokens = usage.get("prompt_tokens", 0) or input_tokens
-
-        # Close content blocks
-        if thinking_block_open:
-            yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'
-        if text_block_open:
-            idx = 1 if thinking_block_open else 0
-            yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx})}\n\n'
-        for idx in sorted(tool_calls.keys()):
-            yield f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":idx+2})}\n\n'
-
-        # Estimate output tokens
-        output_tokens = _estimate_tokens(text_buffer)
-        for tc in tool_calls.values():
-            output_tokens += _estimate_tokens(tc.get("arguments", ""))
-
-        stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
-        anthropic_stop = stop_map.get(finish_reason, "end_turn")
-
-        yield f'event: message_delta\ndata: {json.dumps({"type":"message_delta","delta":{"stop_reason":anthropic_stop,"stop_sequence":None},"usage":{"output_tokens":output_tokens}})}\n\n'
-        yield f'event: message_stop\ndata: {json.dumps({"type":"message_stop"})}\n\n'
-    except GeneratorExit:
-        if upstream_resp is not None:
-            await upstream_resp.aclose()
-        return
-
-
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
-
-class MessagesRequest(BaseModel):
-    model: str = "claude-sonnet-4-6"
-    messages: list[dict] = Field(default_factory=list)
-    max_tokens: int = 4096
-    system: str | list[dict] | None = None
-    tools: list[dict] | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    stream: bool = True
-
-    model_config = {"extra": "allow"}
-
-
-backends: dict[str, Backend] = {}
-default_provider_id: str = ""
-http_client: httpx.AsyncClient | None = None
-
-
-def load_backends(path: Path) -> dict[str, Backend]:
-    with open(path) as f:
-        data = json.load(f)
-    result = {}
-    for pid, info in data.items():
-        api_key = info.get("api_key") or os.environ.get(
-            info.get("api_key_env", ""), ""
-        )
-        result[pid] = Backend(
-            provider_id=pid,
-            base_url=info["base_url"].rstrip("/"),
-            api_key=api_key,
-            model=info.get("model", ""),
-            provider_name=info.get("provider_name", pid.upper()),
-            api_key_env=info.get("api_key_env", ""),
-            models=info.get("models"),
-        )
-    return result
-
-
-def get_backend(request: Request) -> Backend:
-    """Select backend based on x-api-key suffix."""
-    global default_provider_id, backends
-
-    auth = request.headers.get("x-api-key") or request.headers.get("authorization") or ""
-    pid = default_provider_id
-
-    if ":" in auth:
-        suffix = auth.split(":", 1)[1].strip()
-        if suffix and suffix in backends:
-            pid = suffix
-
-    if pid not in backends:
-        raise HTTPException(status_code=400, detail=f"Unknown backend: {pid}. Available: {list(backends)}")
-    return backends[pid]
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(7200.0, connect=30.0))
-    yield
-    if http_client:
-        await http_client.aclose()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-def _get_client() -> httpx.AsyncClient:
-    if http_client is None:
-        raise RuntimeError("HTTP client not initialized")
-    return http_client
-
-
-def _probe_response() -> Response:
-    return Response(status_code=204, headers={"Allow": "GET, POST, HEAD, OPTIONS"})
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-
-@app.get("/")
-async def root():
-    be = backends.get(default_provider_id)
-    return {
-        "status": "ok",
-        "provider": default_provider_id,
-        "model": f"{default_provider_id}/{backends[default_provider_id].model}" if default_provider_id in backends else "",
+if [ -d "${REPO_DIR}/.git" ]; then
+    printf '  Repo exists, pulling latest...\n'
+    git -C "${REPO_DIR}" pull --ff-only 2>/dev/null || {
+        printf '  Warning: git pull failed. Using existing version.\n'
     }
-
-
-@app.api_route("/", methods=["HEAD", "OPTIONS"])
-async def probe_root():
-    return _probe_response()
-
-
-@app.api_route("/v1/messages", methods=["HEAD", "OPTIONS"])
-async def probe_messages():
-    return _probe_response()
-
-
-@app.get("/v1/models")
-async def list_models():
-    models = []
-    for pid, be in backends.items():
-        display = be.provider_name or pid
-        # Does this backend have an API key requirement at all?
-        has_key_req = bool(be.api_key_env)
-        # If backend has a models dict, list all models from it
-        if be.models:
-            for family, model_list in be.models.items():
-                # Free family models don't need a key; all others do
-                family_needs_key = has_key_req and (family != "Free")
-                for m in model_list:
-                    models.append({
-                        "id": m,
-                        "display_name": f"{display} {family} ({m})",
-                        "created_at": "2025-01-01T00:00:00Z",
-                        "type": "model",
-                        "api_key_required": family_needs_key,
-                    })
-        else:
-            model_id = be.model or f"{pid}/default"
-            models.append({
-                "id": model_id,
-                "display_name": f"{display} ({model_id})",
-                "created_at": "2025-01-01T00:00:00Z",
-                "type": "model",
-                "api_key_required": has_key_req,
-            })
-    return {"data": models}
-
-
-@app.post("/v1/messages")
-async def create_message(request: Request):
-    body = await request.json()
-    req = MessagesRequest(**body)
-    be = get_backend(request)
-
-    anthropic_beta = request.headers.get("anthropic-beta", "")
-    allow_thinking = "thinking-2025-01-02" in anthropic_beta
-    # Force thinking mode for Google/OpenRouter models that return reasoning_content
-    if be.provider_id in ("google", "openrouter"):
-        allow_thinking = True
-
-    openai_messages = convert_messages(req.messages)
-    if req.system is not None:
-        if isinstance(req.system, list):
-            system_text = "\n".join(
-                b.get("text", "") for b in req.system if isinstance(b, dict) and b.get("type") == "text"
-            )
-            if system_text:
-                openai_messages.insert(0, {"role": "system", "content": system_text})
-        elif req.system:
-            openai_messages.insert(0, {"role": "system", "content": req.system})
-
-    # Truncate old messages to fit within the model's context window.
-    # Google Gemma 4-31b has a 262,144 token limit; OpenRouter etc. vary.
-    # Keeping ~200K tokens leaves room for the model's response.
-    openai_messages = truncate_messages(openai_messages, max_tokens=180000)
-
-    openai_tools = convert_tools(req.tools)
-    upstream_model = be.model or req.model.split("/")[-1] if "/" in req.model else req.model
-
-    payload = {
-        "model": upstream_model,
-        "messages": openai_messages,
-        "max_tokens": req.max_tokens or 16384,
-        "stream": True,
-        "stream_options": {"include_usage": True},
+else
+    printf '  Cloning claude-code-zen-proxy...\n'
+    git clone --depth 1 "${PROXY_REPO_URL}" "${REPO_DIR}" 2>&1 || {
+        printf '  Error: git clone failed.\n' >&2
+        exit 1
     }
-    set_if_not_none(payload, "temperature", req.temperature)
-    set_if_not_none(payload, "top_p", req.top_p)
-    if openai_tools:
-        payload["tools"] = openai_tools
-
-    headers = {"Content-Type": "application/json"}
-    # Read API key from the live environment variable on each request,
-    # so proxy restarts are NOT required when env vars change mid-session.
-    live_key = os.environ.get(be.api_key_env, "") if be.api_key_env else be.api_key
-    if not live_key:
-        live_key = be.api_key
-    if live_key:
-        headers["Authorization"] = f"Bearer {live_key}"
-
-    client = _get_client()
-
-    # Try with tools first (normal). If the upstream returns 403 (doesn't
-    # support tool calling), retry once with tool blocks merged into text.
-    retried = False
-    while True:
-        try:
-            upstream_resp = await client.post(
-                f"{be.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            upstream_resp.raise_for_status()
-            break  # success
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code
-            try:
-                error_body = e.response.text[:500]
-            except Exception:
-                error_body = ""
-            print(f"[PROXY] Upstream HTTP {status}: {error_body[:300]}", file=sys.stderr, flush=True)
-
-            # On 403, retry once without tools (common for backends that
-            # reject tool calling, e.g. DeepSeek on OpenCode Zen).
-            if status == 403 and not retried and (
-                openai_tools
-                or any(msg.get("tool_calls") or msg.get("role") == "tool" for msg in openai_messages)
-            ):
-                print(f"[PROXY] 403 - retrying without tools...", file=sys.stderr, flush=True)
-                openai_messages = convert_messages(req.messages, strip_tools=True)
-                payload["messages"] = openai_messages
-                payload.pop("tools", None)
-                retried = True
-                continue  # retry
-
-            raise HTTPException(status_code=502, detail=f"Upstream error: {status} - {error_body}")
-
-        except httpx.RequestError as e:
-            print(f"[PROXY] Connection to upstream failed: {e}", file=sys.stderr, flush=True)
-            raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
-
-    if req.stream:
-        return StreamingResponse(
-            make_anthropic_stream(_iter_openai_sse(upstream_resp), req.model, allow_thinking, upstream_resp=upstream_resp),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    # Non-streaming: collect chunks and build single response
-    content_parts: list[dict] = []
-    thinking_text = ""
-    text_buffer = ""
-    tool_calls: dict[int, dict] = {}
-    finish_reason: str | None = None
-    input_tokens = 0
-
-    async for chunk in _iter_openai_sse(upstream_resp):
-        choices = chunk.get("choices", [])
-        if not choices:
-            usage = chunk.get("usage")
-            if usage:
-                input_tokens = usage.get("prompt_tokens", 0) or input_tokens
-            continue
-        delta = choices[0].get("delta", {})
-        finish = choices[0].get("finish_reason")
-        if finish:
-            finish_reason = finish
-
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            thinking_text += reasoning
-
-        text = delta.get("content", "")
-        if text:
-            text_buffer += text
-
-        for tc in delta.get("tool_calls", []):
-            idx = tc.get("index", 0)
-            if idx not in tool_calls:
-                tool_calls[idx] = {
-                    "id": tc.get("id", f"tool_{uuid.uuid4().hex[:8]}"),
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": "",
-                }
-            tool_calls[idx]["arguments"] += tc.get("function", {}).get("arguments", "")
-
-        usage = chunk.get("usage")
-        if usage:
-            input_tokens = usage.get("prompt_tokens", 0) or input_tokens
-
-    if allow_thinking and thinking_text:
-        content_parts.append({"type": "thinking", "thinking": thinking_text})
-    text_buffer = thinking_text + text_buffer if not allow_thinking and thinking_text else text_buffer
-    if text_buffer:
-        content_parts.append({"type": "text", "text": text_buffer})
-    for idx in sorted(tool_calls.keys()):
-        tc = tool_calls[idx]
-        content_parts.append({
-            "type": "tool_use",
-            "id": tc["id"],
-            "name": tc["name"],
-            "input": json.loads(tc["arguments"]) if tc["arguments"] else {},
-        })
-
-    if not content_parts:
-        content_parts = [{"type": "text", "text": ""}]
-
-    output_tokens = _estimate_tokens(text_buffer)
-    for tc in tool_calls.values():
-        output_tokens += _estimate_tokens(tc.get("arguments", ""))
-
-    stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
-    anthropic_stop = stop_map.get(finish_reason, "end_turn")
-
-    return {
-        "id": f"msg_{uuid.uuid4().hex}",
-        "type": "message",
-        "role": "assistant",
-        "content": content_parts,
-        "model": req.model,
-        "stop_reason": anthropic_stop,
-        "stop_sequence": None,
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-    }
-
-
-async def _iter_openai_sse(resp: httpx.Response) -> AsyncIterator[dict]:
-    """Iterate over an OpenAI streaming response, yielding parsed JSON chunks."""
-    async for line in resp.aiter_lines():
-        line = line.strip()
-        if not line or line.startswith(":"):
-            continue
-        if line.startswith("data: "):
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            try:
-                yield json.loads(data)
-            except json.JSONDecodeError:
-                continue
-
-
-@app.post("/v1/messages/count_tokens")
-async def count_tokens(request: Request):
-    body = await request.json()
-    text = ""
-    for msg in body.get("messages", []):
-        c = msg.get("content", "")
-        if isinstance(c, str):
-            text += c
-        elif isinstance(c, list):
-            for block in c:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text += block.get("text", "")
-    tokens = _estimate_tokens(text)
-    return {"input_tokens": tokens}
-
-
-def main():
-    global default_provider_id, backends
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backends", default=os.environ.get("ZEN_BACKENDS", "backends.json"))
-    parser.add_argument("--host", default=os.environ.get("ZEN_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("ZEN_PORT", "8083")))
-    args = parser.parse_args()
-
-    backends_path = Path(args.backends)
-    if not backends_path.exists():
-        print(f"Backends file not found: {backends_path}", file=sys.stderr)
-        sys.exit(1)
-
-    backends = load_backends(backends_path)
-    if not backends:
-        print("No backends configured", file=sys.stderr)
-        sys.exit(1)
-
-    default_provider_id = os.environ.get("ZEN_DEFAULT_PROVIDER") or next(iter(backends))
-
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level="info",
-        timeout_graceful_shutdown=5,
-    )
-
-
-if __name__ == "__main__":
-    main()
-PYEOF
-chmod +x "${PROXY_SCRIPT}"
-printf '  Created %s\n' "${PROXY_SCRIPT}"
-# ─── 4.5. API Key Vault ──────────────────────────────────────────────────────
-KEY_VAULT_SCRIPT="${PERSISTENCE_DIR}/key_vault.py"
-cat > "${KEY_VAULT_SCRIPT}" << 'PYEOF'
-"""API Key Vault — resolve, prompt, and persist API keys for LLM providers.
-
-Usage:
-    python3 key_vault.py resolve <provider_id> <backends_file> <vault_file>
-        -> prints the key to stdout (empty = no key needed or user skipped)
-
-The vault file is a simple JSON dict: { "provider_id": "key_value", ... }
-"""
-import json, os, sys
-
-VAULT_FILE = ""
-BACKENDS_FILE = ""
-
-KEY_ENV_CACHE = {}  # provider_id -> env_var_name
-
-def get_key_env(pid):
-    """Get the env var name for a provider from backends.json."""
-    if pid in KEY_ENV_CACHE:
-        return KEY_ENV_CACHE[pid]
-    try:
-        with open(BACKENDS_FILE) as f:
-            cfg = json.load(f)
-        be = cfg.get(pid, {})
-        env_name = be.get("api_key_env", "")
-        KEY_ENV_CACHE[pid] = env_name
-        return env_name
-    except Exception:
-        return ""
-
-def get_provider_meta(pid):
-    """Get provider metadata from backends.json."""
-    try:
-        with open(BACKENDS_FILE) as f:
-            cfg = json.load(f)
-        be = cfg.get(pid, {})
-        return {
-            "name": be.get("provider_name", pid),
-            "description": be.get("description", ""),
-            "free_tier_info": be.get("free_tier_info", ""),
-        }
-    except Exception:
-        return {"name": pid, "description": "", "free_tier_info": ""}
-
-def load_vault():
-    try:
-        if os.path.exists(VAULT_FILE):
-            with open(VAULT_FILE) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def save_vault(vault):
-    try:
-        os.makedirs(os.path.dirname(VAULT_FILE), exist_ok=True)
-        with open(VAULT_FILE, 'w') as f:
-            json.dump(vault, f, indent=2)
-    except Exception as e:
-        print(f"  Warning: could not save API key: {e}", file=sys.stderr)
-
-def cmd_resolve(pid, model_name=""):
-    """Resolve the API key for provider pid.
-
-    Priority: 1) env var  2) vault  3) prompt user
-    Returns the key on stdout, empty if no key needed / user skipped.
-    If model_name is in a "Free" family in backends.json, skip prompting.
-    """
-    # Check if the selected model is a Zen free model — no API key needed
-    # (OpenRouter :free models still need the API key for routing)
-    if model_name:
-        try:
-            with open(BACKENDS_FILE) as f:
-                cfg = json.load(f)
-            be = cfg.get(pid, {})
-            models_dict = be.get("models", {})
-            for family, model_list in models_dict.items():
-                if family.startswith("Free") and model_name in model_list and pid == "zen":
-                    return ""
-        except Exception:
-            pass
-
-    key_env = get_key_env(pid)
-    if not key_env:
-        return ""
-
-    # 1. Environment variable already set?
-    val = os.environ.get(key_env, "") or ""
-    if val:
-        return val
-
-    # 2. Check vault
-    vault = load_vault()
-    stored = vault.get(pid, "")
-    if stored:
-        return stored
-
-    # 3. Prompt user
-    meta = get_provider_meta(pid)
-    provider_name = meta.get("name", pid)
-    description = meta.get("description", "")
-    free_tier_info = meta.get("free_tier_info", "")
-
-    prompt_parts = [f"\n  {provider_name} requires an API key."]
-    if description:
-        prompt_parts.append(f"  {description}")
-    if free_tier_info:
-        prompt_parts.append(f"  {free_tier_info}")
-    prompt_parts.append(f"  Set ${key_env} or enter your key (or press Enter to skip): ")
-    prompt_text = "\n".join(prompt_parts)
-
-    try:
-        with open("/dev/tty", "r", encoding="utf-8") as tty:
-            sys.stderr.write(prompt_text + " ")
-            sys.stderr.flush()
-            key = tty.readline().strip()
-    except Exception:
-        return ""
-
-    if not key:
-        sys.stderr.write(f"  [SKIP] No key provided. Model may not work.\n")
-        return ""
-
-    # Store in vault
-    vault[pid] = key
-    save_vault(vault)
-    return key
-
-def cmd_set(pid, key_value):
-    """Store a key in the vault."""
-    vault = load_vault()
-    vault[pid] = key_value
-    save_vault(vault)
-    return ""
-
-def cmd_check(pid):
-    """Check if a key is available (env var or vault). Return the key if found."""
-    key_env = get_key_env(pid)
-    if not key_env:
-        return ""
-    val = os.environ.get(key_env, "") or ""
-    if val:
-        return val
-    vault = load_vault()
-    return vault.get(pid, "")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: key_vault.py <resolve|set|check> <provider_id> <backends_file> <vault_file> [key_value]",
-              file=sys.stderr)
-        sys.exit(1)
-
-    cmd = sys.argv[1]
-    pid = sys.argv[2]
-    BACKENDS_FILE = sys.argv[3]
-    VAULT_FILE = sys.argv[4]
-
-    if cmd == "resolve":
-        model_name = sys.argv[5] if len(sys.argv) >= 6 else ""
-        result = cmd_resolve(pid, model_name)
-        if result:
-            print(result)
-    elif cmd == "set":
-        if len(sys.argv) >= 6:
-            cmd_set(pid, sys.argv[5])
-    elif cmd == "check":
-        result = cmd_check(pid)
-        if result:
-            print(result)
-    else:
-        sys.exit(1)
-PYEOF
-chmod +x "${KEY_VAULT_SCRIPT}"
-printf '  Created %s\n' "${KEY_VAULT_SCRIPT}"
-
-
-# ─── 5. Backends config ───────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 5: Backends config ==="
-printf '  Querying OpenCode Zen API for available models...\n'
-
-# Preserve any existing api_key values from previous backends.json
-if [ -f "${BACKENDS_FILE}" ]; then
-    python3 - "${BACKENDS_FILE}" << 'PY' >/dev/null
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-    api_keys = {p: e.get('api_key', '') for p, e in data.items() if isinstance(e, dict) and e.get('api_key')}
-    if api_keys:
-        with open(path + '.apikeys', 'w') as f:
-            json.dump(api_keys, f)
-except Exception:
-    pass
-PY
 fi
 
-python3 << 'PY' > "${BACKENDS_FILE}"
-"""Generate backends.json dynamically by querying ALL providers' APIs."""
-import json, os, sys, urllib.request
-from urllib.error import URLError
-
-# Provider registry (mirrors proxy.py's PROVIDER_REGISTRY)
-PROVIDER_REGISTRY = {
-    "zen": {
-        "name": "OpenCode Zen",
-        "base_url": "https://opencode.ai/zen/v1",
-        "api_key_env": "ZEN_API_KEY",
-        "description": "Free and paid models from multiple providers via OpenCode proxy",
-        "free_tier_info": "Free models available without API key (big-pickle, deepseek-v4-flash-free, nemotron-3-ultra-free, north-mini-code-free)",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "groq": {
-        "name": "Groq",
-        "base_url": "https://api.groq.com/openai/v1",
-        "api_key_env": "GROQ_API_KEY",
-        "description": "Ultra-fast inference for open-source models",
-        "free_tier_info": "14,400 requests/day free tier (llama-3.3-70b, mixtral-8x7b, gemma-7b, etc.)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "google": {
-        "name": "Google (Gemini)",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "api_key_env": "GOOGLE_API_KEY",
-        "description": "Google's Gemini models via OpenAI-compatible API",
-        "free_tier_info": "1,500 requests/day free tier (gemini-1.5-flash, gemini-1.5-pro)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "openrouter": {
-        "name": "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "description": "Access to 100+ models via single API",
-        "free_tier_info": "Some models free (mistral-7b, phi-3-mini, etc.) - check OpenRouter for current list",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "together": {
-        "name": "Together AI",
-        "base_url": "https://api.together.xyz/v1",
-        "api_key_env": "TOGETHER_API_KEY",
-        "description": "Cloud platform for open-source models (Llama, Mistral, DeepSeek, etc.)",
-        "free_tier_info": "Free tier with rate limits ($1 free credits/month)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "deepinfra": {
-        "name": "DeepInfra",
-        "base_url": "https://api.deepinfra.com/v1/openai",
-        "api_key_env": "DEEPINFRA_API_KEY",
-        "description": "Serverless inference for open-source LLMs",
-        "free_tier_info": "Free tier with rate limits (Llama-3, Mixtral, DeepSeek, etc.)",
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
-    "fireworks": {
-        "name": "Fireworks AI",
-        "base_url": "https://api.fireworks.ai/inference/v1",
-        "api_key_env": "FIREWORKS_API_KEY",
-        "description": "Fast inference for open-source and custom models",
-        "free_tier_info": "Free tier with rate limits (Llama-3, DeepSeek, Qwen, etc.)",
-        "requires_key_for_listing": True,
-        "supports_dynamic_discovery": True,
-        "models_endpoint": "/models",
-        "chat_endpoint": "/chat/completions",
-    },
+# ─── 4. Install npm dependencies ──────────────────────────────────────────────
+printf '\n%s\n' "=== Step 4: npm install ==="
+cd "${REPO_DIR}"
+npm install 2>&1 || {
+    printf '  Error: npm install failed.\n' >&2
+    exit 1
 }
+printf '  Dependencies installed.\n'
 
-def fetch_models(base_url, models_endpoint, api_key_env, requires_key=False):
-    """Fetch models from a provider's API.
-    If requires_key is True and the API key is not set, skip silently.
-    """
-    api_key = os.environ.get(api_key_env, '')
-    if requires_key and not api_key:
-        return []  # Skip silently - no key configured
-    url = base_url.rstrip('/') + models_endpoint
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            return [m.get("id", m.get("name", "")) for m in data.get("data", [])]
-    except Exception as e:
-        print(f"  Warning: could not fetch models from {base_url} ({e}).", file=sys.stderr)
-        return []
-
-def probe_free(base_url, chat_endpoint, model):
-    body = json.dumps({"model": model, "messages": [{"role":"user","content":"hi"}], "max_tokens":1, "stream":False}).encode()
-    headers = {"Content-Type":"application/json", "User-Agent": "Mozilla/5.0"}
-    req = urllib.request.Request(base_url.rstrip('/') + "/chat/completions", data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=8):
-            return True
-    except URLError as e:
-        if getattr(e, "code", None) == 401:
-            return False
-        return True
-    except Exception:
-        return True
-
-print('  Querying providers for available models...', file=sys.stderr)
-all_models = {}
-for pid, provider in PROVIDER_REGISTRY.items():
-    if provider.get('supports_dynamic_discovery'):
-        req_key = provider.get('requires_key_for_listing', False)
-        models = fetch_models(provider['base_url'], provider['models_endpoint'], provider['api_key_env'], req_key)
-        if models is not None and len(models) > 0:
-            print(f'  Found {len(models)} models from {provider["name"]}', file=sys.stderr)
-            all_models[pid] = models
-        elif not req_key or os.environ.get(provider['api_key_env'], ''):
-            print(f'  No models found from {provider["name"]}', file=sys.stderr)
-
-if not all_models:
-    print('  Warning: no models fetched from any provider. Using fallback.', file=sys.stderr)
-    all_models = {'zen': ['big-pickle']}
-
-# Probe free models
-zen_models_list = all_models.get('zen', [])
-free_candidates = [m for m in zen_models_list if m.endswith('-free') or m == 'big-pickle']
-
-free_models = []
-expired = []
-if free_candidates:
-    print(f'  Probing {len(free_candidates)} potential free model(s)...', file=sys.stderr)
-    zen_provider = PROVIDER_REGISTRY['zen']
-    for m in free_candidates:
-        if probe_free(zen_provider['base_url'], zen_provider['chat_endpoint'], m):
-            print(f'    ✓ {m}', file=sys.stderr)
-            free_models.append(m)
-        else:
-            print(f'    ✗ {m} (needs API key)', file=sys.stderr)
-            expired.append(m)
-
-FAMILY_RULES = [
-    ("claude-", "Claude"), ("gpt-", "GPT"), ("gemini-", "Gemini"),
-    ("deepseek-", "DeepSeek"), ("grok-", "xAI"),
-    ("glm-", "Other"), ("minimax-", "Other"), ("kimi-", "Other"),
-    ("qwen", "Other"), ("mimo-", "Other"), ("nemotron-", "Other"),
-    ("north-", "Other"),
-]
-
-def classify(mid):
-    for prefix, family in FAMILY_RULES:
-        if mid.startswith(prefix):
-            return family
-    return "Other"
-
-# Classify models as free/paid for each provider
-# OpenRouter :free suffix indicates free models
-for pid in list(all_models.keys()):
-    if pid == 'openrouter':
-        all_models[pid + '_free'] = [m for m in all_models[pid] if m.endswith(':free')]
-        all_models[pid + '_paid'] = [m for m in all_models[pid] if not m.endswith(':free')]
-        del all_models[pid]
-
-# Zen free models are already classified by the probe above
-families = {}
-zen_only = all_models.get('zen', [])
-for m in zen_only:
-    fam = classify(m)
-    families.setdefault(fam, []).append(m)
-
-free_set = set(free_models)
-expired_set = set(expired)
-
-ORDER = ["Claude", "GPT", "Gemini", "DeepSeek", "xAI", "Other", "Free"]
-zen_models_out = {}
-
-for fam in ORDER:
-    if fam == "Free":
-        continue
-    models_in_fam = [m for m in families.get(fam, []) if m not in free_set and m not in expired_set]
-    if models_in_fam:
-        zen_models_out[fam] = models_in_fam
-
-if free_models:
-    zen_models_out["Free"] = sorted(set(free_models))
-
-if expired:
-    zen_models_out.setdefault("Other", []).extend(expired)
-
-result = {
-    "zen": {
-        "base_url": "https://opencode.ai/zen/v1",
-        "api_key_env": "ZEN_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "ZEN",
-        "models": zen_models_out,
-    },
-    "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "api_key_env": "GROQ_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "Groq",
-        "models": {"Free": all_models.get("groq", [])},
-    },
-    "google": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "api_key_env": "GOOGLE_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "Google (Gemini)",
-        "models": {"Free": all_models.get("google", [])},
-    },
-    "openrouter": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "OpenRouter",
-        "models": {"Free": all_models.get("openrouter_free", []), "Paid": all_models.get("openrouter_paid", [])},
-    },
-    "together": {
-        "base_url": "https://api.together.xyz/v1",
-        "api_key_env": "TOGETHER_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "Together AI",
-        "models": {"Free": all_models.get("together", [])},
-    },
-    "deepinfra": {
-        "base_url": "https://api.deepinfra.com/v1/openai",
-        "api_key_env": "DEEPINFRA_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "DeepInfra",
-        "models": {"Free": all_models.get("deepinfra", [])},
-    },
-    "fireworks": {
-        "base_url": "https://api.fireworks.ai/inference/v1",
-        "api_key_env": "FIREWORKS_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "Fireworks AI",
-        "models": {"Free": all_models.get("fireworks", [])},
-    },
-}
-
-json.dump(result, sys.stdout, indent=4)
-print()
-PY
-    if [ -s "${BACKENDS_FILE}" ]; then
-    printf '  Generated %s with dynamic model list\n' "${BACKENDS_FILE}"
+# ─── 5. Create .env.zen (preserve existing API key) ───────────────────────────
+printf '\n%s\n' "=== Step 5: Environment config ==="
+if [ -f "${ENV_FILE}" ]; then
+    # Preserve existing API key
+    EXISTING_KEY="$(sed -n 's/^UPSTREAM_API_KEY=//p' "${ENV_FILE}" 2>/dev/null | head -1 || true)"
+    EXISTING_MODEL="$(sed -n 's/^UPSTREAM_MODEL=//p' "${ENV_FILE}" 2>/dev/null | head -1 || true)"
+    printf '  Existing .env.zen found.'
+    if [ -n "${EXISTING_KEY}" ]; then
+        printf ' API key preserved.'
+    fi
+    if [ -n "${EXISTING_MODEL}" ]; then
+        printf ' Model: %s.' "${EXISTING_MODEL}"
+    fi
+    printf '\n'
 else
-    printf '  Warning: dynamic generation failed, writing fallback.\n' >&2
-    cat > "${BACKENDS_FILE}" << JSONEOF
-{
-    "zen": {
-        "base_url": "https://opencode.ai/zen/v1",
-        "api_key_env": "ZEN_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "ZEN",
-        "models": {
-            "Free": ["big-pickle"]
-        }
-    },
-    "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "api_key_env": "GROQ_API_KEY",
-        "api_key": "",
-        "model": "",
-        "provider_name": "Groq"
-    }
-}
-JSONEOF
-    printf '  Created %s (fallback)\n' "${BACKENDS_FILE}"
+    # First-time setup: prompt for API key or use free model
+    printf '\n'
+    printf '  OpenCode Zen API key setup\n'
+    printf '  ─────────────────────────\n'
+    printf '  Free models (big-pickle, deepseek-v4-flash-free, etc.) work without a key.\n'
+    printf '  Paid models (Claude, GPT, Gemini, etc.) require a ZEN_API_KEY.\n'
+    printf '  Get one at: https://opencode.ai\n'
+    printf '\n'
+    printf '  Set your API key (or press Enter to use free models only): '
+    READ_KEY=""
+    if [ -t 0 ]; then
+        read -r READ_KEY
+    elif [ -t 1 ]; then
+        read -r READ_KEY </dev/tty || true
+    fi
+
+    cat > "${ENV_FILE}" << ENVEOF
+# claude-code-zen-proxy configuration
+# https://github.com/chandan11248/claude-code-zen-proxy
+
+# API key for OpenCode Zen (leave empty for free models only)
+UPSTREAM_API_KEY=${READ_KEY}
+
+# Model to use (change this to switch models)
+UPSTREAM_MODEL=deepseek-v4-flash-free
+
+# Upstream endpoint
+UPSTREAM_CHAT_COMPLETIONS_URL=https://opencode.ai/zen/v1/chat/completions
+
+# Local model alias (how Claude Code sees the model)
+ANTHROPIC_MODEL_ALIAS=claude-code-proxy
+
+# Local proxy auth key (any string, just for local access)
+PROXY_API_KEY=claude-zen-local-key
+
+# DeepSeek thinking mode
+DEEPSEEK_THINKING_TYPE=enabled
+
+# Reasoning effort: xhigh, high, medium, low, minimal, none
+UPSTREAM_REASONING_EFFORT=xhigh
+
+# Proxy listen address
+HOST=127.0.0.1
+PORT=${PROXY_PORT}
+ENVEOF
+    printf '  Created %s\n' "${ENV_FILE}"
 fi
 
-# Restore api_key values from previous backends.json
-if [ -f "${BACKENDS_FILE}.apikeys" ]; then
-    python3 - "${BACKENDS_FILE}" << 'PY' >/dev/null
-import json, sys
-path = sys.argv[1]
-cache_path = path + '.apikeys'
-try:
-    with open(cache_path) as f:
-        api_keys = json.load(f)
-    with open(path) as f:
-        data = json.load(f)
-    for pid, key in api_keys.items():
-        if pid in data and isinstance(data[pid], dict):
-            data[pid]['api_key'] = key
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=4)
-except Exception:
-    pass
-import os
-os.unlink(cache_path)
-PY
-fi
-
-# ─── 6. Shell wrappers ────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 6: Shell wrappers ==="
-
-_wrapper_block() {
-    cat << 'WRAPEOF' | sed \
-        -e "s|__MARKER_BEGIN__|${MARKER_BEGIN}|g" \
-        -e "s|__MARKER_END__|${MARKER_END}|g" \
-        -e "s|__PERSISTENCE_DIR__|${PERSISTENCE_DIR}|g" \
-        -e "s|__PROXY_PORT__|${PROXY_PORT}|g" \
-        -e "s|__PROXY_SCRIPT__|${PROXY_SCRIPT}|g" \
-        -e "s|__NPM_GLOBAL_DIR__|${NPM_GLOBAL_DIR}|g" \
-        -e "s|__SELECTED_MODEL_FILE__|${SELECTED_MODEL_FILE}|g" \
-        -e "s|__BACKENDS_FILE__|${BACKENDS_FILE}|g" \
-        -e "s|__PID_FILE__|${PID_FILE}|g" \
-        -e "s|__LOG_FILE__|${LOG_FILE}|g"
-__MARKER_BEGIN__
-export CLAUDE_ZEN_CONFIG_DIR="__PERSISTENCE_DIR__"
-export CLAUDE_ZEN_PROXY_PORT="__PROXY_PORT__"
-export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
-
-unalias cz cz-new cz-cloud cz-continue ccz cz-danger 2>/dev/null || true
-unset -f cz cz_new ccz claude_zen_launch claude_zen_launch_danger \
-      claude_zen_cloud_launch \
-      claude_zen_pick_model claude_zen_current_model \
-      _claude_zen_pick _claude_zen_ensure_proxy \
-      claude_zen_proxy_start claude_zen_proxy_stop claude_zen_proxy_status \
-      claude_zen_uninstall_danger_rules 2>/dev/null || true
-
-# ── Interactive model picker ──────────────────────────────────────────────────
-_claude_zen_pick() {
-    python3 - "$@" << 'PY'
-import json, os, sys, urllib.request
-f = os.environ.get("ZEN_BACKENDS") or "__BACKENDS_FILE__"
-try:
-    with open(f) as fh:
-        cfg = json.load(fh)
-except Exception as e:
-    print(f"Error loading backends: {e}", file=sys.stderr); sys.exit(1)
-
-# Provider registry with rich metadata for display
-PROVIDER_META = {
-    "zen": {
-        "name": "OpenCode Zen",
-        "free_tier_info": "Free models (big-pickle, deepseek-v4-flash-free) work without an API key. Paid models need ZEN_API_KEY.",
-    },
-    "groq": {
-        "name": "Groq",
-        "free_tier_info": "14,400 req/day free tier",
-    },
-    "google": {
-        "name": "Google (Gemini)",
-        "free_tier_info": "1,500 req/day free tier",
-    },
-    "openrouter": {
-        "name": "OpenRouter",
-        "free_tier_info": "Some models free - see openrouter.ai",
-    },
-    "together": {
-        "name": "Together AI",
-        "free_tier_info": "Free tier with rate limits",
-    },
-    "deepinfra": {
-        "name": "DeepInfra",
-        "free_tier_info": "Free tier with rate limits",
-    },
-    "fireworks": {
-        "name": "Fireworks AI",
-        "free_tier_info": "Free tier with rate limits",
-    },
-}
-
-def key_status(env_name):
-    val = os.environ.get(env_name, "") or ""
-    if val:
-        return "\u2601", "configured"
-    return "\u2717", "not set"
-
-# Build model entries: (label, provider_id, model_name, is_free, desc, free_info, key_char, key_text)
-entries = []
-for pid, bc in cfg.items():
-    if not isinstance(bc, dict): continue
-    pname = bc.get("provider_name", pid)
-    meta = PROVIDER_META.get(pid, {})
-    desc = meta.get("name", pname)
-    free_info = meta.get("free_tier_info", "")
-    key_char, key_text = key_status(bc.get("api_key_env", ""))
-
-    models_dict = bc.get("models")
-    if models_dict and isinstance(models_dict, dict):
-        for family in sorted(models_dict.keys()):
-            is_free = family.startswith("Free")
-            for m in models_dict[family]:
-                entries.append((f"{family} > {m}", pid, m, is_free, desc, free_info, key_char, key_text))
-        continue
-
-    model = bc.get("model", "")
-    entries.append((f"{model} ({desc})", pid, model or "", False, desc, free_info, key_char, key_text))
-
-# Sort all entries
-all_free = sorted([e for e in entries if e[3]], key=lambda x: x[0].lower())
-all_paid = sorted([e for e in entries if not e[3]], key=lambda x: x[0].lower())
-
-# Detect hidden providers (in PROVIDER_META but not actually in cfg with models)
-hidden_providers = {}
-for pid, meta in PROVIDER_META.items():
-    if pid == "zen": continue
-    be = cfg.get(pid, {})
-    has_models = bool(be.get("models") and any(be["models"].values()))
-    if not has_models:
-        hidden_providers[pid] = meta.get("name", pid)
-
-# Separate anonymous Zen free models from other free models
-anon_free = [e for e in all_free if e[1] == "zen"]
-free_with_tier = [e for e in all_free if e[1] != "zen"]
-
-# ── MENU LOOP (supports re-display after provider configuration) ──────────
-backends_file = f
-reconfigured = True
-entry = None
-
-while True:
-    if reconfigured:
-        all_display = []
-        paid_submenu = []
-        idx = 1
-
-        # Entry 1: All paid models (submenu)
-        if all_paid:
-            print(f"  {idx:>3}) Paid models from all providers (requires API key)", file=sys.stderr)
-            all_display.append(("Paid models (submenu)", "_all_", "__submenu__"))
-            paid_submenu = [(label, pid, model) for label, pid, model, is_free, desc, free_info, kc, kt in all_paid]
-            idx += 1
-
-        # Free models from providers with free tier
-        if free_with_tier:
-            print(f"\n{' Models with free tier access (set API key) ':-^65}", file=sys.stderr)
-            last_pid = ""
-            for label, pid, model, is_free, desc, free_info, kc, kt in free_with_tier:
-                if pid != last_pid:
-                    last_pid = pid
-                    meta_src = PROVIDER_META.get(pid, {})
-                    prov_name = meta_src.get("name", desc)
-                    free_tag = meta_src.get("free_tier_info", free_info) or ""
-                    print(f"\n  {prov_name}: {free_tag}", file=sys.stderr)
-                print(f"  {idx:>3}) {model}", file=sys.stderr)
-                all_display.append((label, pid, model))
-                idx += 1
-
-        # Free Zen models (anonymous, no API key)
-        if anon_free:
-            print(f"{' Free Models (anonymous, no API key needed) ':-^65}", file=sys.stderr)
-            for label, pid, model, is_free, desc, free_info, kc, kt in anon_free:
-                has_expired = "expired" in label.lower()
-                suffix = "  (promotion ended)" if has_expired else "  [no API key needed]"
-                print(f"  {idx:>3}) {label}{suffix}", file=sys.stderr)
-                all_display.append((label, pid, model))
-                idx += 1
-
-        # Configure providers section (for hidden/API-key-required providers)
-        if hidden_providers:
-            print(f"{' Configure Providers (enter API key to enable) ':-^65}", file=sys.stderr)
-            for cpid, cname in hidden_providers.items():
-                print(f"  {idx:>3}) Set up {cname} API key -> scan and add models", file=sys.stderr)
-                all_display.append((f"Configure {cname}", cpid, "__configure__"))
-                idx += 1
-
-        reconfigured = False
-
-    # ── SELECTION ────────────────────────────────────────────────────────
-    print("\nSelect model:", file=sys.stderr)
-    with open("/dev/tty", "r", encoding="utf-8") as tty:
-        c = tty.readline().strip()
-    if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
-    p = int(c) - 1
-    if p < 0 or p >= len(all_display): print("Out of range.", file=sys.stderr); sys.exit(1)
-
-    entry = all_display[p]
-
-    # Handle submenu (paid models)
-    if entry[2] == "__submenu__":
-        print(f"\n{' Paid Models (set API key via env var) ':-^65}", file=sys.stderr)
-        sub_idx = 1
-        last_pid = ""
-        for label, pid, model in paid_submenu:
-            if pid != last_pid:
-                last_pid = pid
-                bc = cfg.get(pid, {})
-                meta_src = PROVIDER_META.get(pid, {})
-                prov_name = meta_src.get("name", bc.get("provider_name", pid))
-                kc, kt = key_status(bc.get("api_key_env", ""))
-                print(f"\n  {prov_name}  ({kc} {kt})", file=sys.stderr)
-                ek = bc.get("api_key_env", "")
-                if ek:
-                    print(f"    Set ${ek} to access", file=sys.stderr)
-            print(f"  {sub_idx:>3}) {label}", file=sys.stderr)
-            sub_idx += 1
-        print("\nSelect model (or 0 for main menu):", file=sys.stderr)
-        with open("/dev/tty", "r", encoding="utf-8") as tty:
-            c = tty.readline().strip()
-        if c == "0" or c.lower() == "b":
-            continue
-        if not c.isdigit(): print("Invalid.", file=sys.stderr); sys.exit(1)
-        sp = int(c) - 1
-        if sp < 0 or sp >= len(paid_submenu): print("Out of range.", file=sys.stderr); sys.exit(1)
-        entry = paid_submenu[sp]
-        break
-
-    # Handle configure provider entry
-    if entry[2] == "__configure__":
-        cpid = entry[1]
-        cname = PROVIDER_META.get(cpid, {}).get("name", cpid)
-        backends_entry = cfg.get(cpid, {})
-        base_url = backends_entry.get("base_url", "")
-        api_key_env = backends_entry.get("api_key_env", "")
-        models_endpoint = "/models"
-
-        if not api_key_env:
-            print(f"  No API key variable known for {cname}", file=sys.stderr)
-            continue
-
-        # Check env var or vault
-        import subprocess as _sp
-        key_vault_path = os.path.join(os.path.dirname(backends_file), "key_vault.py")
-        vault_file = os.path.join(os.path.dirname(backends_file), "api_keys.json")
-
-        # Show a clear prompt before the subprocess call (its stderr is captured)
-        env_name = backends_entry.get("api_key_env", "$KEY")
-        print(f"\n  {cname} needs an API key.", file=sys.stderr)
-        print(f"  Paste your {env_name} below, then press Enter:", file=sys.stderr)
-
-        result = _sp.run(
-            ["python3", key_vault_path, "resolve", cpid, backends_file, vault_file, ""],
-            capture_output=True, text=True
-        )
-        key = result.stdout.strip()
-
-        if not key:
-            print(f"  No API key provided for {cname}. Skipping.", file=sys.stderr)
-            continue
-
-        # Fetch models for this provider
-        print(f"  Fetching models from {cname}...", file=sys.stderr)
-        url = base_url.rstrip('/') + "/models"
-        headers = {"User-Agent": "Mozilla/5.0", "Authorization": f"Bearer {key}"}
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                model_list = [m.get("id", m.get("name", "")) for m in data.get("data", [])]
-                print(f"  Found {len(model_list)} models from {cname}!", file=sys.stderr)
-        except Exception as e:
-            print(f"  Error fetching models from {cname}: {e}", file=sys.stderr)
-            continue
-
-        # Update backends.json
-        try:
-            with open(backends_file) as fh:
-                cfg_all = json.load(fh)
-            if cpid not in cfg_all:
-                cfg_all[cpid] = {
-                    "base_url": base_url,
-                    "api_key_env": api_key_env,
-                    "api_key": "",
-                    "model": "",
-                    "provider_name": cname,
-                }
-            # Add model list — classify as free/paid
-            # Providers with free tiers: ALL models are free-tier models
-            if cpid in ("google", "groq", "deepinfra"):
-                free_models_list = model_list
-                paid_models_list = []
-            else:
-                free_models_list = [m for m in model_list if ":free" in m or "-free" in m]
-                paid_models_list = [m for m in model_list if ":free" not in m and "-free" not in m]
-            cfg_all[cpid]["models"] = {}
-            if free_models_list:
-                cfg_all[cpid]["models"]["Free"] = free_models_list
-            if paid_models_list:
-                cfg_all[cpid]["models"]["Paid"] = paid_models_list
-            if not free_models_list and not paid_models_list:
-                cfg_all[cpid]["models"] = {cname: model_list}
-
-            with open(backends_file, 'w') as fh:
-                json.dump(cfg_all, fh, indent=4)
-
-            print(f"  Added {len(model_list)} models from {cname}!", file=sys.stderr)
-            # Kill the running proxy so it restarts with fresh API keys on next launch
-            try:
-                pid_file = os.path.join(os.path.dirname(backends_file), "proxy.pid")
-                with open(pid_file) as pf:
-                    pid = int(pf.read().strip())
-                os.kill(pid, 15)  # SIGTERM
-            except Exception:
-                pass  # Proxy not running or no PID file
-        except Exception as e:
-            print(f"  Error updating backends.json: {e}", file=sys.stderr)
-            continue
-
-        # Re-read config and rebuild menu
-        try:
-            with open(backends_file) as fh:
-                cfg = json.load(fh)
-        except Exception:
-            pass
-        
-        # Remove this provider from hidden list
-        hidden_providers.pop(cpid, None)
-        
-        # Rebuild all entries
-        entries = []
-        for pid, bc in cfg.items():
-            if not isinstance(bc, dict): continue
-            pname = bc.get("provider_name", pid)
-            meta = PROVIDER_META.get(pid, {})
-            desc = meta.get("name", pname)
-            free_info = meta.get("free_tier_info", "")
-            key_char, key_text = key_status(bc.get("api_key_env", ""))
-            models_dict = bc.get("models")
-            if models_dict and isinstance(models_dict, dict):
-                for family in sorted(models_dict.keys()):
-                    is_free = family.startswith("Free")
-                    for m in models_dict[family]:
-                        entries.append((f"{family} > {m}", pid, m, is_free, desc, free_info, key_char, key_text))
-                continue
-            model = bc.get("model", "")
-            entries.append((f"{model} ({desc})", pid, model or "", False, desc, free_info, key_char, key_text))
-
-        all_free = sorted([e for e in entries if e[3]], key=lambda x: x[0].lower())
-        all_paid = sorted([e for e in entries if not e[3]], key=lambda x: x[0].lower())
-        anon_free = [e for e in all_free if e[1] == "zen"]
-        free_with_tier = [e for e in all_free if e[1] != "zen"]
-        reconfigured = True
-        continue
-
-    break  # Exit loop with valid entry
-
-print(f"{entry[1]}|{entry[2]}")
-PY
-}
-# ── Proxy lifecycle ───────────────────────────────────────────────────────────
-_claude_zen_ensure_proxy() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local pidf="${dir}/proxy.pid"
-    local logf="${dir}/proxy.log"
-    local proxy_script="${dir}/proxy.py"
-    local backends_file="${ZEN_BACKENDS:-${dir}/backends.json}"
-    local port="${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}"
-    mkdir -p "$dir"
-    if [ -f "$pidf" ]; then
-        local pid; pid=$(cat "$pidf")
-        kill -0 "$pid" 2>/dev/null && return 0
-        rm -f "$pidf"
-    fi
-    if [ ! -f "$proxy_script" ]; then
-        printf '\nProxy script not found at %s\n' "$proxy_script" >&2
-        return 1
-    fi
-    # Determine Python: prefer dedicated proxy venv, fall back to system
-    local proxy_python
-    if [ -x "${dir}/proxy-venv/bin/python3" ]; then
-        proxy_python="${dir}/proxy-venv/bin/python3"
-    elif [ -f "${dir}/.USE_SYSTEM_PY" ]; then
-        proxy_python="$(head -1 "${dir}/.USE_SYSTEM_PY" 2>/dev/null)"
-        if [ ! -x "$proxy_python" ]; then
-            proxy_python="$(command -v python3)"
-        fi
-else
-        printf '\nProxy Python not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
-        return 1
-    fi
-
-    # ── Kill any stale proxy process on our port ──────────────────────────
-    # Orphaned proxies with outdated backends.json (e.g. be.model = "big-pickle"
-    # from a previous script version) would hardcode the upstream model name,
-    # silently breaking model switching.  Kill them so the new proxy loads the
-    # current backends.json where model = "" (pass-through mode).
-    local stale_pids
-    stale_pids="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
-    if [ -n "$stale_pids" ]; then
-        printf '  Stopping stale proxy process(es): %s\n' "$stale_pids"
-        kill $stale_pids 2>/dev/null || true
-        sleep 1
-        local remaining
-        remaining="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
-        if [ -n "$remaining" ]; then
-            printf '  Force-killing stalled proxy(es): %s\n' "$remaining"
-            kill -9 $remaining 2>/dev/null || true
-            sleep 1
-        fi
-        # Clear stale PID file (ours or orphaned)
-        rm -f "$pidf"
-    fi
-
-    ZEN_API_KEY="" "${proxy_python}" "$proxy_script" \
-        --backends "$backends_file" \
-        --port "$port" \
-        >> "$logf" 2>&1 &
-    echo $! > "$pidf"
-    sleep 2
-    if kill -0 $! 2>/dev/null; then
-        printf '\nProxy started (PID %s), port %s\n' "$!" "$port"
-        return 0
-    fi
-    printf '\nWarning: proxy may not have started. Check %s\n' "$logf" >&2
-    return 1
-}
-
-
-
-# ── API Key resolution ──────────────────────────────────────────────────
-# Called before launching Claude to ensure the provider's API key is set.
-# Checks env var -> vault file -> prompts user interactively.
-_claude_zen_resolve_key() {
-    local pid="$1"
-    local dir="$2"
-    local model_name="$3"
-    local key_vault="${dir}/key_vault.py"
-
-    if [ ! -f "$key_vault" ]; then
-        return 0
-    fi
-
-    local key_value
-    key_value="$(python3 "$key_vault" resolve "$pid" \
-        "${ZEN_BACKENDS:-${dir}/backends.json}" \
-        "${dir}/api_keys.json" "$model_name")"
-
-    local key_env
-    key_env="$(python3 -c "
-import json
-with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
-    cfg = json.load(f)
-print(cfg.get('$pid', {}).get('api_key_env', ''))
-" 2>/dev/null)"
-
-    if [ -n "$key_value" ]; then
-        if [ -n "$key_env" ]; then
-            export "$key_env=$key_value"
-        fi
-    else
-        if [ -n "$key_env" ]; then
-            unset "$key_env" 2>/dev/null || true
-        fi
-    fi
-}
-# ── Launch Claude via the proxy ──────────────────────────────────────────────
-_claude_zen_find_claude() {
-    local cmd
-    cmd="$(command -v claude 2>/dev/null)" && { echo "$cmd"; return 0; }
-    # Common locations in devcontainers
-    for p in \
-        /home/vscode/.npm-global/bin/claude \
-        /root/.npm-global/bin/claude \
-        /usr/local/bin/claude \
-        /usr/bin/claude; do
-        [ -x "$p" ] && { echo "$p"; return 0; }
-    done
-    # VS Code extension bundled binary (common in devcontainers)
-    cmd="$(find /home/vscode/.vscode-server/extensions -maxdepth 4 -path '*/anthropic.claude-code-*/resources/native-binary/claude' -type f -executable 2>/dev/null | head -1)"
-    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
-    # Broader search within node_modules
-    cmd="$(find /home/vscode /root /usr/local -maxdepth 8 -name claude -type f -executable 2>/dev/null | head -1)"
-    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
-    printf '\nError: claude binary not found. Install it with:\n  npm install -g @anthropic-ai/claude-code\n\n' >&2
-    return 1
-}
-
-claude_zen_launch() {
-    local sel provider_id model_name claude_bin dir
-    sel="$(_claude_zen_pick)" || return 1
-    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    mkdir -p "$dir"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    # Parse provider_id|model_name format
-    if [[ "$sel" == *"|"* ]]; then
-        provider_id="${sel%%|*}"
-        model_name="${sel#*|}"
-else
-        # Legacy format: just provider_id
-        provider_id="$sel"
-        model_name=$(python3 -c "
-import json
-with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
-    cfg = json.load(f)
-bc = cfg.get('$sel', {})
-print(bc.get('model', '') or bc.get('provider_name', '$sel'))
-" 2>/dev/null)
-    fi
-    printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
-    # Resolve API key for this provider (prompts if needed, checks vault)
-    _claude_zen_resolve_key "$provider_id" "$dir" "$model_name"
-    _claude_zen_ensure_proxy || true
-    claude_bin="$(_claude_zen_find_claude)"
-    ZEN_DEFAULT_PROVIDER="$provider_id" \
-    ANTHROPIC_API_KEY="freecc:${provider_id}" \
-    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-    "$claude_bin" --model "$model_name" "$@"
-}
-
-# ── Danger mode: auto-accept permissions with git guardrails ────────────────
-claude_zen_launch_danger() {
-    local sel provider_id model_name claude_bin dir workspace_root danger_rules_file
-    sel="$(_claude_zen_pick)" || return 1
-    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    # Derive workspace root: __PERSISTENCE_DIR__ = <root>/.claude_config
-    workspace_root="${dir%/.claude_config}"
-    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
-    mkdir -p "$dir"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    # Parse provider_id|model_name format
-    if [[ "$sel" == *"|"* ]]; then
-        provider_id="${sel%%|*}"
-        model_name="${sel#*|}"
-else
-        provider_id="$sel"
-        model_name=$(python3 -c "
-import json
-with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
-    cfg = json.load(f)
-bc = cfg.get('$sel', {})
-print(bc.get('model', '') or bc.get('provider_name', '$sel'))
-" 2>/dev/null)
-    fi
-
-    printf '\n'
-    printf '  ⚠️  DANGER MODE\n'
-    printf '  ────────────\n'
-    printf '  Auto-accepting ALL permissions.\n'
-    printf '  Provider: %s  Model: %s\n' "$provider_id" "$model_name"
-    printf '\n'
-
-    # Resolve API key for this provider (prompts if needed, checks vault)
-    _claude_zen_resolve_key "$provider_id" "$dir" "$model_name"
-    _claude_zen_ensure_proxy || true
-    claude_bin="$(_claude_zen_find_claude)"
-
-    # ── Install danger guardrails via helper ──────────────────────────────
-    local backup_file
-    backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
-    printf '\n'
-
-    # ── Launch with auto-accept ────────────────────────────────────────────
-    ZEN_DEFAULT_PROVIDER="$provider_id" \
-    ANTHROPIC_API_KEY="freecc:${provider_id}" \
-    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-    "$claude_bin" --model "$model_name" --dangerously-skip-permissions "$@"
-
-    # ── Cleanup via helper ────────────────────────────────────────────────
-}
-
-# Remove danger guardrails from CLAUDE.md without launching (cleanup utility)
-claude_zen_uninstall_danger_rules() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local workspace_root="${dir%/.claude_config}"
-    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
-    local claude_md="${workspace_root}/CLAUDE.md"
-    local backup_file="${dir}/danger/CLAUDE.md.bak"
-
-    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
-        cp "$backup_file" "$claude_md"
-        printf 'Restored original CLAUDE.md\n'
-        rm -f "$backup_file"
-    elif [ -f "$claude_md" ]; then
-        # Remove only the guardrail block, preserving any custom content
-        if grep -q '# --- DANGER GUARDRAILS START ---' "$claude_md" 2>/dev/null; then
-            local start_marker="# --- DANGER GUARDRAILS START ---"
-            local end_marker="# --- DANGER GUARDRAILS END ---"
-            sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
-            if [ -s "${claude_md}.tmp" ]; then
-                mv "${claude_md}.tmp" "$claude_md"
-            else
-                rm -f "$claude_md" "${claude_md}.tmp"
-            fi
-            printf 'Removed danger guardrails from CLAUDE.md\n'
-        elif grep -q 'DANGER MODE GUARDRAILS' "$claude_md" 2>/dev/null; then
-            # Old format without markers — file was all danger rules (cp'd), no custom content lost
-            rm -f "$claude_md"
-            printf 'Removed danger CLAUDE.md (old format, no custom content)\n'
-        else
-            printf 'CLAUDE.md is not a danger rules file — leaving untouched\n'
-        fi
-else
-        printf 'No CLAUDE.md found\n'
-    fi
-}
-
-
-claude_zen_install_danger_rules() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local workspace_root="${dir%/.claude_config}"
-    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
-    _claude_zen_install_danger_guardrails "$workspace_root" "$dir" >/dev/null
-    printf '  \u2705 Danger guardrails installed in CLAUDE.md\n'
-}
-
-claude_zen_remove_danger_rules() {
-    claude_zen_uninstall_danger_rules
-}
-
-claude_zen_cloud_launch() {
-    local b; b="$(_claude_zen_find_claude)"
-    "$b" "$@"
-}
-
-claude_zen_pick_model() {
-    local sel provider_id model_name dir
-    sel="$(_claude_zen_pick)" || return 1
-    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    mkdir -p "$dir"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    if [[ "$sel" == *"|"* ]]; then
-        provider_id="${sel%%|*}"
-        model_name="${sel#*|}"
-        printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
-else
-        printf 'Backend: %s\n' "$sel"
-    fi
-}
-
-claude_zen_current_model() {
-    local f provider_id model_name
-    f="${CLAUDE_ZEN_MODEL_FILE:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}/selected-model}"
-    if [ -f "$f" ]; then
-        read -r sel < "$f"
-        if [[ "$sel" == *"|"* ]]; then
-            provider_id="${sel%%|*}"
-            model_name="${sel#*|}"
-            printf 'Provider: %s  Model: %s\n' "$provider_id" "$model_name"
-        else
-            printf 'Backend: %s\n' "$sel"
-        fi
-else
-        echo "No model selected (run cz-model)"
-    fi
-}
-
-claude_zen_proxy_start() { _claude_zen_ensure_proxy; }
-
-claude_zen_proxy_stop() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local pidf="${dir}/proxy.pid"
-    [ ! -f "$pidf" ] && echo "Proxy not running." && return 0
-    local pid; pid=$(cat "$pidf")
-    kill "$pid" 2>/dev/null && echo "Stopped PID $pid" || echo "Not running."
-    rm -f "$pidf"
-}
-
-claude_zen_proxy_status() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local pidf="${dir}/proxy.pid"
-    if [ -f "$pidf" ]; then
-        local pid; pid=$(cat "$pidf")
-        kill -0 "$pid" 2>/dev/null && echo "Proxy running: PID $pid, port ${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" && return 0
-        rm -f "$pidf"
-    fi
-    echo "Proxy not running."; return 1
-}
-
-claude_zen_proxy_restart() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local port="${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}"
-    local pidf="${dir}/proxy.pid"
-
-    printf 'Force-restarting proxy on port %s...\n' "$port"
-
-    # Kill all proxy processes on this port (both tracked and orphaned)
-    local stale_pids
-    stale_pids="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
-    if [ -n "$stale_pids" ]; then
-        printf '  Killing stale proxy(es): %s\n' "$stale_pids"
-        kill $stale_pids 2>/dev/null || true
-        sleep 1
-        local remaining
-        remaining="$(pgrep -f "proxy\.py.*--port ${port}" 2>/dev/null || true)"
-        if [ -n "$remaining" ]; then
-            printf '  Force-killing stalled proxy(es): %s\n' "$remaining"
-            kill -9 $remaining 2>/dev/null || true
-            sleep 1
-        fi
-    fi
-    rm -f "$pidf"
-
-    # Verify port is free
-    if ss -tlnp "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
-        printf '  Port %s still in use, waiting...\n' "$port"
-        sleep 2
-    fi
-
-    printf '  Starting fresh proxy...\n'
-    _claude_zen_ensure_proxy || {
-        printf '  Proxy failed to start. Check %s/proxy.log\n' "$dir" >&2
-        return 1
-    }
-    printf '  OK.\n'
-}
-
-claude_zen_reset_key() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    local backends_file="${ZEN_BACKENDS:-${dir}/backends.json}"
-    local vault_file="${dir}/api_keys.json"
-    local key_vault="${dir}/key_vault.py"
-
-    python3 "$key_vault" set zen "$backends_file" "$vault_file" ""
-    unset ZEN_API_KEY
-
-    printf '\n'
-    printf '  Cleared stored anonymous key.\n'
-    printf '  Restarting proxy with fresh anonymous identity...\n'
-
-    claude_zen_proxy_restart
-}
-
-# ── Danger guardrail helpers (shared by launch and session-resume) ──────────
-# Installs a temporary CLAUDE.md with git-restriction guardrails, backed up
-# from the original so it can be restored after Claude exits.
-_claude_zen_install_danger_guardrails() {
-    local workspace_root="$1" dir="$2" claude_md danger_dir backup_file
-    claude_md="${workspace_root}/CLAUDE.md"
-    danger_dir="${dir}/danger"
-    mkdir -p "$danger_dir"
-    backup_file="${danger_dir}/CLAUDE.md.bak"
-    if [ -f "$claude_md" ]; then
-        cp "$claude_md" "$backup_file"
-else
-        rm -f "$backup_file"
-        touch "$backup_file"
-    fi
-    local rules_file="${danger_dir}/danger_rules.md"
-    cat > "$rules_file" << 'DANGEREOF'
-# --- DANGER GUARDRAILS START ---
-# ⚠️ DANGER MODE GUARDRAILS — Do Not Remove
-
-You are running with **automatic permission approval**. Every tool call you
-make is executed WITHOUT confirmation. This is a safety-critical mode.
-
-## MANDATORY RESTRICTIONS — Git write operations
-
-Only the following **Staging & Read** operations are allowed:
-
-### ✅ ALLOWED Git Operations
-| Command | Purpose |
-|---------|---------|
-| `git add <file>` | Stage a file (fine-grained) |
-| `git add -p` | Stage interactively by hunk |
-| `git add -A` | Stage all changes |
-| `git status` | View working tree state |
-| `git diff` | View unstaged changes |
-| `git diff --cached` | View staged changes |
-| `git log` | View commit history |
-| `git show` | View a commit |
-| `git blame` | Annotate a file |
-| `git restore <file>` | Discard unstaged local changes |
-| `git stash push` | Save WIP temporarily |
-| `git stash list` | View stashes |
-| `git stash show` | View stash contents |
-
-### ❌ FORBIDDEN Git Operations
-| Operation | Reason |
-|-----------|--------|
-| `git commit` | Would record changes permanently |
-| `git push` / `git push --force` | Would publish to remote |
-| `git branch` / `git checkout -b` | Would create branches |
-| `git merge` / `git rebase` | Would alter history |
-| `git tag` | Would tag releases |
-| `git fetch` / `git pull` | Would contact remote |
-| `git reset --hard` / `git reset --mixed` | Destructive history reset |
-| `git revert` / `git cherry-pick` | Would create new commits |
-| `git rm` / `git mv` | Would remove/rename tracked files |
-| `git submodule` | Complex git mutation |
-| `git worktree` | Would create worktrees |
-| `git gc` / `git prune` / `git repack` | Repository maintenance |
-| `git clean -fd` / `-fdX` | Aggressive file removal |
-| `git stash drop` / `git stash pop` / `git stash clear` | Destructive stash ops |
-| `git config` (with global/system) | Would change git settings |
-
-### File System Cautions
-- You can read, write, and edit files normally.
-- **Do not delete files** without the user explicitly asking — even though
-  you auto-accept permissions, ask for verbal confirmation on deletes.
-- **Do not run shell commands** that modify the system (install packages,
-  change system config) without asking first.
-
-### Enforcement
-- If you are asked to do a forbidden git operation, say:
-  "⛔ This operation is blocked by Danger Mode guardrails."
-- If in doubt, err on the side of refusing. The user can always switch to
-  normal mode (`cz`) for git-write operations.
-
-## MANDATORY RESTRICTIONS — az (Azure CLI)
-
-Read-only operations are permitted. All write/mutation operations are prohibited.
-
-### ❌ FORBIDDEN az Operations
-| Operation | Reason |
-|-----------|--------|
-| `az resource create` / `az resource delete` / `az resource update` | Would create or delete Azure resources |
-| `az vm start` / `az vm stop` / `az vm delete` | Would modify VM state |
-| `az group create` / `az group delete` | Would modify resource groups |
-| `az network *` (write subcommands) | Would modify network configuration |
-| (any other az write operation) | Mutations are prohibited |
-
-## MANDATORY RESTRICTIONS — gh (GitHub CLI)
-
-Only read operations and updating PR descriptions via `gh edit` are permitted.
-
-### ✅ ALLOWED gh Operations
-| Command | Purpose |
-|---------|---------|
-| `gh edit` (PR description only) | Update PR descriptions |
-| `gh pr view` / `gh issue view` / `gh repo view` | Read repository data |
-| (any read-only gh command) | Read operations are permitted |
-
-### ❌ FORBIDDEN gh Operations
-| Operation | Reason |
-|-----------|--------|
-| `gh pr create` / `gh pr merge` / `gh pr close` | Would create or modify pull requests |
-| `gh issue create` / `gh issue close` / `gh issue comment` | Would modify issues |
-| `gh release create` | Would create releases |
-| `gh repo fork` / `gh repo create` / `gh repo delete` | Would create or delete repositories |
-| (any other gh write/mutation operation) | Mutations are prohibited |
-
-# --- DANGER GUARDRAILS END ---
-DANGEREOF
-
-    # Merge guardrails into CLAUDE.md idempotently using markers
-    local start_marker="# --- DANGER GUARDRAILS START ---"
-    local end_marker="# --- DANGER GUARDRAILS END ---"
-    local guardrails
-    guardrails="$(cat "$rules_file")"
-
-    if [ ! -f "$claude_md" ]; then
-        printf '# Project Instructions\n\n%s\n' "$guardrails" > "$claude_md"
-    elif grep -qF "$start_marker" "$claude_md"; then
-        sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
-        cat "${claude_md}.tmp" > "$claude_md"
-        printf '\n%s\n' "$guardrails" >> "$claude_md"
-        rm -f "${claude_md}.tmp"
-    else
-        printf '\n%s\n' "$guardrails" >> "$claude_md"
-    fi
-    printf '  🔒 Danger guardrails installed (CLAUDE.md)\n'
-    printf '%s' "$backup_file"
-}
-
-_claude_zen_cleanup_danger_guardrails() {
-    local workspace_root="$1" dir="$2" backup_file="$3" exit_code="${4:-$?}"
-    local claude_md="${workspace_root}/CLAUDE.md"
-    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
-        cp "$backup_file" "$claude_md"
-        printf '\n  ✅ Restored original CLAUDE.md\n'
-    elif [ -f "$backup_file" ]; then
-        rm -f "$claude_md"
-        printf '\n  ✅ Removed danger CLAUDE.md (no original to restore)\n'
-    fi
-    rm -f "$backup_file"
-    return "$exit_code"
-}
-
-# ── Session management: list & resume recent conversations ─────────────────
-# These rely on the claude_persist (which survives devcontainer rebuilds),
-# so past sessions are always findable even after fresh-install `cz`.
-_claude_zen_derive_workspace_root() {
-    local dir="${1:-${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}}"
-    local root="${dir%/.claude_config}"
-    [ -z "$root" ] && root="${dir%/*}"
-    printf '%s' "$root"
-}
-_claude_zen_persist_dir() {
-    local dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    # The persist dir is one level up from config: <workspace>/.claude_config => <workspace>
-    local workspace_root="${dir%/.claude_config}"
-    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
-    # The real persist target that ~/.claude points to
-    readlink -f "${HOME}/.claude" 2>/dev/null || echo "${workspace_root}/.claude_persist"
-}
-
-claude_zen_list_recent() {
-    local persist claude_bin danger_mode dir workspace_root backup_file sel provider_id model_name
-    danger_mode=0
-    if [ "${1:-}" = "--danger" ]; then
-        danger_mode=1
-        shift
-    fi
-    sel="$(_claude_zen_pick)" || return 1
-    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    mkdir -p "$dir"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    if [[ "$sel" == *"|"* ]]; then
-        provider_id="${sel%%|*}"
-        model_name="${sel#*|}"
-else
-        provider_id="$sel"
-        model_name=$(python3 -c "
-    import json
-    with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
-        cfg = json.load(f)
-    bc = cfg.get('$sel', {})
-    print(bc.get('model', '') or bc.get('provider_name', '$sel'))
-    " 2>/dev/null)
-    fi
-    persist="$(_claude_zen_persist_dir)"
-    if [ ! -f "${persist}/history.jsonl" ]; then
-        printf 'No session history found.\n' >&2
-        return 1
-    fi
-    printf '\n  Recent sessions:\n'
-    printf '  %s\n' '────────────────────────────────────────────────'
-    # Show the most recent 10 sessions from history.jsonl with index numbers
-    python3 - "${persist}/history.jsonl" << 'PY'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        entries = [json.loads(line) for line in f if line.strip()]
-except FileNotFoundError:
-    print("No history found.")
-    sys.exit(0)
-# Deduplicate: keep the most recent entry per session
-seen = {}
-for e in entries:
-    sid = e.get("sessionId", "")
-    seen[sid] = e  # last wins = most recent
-unique = list(seen.values())
-# Show last 10 (most recent first)
-for i, e in enumerate(reversed(unique[-10:]), 1):
-    disp = e.get("display", "")[:90]
-    sid = e.get("sessionId", "")[:12]
-    ts = e.get("timestamp", 0)
-    print(f'  {i:>2}) [{sid}...] {disp}')
-PY
-    printf '\n  Enter number to resume, or 0 to start fresh: ' >&2
-    read -r choice
-    case "${choice}" in
-        0|"") return 1 ;;
-        *)
-            # Pick the Nth recent unique session
-            local sid
-            claude_bin="$(_claude_zen_find_claude)" || return 1
-            sid=$(python3 - "${persist}/history.jsonl" "${choice}" 2>/dev/null << 'PY'
-import json, sys
-with open(sys.argv[1]) as f:
-    entries = [json.loads(line) for line in f if line.strip()]
-seen = {}
-for e in entries:
-    seen[e.get("sessionId", "")] = e
-unique = list(seen.values())
-idx = len(unique) - int(sys.argv[2])
-if 0 <= idx < len(unique):
-    print(unique[idx]["sessionId"])
-else:
-    sys.exit(1)
-PY
-) || { printf 'Invalid choice.\n' >&2; return 1; }
-            _claude_zen_ensure_proxy || true
-            printf 'Resuming session %s...\n' "${sid}"
-            if [ "$danger_mode" -eq 1 ]; then
-                dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-                workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
-                backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
-                printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
-                env ZEN_DEFAULT_PROVIDER="${provider_id}" \
-                    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-                    ANTHROPIC_API_KEY="freecc:${provider_id}" \
-                    "${claude_bin}" --model "${model_name}" --resume "${sid}" --dangerously-skip-permissions "$@"
-            else
-                exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
-                    ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-                    ANTHROPIC_API_KEY="freecc:${provider_id}" \
-                    "${claude_bin}" --model "${model_name}" --resume "${sid}" "$@"
-            fi
-            ;;
-    esac
-}
-
-claude_zen_resume_last() {
-    local claude_bin danger_mode dir workspace_root backup_file
-    danger_mode=0
-    if [ "${1:-}" = "--danger" ]; then
-        danger_mode=1
-        shift
-    fi
-    local sel provider_id model_name
-    sel="$(_claude_zen_pick)" || return 1
-    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    mkdir -p "$dir"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    if [[ "$sel" == *"|"* ]]; then
-        provider_id="${sel%%|*}"
-        model_name="${sel#*|}"
-else
-        provider_id="$sel"
-        model_name=$(python3 -c "
-    import json
-    with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
-        cfg = json.load(f)
-    bc = cfg.get('$sel', {})
-    print(bc.get('model', '') or bc.get('provider_name', '$sel'))
-    " 2>/dev/null)
-    fi
-    claude_bin="$(_claude_zen_find_claude)" || return 1
-    _claude_zen_ensure_proxy || true
-    if [ "$danger_mode" -eq 1 ]; then
-        dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-        workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
-        backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
-        printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
-        env ZEN_DEFAULT_PROVIDER="${provider_id}" \
-            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc:${provider_id}" \
-            "${claude_bin}" --model "${model_name}" --continue --dangerously-skip-permissions "$@"
-else
-        exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
-            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc:${provider_id}" \
-            "${claude_bin}" --model "${model_name}" --continue "$@"
-    fi
-}
-
-claude_zen_quick_resume() {
-    # Resume by session ID prefix or full ID
-    # Usage: claude_zen_quick_resume [--danger] <session-id-prefix> [extra-claude-args...]
-    local claude_bin sid target session_id danger_mode dir workspace_root backup_file
-    danger_mode=0
-    if [ "${1:-}" = "--danger" ]; then
-        danger_mode=1
-        shift
-    fi
-    sid="$1"; shift
-    local sel provider_id model_name
-    claude_bin="$(_claude_zen_find_claude)" || return 1
-    sel="$(_claude_zen_pick)" || return 1
-    dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-    mkdir -p "$dir"
-    printf '%s\n' "$sel" > "${CLAUDE_ZEN_MODEL_FILE:-${dir}/selected-model}"
-    if [[ "$sel" == *"|"* ]]; then
-        provider_id="${sel%%|*}"
-        model_name="${sel#*|}"
-else
-        provider_id="$sel"
-        model_name=$(python3 -c "
-    import json
-    with open('${ZEN_BACKENDS:-${dir}/backends.json}') as f:
-        cfg = json.load(f)
-    bc = cfg.get('$sel', {})
-    print(bc.get('model', '') or bc.get('provider_name', '$sel'))
-    " 2>/dev/null)
-    fi
-    _claude_zen_ensure_proxy || true
-    # Find the session file and extract the sessionId from its first line
-    target=""
-    for f in "$(_claude_zen_persist_dir)/projects/-workspace/"*.jsonl; do
-        if [[ "$(basename "$f")" == "${sid}"* ]]; then
-            target="$f"; break
-        fi
-    done
-    if [ -z "$target" ] || [ ! -f "$target" ]; then
-        printf 'Session not found: %s\n' "$sid" >&2
-        return 1
-    fi
-    # Extract sessionId from first JSON line
-    session_id=$(head -1 "$target" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sessionId',''))" 2>/dev/null)
-    if [ -z "$session_id" ]; then
-        printf 'Could not read session ID from %s\n' "$target" >&2
-        return 1
-    fi
-    printf 'Resuming session %s...\n' "$session_id"
-    if [ "$danger_mode" -eq 1 ]; then
-        dir="${CLAUDE_ZEN_CONFIG_DIR:-__PERSISTENCE_DIR__}"
-        workspace_root="$(_claude_zen_derive_workspace_root "$dir")"
-        backup_file="$(_claude_zen_install_danger_guardrails "$workspace_root" "$dir")"
-        printf '  ⚠️  DANGER MODE — auto-accepting permissions\n\n' >&2
-        env ZEN_DEFAULT_PROVIDER="${provider_id}" \
-            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc:${provider_id}" \
-            "${claude_bin}" --model "${model_name}" --resume "$session_id" --dangerously-skip-permissions "$@"
-else
-        exec env ZEN_DEFAULT_PROVIDER="${provider_id}" \
-            ANTHROPIC_BASE_URL="http://127.0.0.1:${CLAUDE_ZEN_PROXY_PORT:-__PROXY_PORT__}" \
-            ANTHROPIC_API_KEY="freecc:${provider_id}" \
-            "${claude_bin}" --model "${model_name}" --resume "$session_id" "$@"
-    fi
-}
-
-alias cz='claude_zen_launch'
-alias cz-new='claude_zen_launch'
-alias cz-danger='claude_zen_launch_danger'
-alias cz-cloud='claude_zen_cloud_launch'
-ccz() { local b; b="$(_claude_zen_find_claude)"; "$b" --continue "$@"; }
-alias cz-model='claude_zen_pick_model'
-alias cz-model-current='claude_zen_current_model'
-alias cz-proxy-start='claude_zen_proxy_start'
-alias cz-proxy-stop='claude_zen_proxy_stop'
-alias cz-proxy-status='claude_zen_proxy_status'
-alias cz-undo-danger='claude_zen_uninstall_danger_rules'
-alias cz-danger-guardrails-install='claude_zen_install_danger_rules'
-alias cz-danger-guardrails-remove='claude_zen_remove_danger_rules'
-alias cz-recent='claude_zen_list_recent'
-alias cz-last='claude_zen_resume_last'
-alias cz-resume='claude_zen_quick_resume'
-alias cz-danger-recent='claude_zen_list_recent --danger'
-alias cz-danger-last='claude_zen_resume_last --danger'
-alias cz-danger-resume='claude_zen_quick_resume --danger'
-alias cz-proxy-restart='claude_zen_proxy_restart'
-alias cz-fresh-key='claude_zen_reset_key'
-alias cz-help='claude_zen_help'
-alias cz-aliases='claude_zen_help'
-
-claude_zen_help() {
-    cat << HELPEOF
-Claude Zen - Claude Code via OpenAI-compatible proxy
-
-USAGE:
-  cz / cz-new           Start a new Claude Code session (model picker)
-  cz-danger             Same, with auto-accept permissions
-  cz-cloud              Use Anthropic cloud API directly (no proxy)
-  ccz                   Resume most recent cloud session
-
-  Session management:
-    cz-recent             List recent sessions, pick one to resume
-    cz-last               Resume the most recent session
-    cz-resume <id>        Resume a specific session by ID prefix
-    cz-danger-recent      Same as cz-recent with auto-accept
-    cz-danger-last        Same as cz-last with auto-accept
-    cz-danger-resume <id> Same as cz-resume with auto-accept
-
-  Proxy:
-    cz-proxy-start        Start the translation proxy daemon
-    cz-proxy-stop         Stop the proxy daemon
-    cz-proxy-status       Check if proxy is running
-    cz-proxy-restart      Force-kill all proxies and restart fresh
-    cz-fresh-key          Clear stored key and restart anonymous session
-
-  Model:
-    cz-model              Pick and save a default model
-    cz-model-current      Show currently selected model
-
-  Other:
-    cz-undo-danger                Remove danger-mode guardrails from CLAUDE.md
-    cz-danger-guardrails-install  Install danger-mode guardrails in CLAUDE.md
-    cz-danger-guardrails-remove   Remove danger-mode guardrails from CLAUDE.md
-    cz-aliases / cz-help          Show this help
-
-HELPEOF
-}
-
-__MARKER_END__
-WRAPEOF
-}
+# ─── 6. Shell aliases ─────────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 6: Shell aliases ==="
 
 _install_shell_wrappers() {
-    local block; block="$(_wrapper_block)"
+    local block
+    block="$(_wrapper_block)"
     for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
         [ -f "$rc" ] || continue
         python3 - "$rc" "$MARKER_BEGIN" "$MARKER_END" "$block" << 'PY'
@@ -2894,200 +274,749 @@ PY
     done
 }
 
+_wrapper_block() {
+    cat << WRAPEOF | sed \
+        -e "s|__MARKER_BEGIN__|${MARKER_BEGIN}|g" \
+        -e "s|__MARKER_END__|${MARKER_END}|g" \
+        -e "s|__PERSISTENCE_DIR__|${PERSISTENCE_DIR}|g" \
+        -e "s|__REPO_DIR__|${REPO_DIR}|g" \
+        -e "s|__ENV_FILE__|${ENV_FILE}|g" \
+        -e "s|__PROXY_PORT__|${PROXY_PORT}|g" \
+        -e "s|__NPM_GLOBAL_DIR__|${NPM_GLOBAL_DIR}|g"
+__MARKER_BEGIN__
+export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
+
+unalias cz cz-new cz-cloud cz-danger ccz cz-model cz-model-current \
+       cz-proxy-start cz-proxy-stop cz-proxy-status cz-undo-danger 2>/dev/null || true
+unset -f cz cz_new ccz _cz_find_claude _cz_ensure_proxy \
+         _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
+         cz_proxy_start cz_proxy_stop cz_proxy_status 2>/dev/null || true
+
+# ── Find the claude binary ─────────────────────────────────────────────────
+_cz_find_claude() {
+    local cmd
+    cmd="$(command -v claude 2>/dev/null)" && { echo "$cmd"; return 0; }
+    for p in \
+        "${__NPM_GLOBAL_DIR__}/bin/claude" \
+        /home/vscode/.npm-global/bin/claude \
+        /root/.npm-global/bin/claude \
+        /usr/local/bin/claude \
+        /usr/bin/claude; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    cmd="$(find /home/vscode/.vscode-server/extensions -maxdepth 4 \
+        -path '*/anthropic.claude-code-*/resources/native-binary/claude' \
+        -type f -executable 2>/dev/null | head -1)"
+    [ -n "$cmd" ] && { echo "$cmd"; return 0; }
+    printf '\nError: claude not found. Install with:\n  npm install -g @anthropic-ai/claude-code\n\n' >&2
+    return 1
+}
+
+# ── Ensure proxy is running ────────────────────────────────────────────────
+_cz_ensure_proxy() {
+    local dir="__PERSISTENCE_DIR__"
+    local repo="__REPO_DIR__"
+    local env_file="__ENV_FILE__"
+    local port="${ZEN_PORT:-__PROXY_PORT__}"
+    local pidf="${dir}/proxy.pid"
+    local logf="${dir}/proxy.log"
+
+    # Check if already running
+    if [ -f "$pidf" ]; then
+        local pid; pid=$(cat "$pidf" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$pidf"
+    fi
+
+    # Check if something is already on the port
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+            printf '\n  Proxy already running on port %s (not tracked by us).\n' "$port" >&2
+            return 0
+        fi
+    fi
+
+    # Start the proxy
+    if [ ! -d "$repo" ]; then
+        printf '\n  Proxy repo not found at %s. Re-run setup.\n' "$repo" >&2
+        return 1
+    fi
+    if [ ! -f "$env_file" ]; then
+        printf '\n  .env.zen not found at %s. Re-run setup.\n' "$env_file" >&2
+        return 1
+    fi
+
+    printf '\n  Starting zen proxy on port %s...\n' "$port"
+    cd "$repo"
+    set -a
+    source "$env_file"
+    set +a
+    node src/server.js >> "$logf" 2>&1 &
+    echo $! > "$pidf"
+    set +a
+    sleep 2
+
+    # Verify it started
+    if kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
+        printf '  Proxy started (PID %s)\n' "$(cat "$pidf")"
+        return 0
+    fi
+    printf '\n  Warning: proxy may not have started. Check %s\n' "$logf" >&2
+    return 1
+}
+
+# ── Launch Claude Code through the proxy ───────────────────────────────────
+_cz_launch() {
+    local dir="__PERSISTENCE_DIR__"
+    local env_file="__ENV_FILE__"
+    local port="${ZEN_PORT:-__PROXY_PORT__}"
+
+    if [ ! -f "$env_file" ]; then
+        printf 'Error: .env.zen not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
+        return 1
+    fi
+
+    local settings_file="${dir}/zen-claude-settings.json"
+    if [ ! -f "$settings_file" ]; then
+        printf 'Error: settings file not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
+        return 1
+    fi
+
+    # Read config from .env.zen
+    set -a
+    source "$env_file"
+    set +a
+    local api_key="${PROXY_API_KEY:-claude-zen-local-key}"
+    local model_alias="${ANTHROPIC_MODEL_ALIAS:-claude-code-proxy}"
+
+    _cz_ensure_proxy || true
+    local claude_bin
+    claude_bin="$(_cz_find_claude)" || return 1
+
+    ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" \
+    ANTHROPIC_API_KEY="${api_key}" \
+    ANTHROPIC_MODEL="${model_alias}" \
+    "$claude_bin" --settings "$settings_file" "$@"
+}
+
+# ── Launch with danger mode (auto-accept) ─────────────────────────────────
+_cz_launch_danger() {
+    local dir="__PERSISTENCE_DIR__"
+    local env_file="__ENV_FILE__"
+    local workspace_root="${dir%/.claude_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+
+    if [ ! -f "$env_file" ]; then
+        printf 'Error: .env.zen not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
+        return 1
+    fi
+
+    local settings_file="${dir}/zen-claude-settings.json"
+    if [ ! -f "$settings_file" ]; then
+        printf 'Error: settings file not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
+        return 1
+    fi
+
+    set -a
+    source "$env_file"
+    set +a
+    local api_key="${PROXY_API_KEY:-claude-zen-local-key}"
+    local model_alias="${ANTHROPIC_MODEL_ALIAS:-claude-code-proxy}"
+    local port="${ZEN_PORT:-__PROXY_PORT__}"
+
+    _cz_ensure_proxy || true
+    local claude_bin
+    claude_bin="$(_cz_find_claude)" || return 1
+
+    # Install danger guardrails
+    _cz_install_danger_guardrails "$workspace_root" "$dir"
+
+    printf '\n'
+    printf '  DANGER MODE\n'
+    printf '  Auto-accepting ALL permissions.\n'
+    printf '\n'
+
+    ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" \
+    ANTHROPIC_API_KEY="${api_key}" \
+    ANTHROPIC_MODEL="${model_alias}" \
+    "$claude_bin" --settings "$settings_file" --dangerously-skip-permissions "$@"
+}
+
+# ── Cloud launch (direct Anthropic, no proxy) ─────────────────────────────
+_cz_cloud_launch() {
+    local b; b="$(_cz_find_claude)" || return 1
+    "$b" "$@"
+}
+
+# ── Model picker ───────────────────────────────────────────────────────────
+_cz_model_pick() {
+    local env_file="__ENV_FILE__"
+
+    if [ ! -f "$env_file" ]; then
+        printf 'Error: .env.zen not found. Re-run setup.\n' >&2
+        return 1
+    fi
+
+    local current_model
+    current_model="$(sed -n 's/^UPSTREAM_MODEL=//p' "$env_file" 2>/dev/null | head -1)"
+    [ -z "$current_model" ] && current_model="deepseek-v4-flash-free"
+
+    printf '\n'
+    printf '  Current model: %s\n' "$current_model"
+    printf '\n'
+    printf '  Free models (no API key needed):\n'
+    printf '    1) deepseek-v4-flash-free\n'
+    printf '    2) big-pickle\n'
+    printf '    3) minimax-m2.5-free\n'
+    printf '    4) nemotron-3-super-free\n'
+    printf '    5) north-mini-code-free\n'
+    printf '    6) hy3-preview-free\n'
+    printf '    7) ling-2.6-flash\n'
+    printf '\n'
+    printf '  Paid models (requires UPSTREAM_API_KEY in .env.zen):\n'
+    printf '    8) claude-sonnet-4-6\n'
+    printf '    9) gpt-5.5\n'
+    printf '   10) gemini-3.5-flash\n'
+    printf '   11) deepseek-v4\n'
+    printf '   12) glm-5.1\n'
+    printf '   13) kimi-k2.6\n'
+    printf '   14) minimax-m2.7\n'
+    printf '   15) qwen3.5-plus\n'
+    printf '\n'
+    printf '   16) Enter custom model name\n'
+    printf '\n'
+    printf '  Select model (1-16, or Enter to keep current): '
+
+    local choice
+    if [ -t 0 ]; then
+        read -r choice
+    elif [ -t 1 ]; then
+        read -r choice </dev/tty || true
+    fi
+
+    local new_model=""
+    case "${choice}" in
+        1)  new_model="deepseek-v4-flash-free" ;;
+        2)  new_model="big-pickle" ;;
+        3)  new_model="minimax-m2.5-free" ;;
+        4)  new_model="nemotron-3-super-free" ;;
+        5)  new_model="north-mini-code-free" ;;
+        6)  new_model="hy3-preview-free" ;;
+        7)  new_model="ling-2.6-flash" ;;
+        8)  new_model="claude-sonnet-4-6" ;;
+        9)  new_model="gpt-5.5" ;;
+        10) new_model="gemini-3.5-flash" ;;
+        11) new_model="deepseek-v4" ;;
+        12) new_model="glm-5.1" ;;
+        13) new_model="kimi-k2.6" ;;
+        14) new_model="minimax-m2.7" ;;
+        15) new_model="qwen3.5-plus" ;;
+        16)
+            printf '  Enter model name: '
+            if [ -t 0 ]; then
+                read -r new_model
+            elif [ -t 1 ]; then
+                read -r new_model </dev/tty || true
+            fi
+            ;;
+        "")
+            printf '  Keeping current model: %s\n' "$current_model"
+            return 0
+            ;;
+        *)
+            printf '  Invalid choice.\n' >&2
+            return 1
+            ;;
+    esac
+
+    if [ -n "$new_model" ]; then
+        sed -i "s|^UPSTREAM_MODEL=.*|UPSTREAM_MODEL=${new_model}|" "$env_file"
+        printf '  Model set to: %s\n' "$new_model"
+
+        # Restart proxy if running to pick up the change
+        local pidf="__PERSISTENCE_DIR__/proxy.pid"
+        if [ -f "$pidf" ]; then
+            local pid; pid=$(cat "$pidf" 2>/dev/null || true)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                printf '  Restarting proxy to apply model change...\n'
+                kill "$pid" 2>/dev/null || true
+                sleep 1
+                rm -f "$pidf"
+                _cz_ensure_proxy || true
+            fi
+        fi
+    fi
+}
+
+# ── Show current model ────────────────────────────────────────────────────
+_cz_model_current() {
+    local env_file="__ENV_FILE__"
+    if [ -f "$env_file" ]; then
+        local model
+        model="$(sed -n 's/^UPSTREAM_MODEL=//p' "$env_file" 2>/dev/null | head -1)"
+        [ -z "$model" ] && model="(not set)"
+        printf 'Model: %s\n' "$model"
+    else
+        printf 'No .env.zen found. Run setup first.\n'
+    fi
+}
+
+# ── Proxy daemon management ───────────────────────────────────────────────
+cz_proxy_start() {
+    local dir="__PERSISTENCE_DIR__"
+    local pidf="${dir}/proxy.pid"
+    if [ -f "$pidf" ]; then
+        local pid; pid=$(cat "$pidf" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            printf 'Proxy already running (PID %s)\n' "$pid"
+            return 0
+        fi
+        rm -f "$pidf"
+    fi
+    _cz_ensure_proxy
+}
+
+cz_proxy_stop() {
+    local dir="__PERSISTENCE_DIR__"
+    local pidf="${dir}/proxy.pid"
+    if [ -f "$pidf" ]; then
+        local pid; pid=$(cat "$pidf" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null && printf 'Stopped proxy (PID %s)\n' "$pid" || printf 'Proxy not running.\n'
+        fi
+        rm -f "$pidf"
+    else
+        printf 'Proxy not running.\n'
+    fi
+}
+
+cz_proxy_status() {
+    local dir="__PERSISTENCE_DIR__"
+    local pidf="${dir}/proxy.pid"
+    if [ -f "$pidf" ]; then
+        local pid; pid=$(cat "$pidf" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            printf 'Proxy running: PID %s, port %s\n' "$pid" "${ZEN_PORT:-__PROXY_PORT__}"
+            return 0
+        fi
+        rm -f "$pidf"
+    fi
+    printf 'Proxy not running.\n'
+    return 1
+}
+
+# ── Danger guardrails ─────────────────────────────────────────────────────
+_cz_install_danger_guardrails() {
+    local workspace_root="$1" dir="$2"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    local danger_dir="${dir}/danger"
+    mkdir -p "$danger_dir"
+    local backup_file="${danger_dir}/CLAUDE.md.bak"
+    local rules_file="${danger_dir}/danger_rules.md"
+
+    if [ -f "$claude_md" ]; then
+        cp "$claude_md" "$backup_file"
+    else
+        rm -f "$backup_file"
+        touch "$backup_file"
+    fi
+
+    cat > "$rules_file" << 'DANGEREOF'
+# --- DANGER GUARDRAILS START ---
+# DANGER MODE GUARDRAILS — Do Not Remove
+
+You are running with **automatic permission approval**. Every tool call you
+make is executed WITHOUT confirmation. This is a safety-critical mode.
+
+## MANDATORY RESTRICTIONS — Git write operations
+
+Only the following **Staging & Read** operations are allowed:
+
+### ALLOWED Git Operations
+| Command | Purpose |
+|---------|---------|
+| `git add <file>` | Stage a file (fine-grained) |
+| `git add -p` | Stage interactively by hunk |
+| `git add -A` | Stage all changes |
+| `git status` | View working tree state |
+| `git diff` | View unstaged changes |
+| `git diff --cached` | View staged changes |
+| `git log` | View commit history |
+| `git show` | View a commit |
+| `git blame` | Annotate a file |
+| `git restore <file>` | Discard unstaged local changes |
+| `git stash push` | Save WIP temporarily |
+| `git stash list` | View stashes |
+| `git stash show` | View stash contents |
+
+### FORBIDDEN Git Operations
+| Operation | Reason |
+|-----------|--------|
+| `git commit` | Would record changes permanently |
+| `git push` / `git push --force` | Would publish to remote |
+| `git branch` / `git checkout -b` | Would create branches |
+| `git merge` / `git rebase` | Would alter history |
+| `git tag` | Would tag releases |
+| `git fetch` / `git pull` | Would contact remote |
+| `git reset --hard` / `git reset --mixed` | Destructive history reset |
+| `git revert` / `git cherry-pick` | Would create new commits |
+| `git rm` / `git mv` | Would remove/rename tracked files |
+
+### File System Cautions
+- You can read, write, and edit files normally.
+- **Do not delete files** without the user explicitly asking.
+
+### Enforcement
+- If you are asked to do a forbidden git operation, refuse.
+- If in doubt, err on the side of refusing.
+
+## MANDATORY RESTRICTIONS — gh (GitHub CLI)
+
+Only read operations and updating PR descriptions via `gh edit` are permitted.
+
+### FORBIDDEN gh Operations
+| Operation | Reason |
+|-----------|--------|
+| `gh pr create` / `gh pr merge` / `gh pr close` | Would create or modify pull requests |
+| `gh issue create` / `gh issue close` | Would modify issues |
+| `gh release create` | Would create releases |
+| `gh repo fork` / `gh repo create` / `gh repo delete` | Would create or delete repositories |
+
+# --- DANGER GUARDRAILS END ---
+DANGEREOF
+
+    local start_marker="# --- DANGER GUARDRAILS START ---"
+    local end_marker="# --- DANGER GUARDRAILS END ---"
+    local guardrails
+    guardrails="$(cat "$rules_file")"
+
+    if [ ! -f "$claude_md" ]; then
+        printf '# Project Instructions\n\n%s\n' "$guardrails" > "$claude_md"
+    elif grep -qF "$start_marker" "$claude_md"; then
+        sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
+        cat "${claude_md}.tmp" > "$claude_md"
+        printf '\n%s\n' "$guardrails" >> "$claude_md"
+        rm -f "${claude_md}.tmp"
+    else
+        printf '\n%s\n' "$guardrails" >> "$claude_md"
+    fi
+}
+
+_cz_uninstall_danger_rules() {
+    local dir="__PERSISTENCE_DIR__"
+    local workspace_root="${dir%/.claude_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+    local claude_md="${workspace_root}/CLAUDE.md"
+    local backup_file="${dir}/danger/CLAUDE.md.bak"
+
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        cp "$backup_file" "$claude_md"
+        printf 'Restored original CLAUDE.md\n'
+        rm -f "$backup_file"
+    elif [ -f "$claude_md" ]; then
+        if grep -q '# --- DANGER GUARDRAILS START ---' "$claude_md" 2>/dev/null; then
+            local start_marker="# --- DANGER GUARDRAILS START ---"
+            local end_marker="# --- DANGER GUARDRAILS END ---"
+            sed "/$start_marker/,/$end_marker/d" "$claude_md" > "${claude_md}.tmp"
+            if [ -s "${claude_md}.tmp" ]; then
+                mv "${claude_md}.tmp" "$claude_md"
+            else
+                rm -f "$claude_md" "${claude_md}.tmp"
+            fi
+            printf 'Removed danger guardrails from CLAUDE.md\n'
+        else
+            printf 'CLAUDE.md has no danger guardrails — leaving untouched\n'
+        fi
+    else
+        printf 'No CLAUDE.md found\n'
+    fi
+}
+
+# ── Aliases ────────────────────────────────────────────────────────────────
+cz()             { _cz_launch "$@"; }
+cz-new()         { _cz_launch "$@"; }
+cz-danger()      { _cz_launch_danger "$@"; }
+cz-cloud()       { _cz_cloud_launch "$@"; }
+ccz()            { local b; b="$(_cz_find_claude)" || return 1; "$b" --continue "$@"; }
+cz-model()       { _cz_model_pick "$@"; }
+cz-model-current() { _cz_model_current "$@"; }
+cz-proxy-start() { cz_proxy_start "$@"; }
+cz-proxy-stop()  { cz_proxy_stop "$@"; }
+cz-proxy-status(){ cz_proxy_status "$@"; }
+cz-undo-danger() { _cz_uninstall_danger_rules "$@"; }
+
+cz-help() {
+    cat << 'HELPEOF'
+Claude Zen — Claude Code through OpenCode Zen (or any OpenAI-compatible API)
+
+USAGE:
+  cz / cz-new           Pick a model, launch Claude Code through the proxy
+  cz-danger             Same, with auto-accept permissions (--dangerously-skip-permissions)
+  cz-cloud              Launch Claude Code directly (Anthropic cloud, no proxy)
+  ccz                   Resume most recent Claude Code session
+
+MODEL:
+  cz-model              Change the upstream model (interactive picker)
+  cz-model-current      Show currently selected model
+
+PROXY:
+  cz-proxy-start        Start the translation proxy as a background daemon
+  cz-proxy-stop         Stop the proxy daemon
+  cz-proxy-status       Check if the proxy is running
+
+OTHER:
+  cz-undo-danger        Remove danger-mode guardrails from CLAUDE.md
+  cz-help               Show this help
+
+HOW IT WORKS:
+  claude CLI ──Anthropic API──► zen-proxy (:4041) ──chat/completions──► OpenCode Zen
+
+  The proxy translates between Claude Code's Anthropic Messages API and
+  OpenAI-compatible chat completions. You can use free models without an
+  API key, or set UPSTREAM_API_KEY in .env.zen for paid models.
+
+  Config file: .claude_zen/.env.zen
+  Proxy repo:  .claude_zen/repo/
+  Statusline:  .claude_zen/statusline.sh (wired via zen-claude-settings.json)
+
+HELPEOF
+}
+
+__MARKER_END__
+WRAPEOF
+}
+
 _install_shell_wrappers
+
+# ─── 6.5. Statusline integration ────────────────────────────────────────────
+printf '\n%s\n' "=== Step 6.5: Statusline integration ==="
+# The workspace ships with a rich statusline script (model, context usage,
+# git branch, cost, cache hit rate). Wire it into Claude Code's settings so
+# it shows in the terminal status panel for every zen session.
+
+# jq (JSON parsing) and bc (arithmetic) are required by statusline.sh
+for _tool in jq bc; do
+    if have "$_tool"; then
+        printf '  %s: found\n' "$_tool"
+    else
+        printf '  Installing %s (required by statusline)...\n' "$_tool"
+        if have apt-get; then
+            sudo apt-get install -y "$_tool" 2>/dev/null || apt-get install -y "$_tool" 2>/dev/null || {
+                printf '  Warning: could not install %s. Statusline will not render fully.\n' "$_tool" >&2
+            }
+        else
+            printf '  Warning: %s not found. Statusline will not render fully.\n' "$_tool" >&2
+        fi
+    fi
+done
+
+# Copy statusline.sh into the persistence dir so it survives rebuilds.
+# Source lookup order:
+#   1. .claude_zen/statusline.sh        (already installed — idempotent)
+#   2. ./statusline.sh                  (kept next to this script — portable)
+#   3. <workspace>/.claude/statusline.sh  (this devcontainer's copy)
+#   4. ~/.claude/statusline.sh          (home copy)
+if [ -f "${STATUSLINE_SCRIPT}" ]; then
+    chmod +x "${STATUSLINE_SCRIPT}" 2>/dev/null || true
+    printf '  Statusline already installed: %s\n' "${STATUSLINE_SCRIPT}"
+elif [ -f "${SCRIPT_DIR}/statusline.sh" ]; then
+    cp "${SCRIPT_DIR}/statusline.sh" "${STATUSLINE_SCRIPT}"
+    chmod +x "${STATUSLINE_SCRIPT}"
+    printf '  Copied statusline: %s -> %s\n' "${SCRIPT_DIR}/statusline.sh" "${STATUSLINE_SCRIPT}"
+elif [ -f "${STATUSLINE_SOURCE}" ]; then
+    cp "${STATUSLINE_SOURCE}" "${STATUSLINE_SCRIPT}"
+    chmod +x "${STATUSLINE_SCRIPT}"
+    printf '  Copied statusline: %s -> %s\n' "${STATUSLINE_SOURCE}" "${STATUSLINE_SCRIPT}"
+elif [ -f "${HOME}/.claude/statusline.sh" ]; then
+    cp "${HOME}/.claude/statusline.sh" "${STATUSLINE_SCRIPT}"
+    chmod +x "${STATUSLINE_SCRIPT}"
+    printf '  Copied statusline from %s\n' "${HOME}/.claude/statusline.sh"
+else
+    printf '  Warning: no statusline.sh found. Creating placeholder.\n' >&2
+    cat > "${STATUSLINE_SCRIPT}" << 'SL'
+#!/bin/bash
+# Placeholder statusline - drop your own at .claude_zen/statusline.sh
+input=$(cat)
+model=$(echo "$input" | jq -r '.model.display_name // "claude"' 2>/dev/null)
+printf "🤖 %s\n" "$model"
+SL
+    chmod +x "${STATUSLINE_SCRIPT}"
+fi
+
+# Build a workspace copy of the settings file (repo's zen-claude-settings.json
+# + statusLine). Do NOT edit the repo copy - a git pull would wipe it.
+if [ -f "${REPO_DIR}/zen-claude-settings.json" ]; then
+    python3 - "${REPO_DIR}/zen-claude-settings.json" "${SETTINGS_FILE}" "${STATUSLINE_SCRIPT}" << 'PY'
+import json, sys
+src, dst, statusline = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src) as f:
+    data = json.load(f)
+data.setdefault("statusLine", {})["type"] = "command"
+data["statusLine"]["command"] = f"bash {statusline}"
+# Bump context_window to match large upstream models (e.g. DeepSeek V4)
+with open(dst, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print(f"  Created {dst} (with statusLine)")
+PY
+else
+    cat > "${SETTINGS_FILE}" << JSONEOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:${PROXY_PORT}",
+    "ANTHROPIC_MODEL": "claude-code-proxy",
+    "ANTHROPIC_API_KEY": "claude-zen-local-key",
+    "ENABLE_TOOL_SEARCH": "true"
+  },
+  "model": "claude-code-proxy",
+  "modelSettings": {
+    "thinking": { "enabled": true, "budgetTokens": 8192 },
+    "max_tokens": 32000,
+    "context_window": 1000000,
+    "temperature": 0.2,
+    "top_p": 0.95
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash ${STATUSLINE_SCRIPT}"
+  }
+}
+JSONEOF
+    printf '  Created %s (fallback, with statusLine)\n' "${SETTINGS_FILE}"
+fi
 
 # ─── 7. Claude Code persistence (survives devcontainer rebuild) ─────────────
 printf '\n%s\n' "=== Step 7: Claude Code persistence ==="
-# The home directory (overlay) is wiped on devcontainer rebuild, but /workspace
-# (host-mounted volume) persists. We migrate Claude Code's entire ~/.claude/
-# config directory to the workspace and symlink it back, then also link the
-# .ai_memory/ research files into the per-project memory slot.
-
 CLAUDE_PERSIST_DIR="${SCRIPT_DIR}/.claude_persist"
 CLAUDE_MEMORY_DIR="${SCRIPT_DIR}/.ai_memory"
-# Always create both target dirs before ANY symlink or path-through-symlink
-# mkdir calls. A dangling symlink (target dir missing) causes two failures:
-#   1. Claude Code: ENOENT when creating jobs/sessions dirs under ~/.claude
-#   2. mkdir -p on step 7b: "File exists" (can't traverse dangling symlink)
 mkdir -p "${CLAUDE_PERSIST_DIR}"
 mkdir -p "${CLAUDE_MEMORY_DIR}"
 
-# ── 7a. Migrate ~/.claude → workspace ──────────────────────────────────────
+# Migrate ~/.claude -> workspace
 if [ -L "${HOME}/.claude" ]; then
     CURRENT_TARGET="$(readlink "${HOME}/.claude")"
     if [ "${CURRENT_TARGET}" = "${CLAUDE_PERSIST_DIR}" ]; then
-        printf '  ~/.claude already symlinked to workspace: %s\n' "${CLAUDE_PERSIST_DIR}"
-else
-        # Symlink points somewhere else (e.g. .claude_config/dot-claude from
-        # an older ollama setup). Migrate data if the old target has content
-        # and our persist dir is empty, then re-point to .claude_persist.
-        printf '  ~/.claude was pointing to: %s — re-linking to %s\n' "${CURRENT_TARGET}" "${CLAUDE_PERSIST_DIR}"
+        printf '  ~/.claude already symlinked to workspace\n'
+    else
+        printf '  Re-linking ~/.claude from %s to %s\n' "${CURRENT_TARGET}" "${CLAUDE_PERSIST_DIR}"
         if [ -d "${CURRENT_TARGET}" ] && [ -z "$(ls -A "${CLAUDE_PERSIST_DIR}" 2>/dev/null)" ]; then
-            printf '  Migrating Claude data...\n'
             cp -a "${CURRENT_TARGET}/." "${CLAUDE_PERSIST_DIR}/"
         fi
         rm -f "${HOME}/.claude"
         ln -sfn "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
-        printf '  Done: ~/.claude -> %s\n' "${CLAUDE_PERSIST_DIR}"
     fi
 elif [ -d "${HOME}/.claude" ]; then
     if [ -z "$(ls -A "${HOME}/.claude" 2>/dev/null)" ]; then
         rm -rf "${HOME}/.claude"
-else
-        printf '  Migrating ~/.claude to %s ...\n' "${CLAUDE_PERSIST_DIR}"
+    else
+        printf '  Migrating ~/.claude to workspace...\n'
         cp -a "${HOME}/.claude/." "${CLAUDE_PERSIST_DIR}/" && rm -rf "${HOME}/.claude"
-        printf '  Done.\n'
     fi
     ln -sfn "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
-    printf '  Done: ~/.claude -> %s\n' "${CLAUDE_PERSIST_DIR}"
 else
-    # ~/.claude doesn't exist yet; create the symlink so future runs store data
-    # in the workspace. Claude Code will create the directory structure on first use.
     ln -sfn "${CLAUDE_PERSIST_DIR}" "${HOME}/.claude"
-    printf '  Created: ~/.claude -> %s (empty, populated on first Claude launch)\n' "${CLAUDE_PERSIST_DIR}"
+    printf '  Created: ~/.claude -> %s (populated on first launch)\n' "${CLAUDE_PERSIST_DIR}"
 fi
 
-# ── 7b. Symlink per-project memory into .ai_memory ──────────────────────────
-# Claude Code stores memory at $HOME/.claude/projects/<workspace-slug>/memory/
-# The slug is the absolute workspace path with '/' replaced by '-'
-# e.g. /workspace -> -workspace
+# Symlink per-project memory
 WORKSPACE_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || realpath "${SCRIPT_DIR}")"
 WORKSPACE_SLUG="$(echo "${WORKSPACE_ROOT}" | tr '/' '-')"
 CLAUDE_MEMORY_LINK="${HOME}/.claude/projects/${WORKSPACE_SLUG}/memory"
-
 mkdir -p "$(dirname "${CLAUDE_MEMORY_LINK}")"
 if [ -e "${CLAUDE_MEMORY_LINK}" ] && [ ! -L "${CLAUDE_MEMORY_LINK}" ]; then
     printf '  WARNING: %s exists and is not a symlink. Skipping.\n' "${CLAUDE_MEMORY_LINK}"
 elif [ -L "${CLAUDE_MEMORY_LINK}" ]; then
     ln -sfn "${CLAUDE_MEMORY_DIR}" "${CLAUDE_MEMORY_LINK}"
-    printf '  Updated memory symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_DIR}"
 else
     ln -s "${CLAUDE_MEMORY_DIR}" "${CLAUDE_MEMORY_LINK}"
-    printf '  Created memory symlink: %s -> %s\n' "${CLAUDE_MEMORY_LINK}" "${CLAUDE_MEMORY_DIR}"
+    printf '  Created memory symlink\n'
 fi
 
-# ─── 8. Verify ────────────────────────────────────────────────────────────────
-printf '\n%s\n' "=== Step 8: Smoke test ==="
-if "${PROXY_VENV}/bin/python3" -c "
-import sys; sys.path.insert(0, '${PERSISTENCE_DIR}')
-from proxy import app
-print('  Proxy module: OK')
-" 2>&1; then
-    printf '  Proxy module loaded OK\n'
+# ─── 8. Smoke test ──────────────────────────────────────────────────────────
+printf '\n%s\n' "=== Step 8: Verification ==="
+if [ -f "${REPO_DIR}/src/server.js" ]; then
+    printf '  Proxy source: OK\n'
 else
-    printf '  Warning: smoke test failed (proxy module may have syntax errors)\n'
+    printf '  Warning: proxy source missing at %s/src/server.js\n' "${REPO_DIR}"
 fi
 
-# ─── 8.5. VS Code tasks ───────────────────────────────────────────────
-update_vscode_tasks() {
-    printf '  Updating VS Code tasks...\n'
-    local tasks_file="${SCRIPT_DIR}/.vscode/tasks.json"
-    mkdir -p "${SCRIPT_DIR}/.vscode"
-    if [ ! -f "$tasks_file" ]; then
-        printf '{"version": "2.0.0", "tasks": []}' > "$tasks_file"
-    fi
-
-    python3 - "$tasks_file" << 'PY'
-import json, sys
-tasks_file = sys.argv[1]
-with open(tasks_file, 'r') as f:
-    data = json.load(f)
-
-new_tasks = [
-    {"label": "Claude Zen (cz)", "type": "shell", "command": "bash -ic 'cz'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen New (cz-new)", "type": "shell", "command": "bash -ic 'cz-new'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Danger (cz-danger)", "type": "shell", "command": "bash -ic 'cz-danger'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Cloud (cz-cloud)", "type": "shell", "command": "bash -ic 'cz-cloud'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Continue (ccz)", "type": "shell", "command": "bash -ic 'ccz'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Last (cz-last)", "type": "shell", "command": "bash -ic 'cz-last'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Recent (cz-recent)", "type": "shell", "command": "bash -ic 'cz-recent'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Danger Last (cz-danger-last)", "type": "shell", "command": "bash -ic 'cz-danger-last'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Danger Recent (cz-danger-recent)", "type": "shell", "command": "bash -ic 'cz-danger-recent'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Model (cz-model)", "type": "shell", "command": "bash -ic 'cz-model'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Proxy Start (cz-proxy-start)", "type": "shell", "command": "bash -ic 'cz-proxy-start'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Proxy Stop (cz-proxy-stop)", "type": "shell", "command": "bash -ic 'cz-proxy-stop'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Proxy Status (cz-proxy-status)", "type": "shell", "command": "bash -ic 'cz-proxy-status'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Proxy Restart (cz-proxy-restart)", "type": "shell", "command": "bash -ic 'cz-proxy-restart'", "problemMatcher": [], "group": "build"},
-    {"label": "Claude Zen Fresh Key (cz-fresh-key)", "type": "shell", "command": "bash -ic 'cz-fresh-key'", "problemMatcher": [], "group": "build"},
-]
-
-existing_tasks = {t["label"]: t for t in data.get("tasks", [])}
-for nt in new_tasks:
-    existing_tasks[nt["label"]] = nt
-
-data["tasks"] = list(existing_tasks.values())
-with open(tasks_file, 'w') as f:
-    json.dump(data, f, indent=2)
-PY
-    printf '  Done.\n'
-}
-
-update_vscode_tasks
-
-# ── Kill stale proxy daemon (may be poisoned with old ZEN_API_KEY from env) ──
-printf '  Killing stale proxy process(es) on port %s...\n' "${PROXY_PORT}"
-stale_pids="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
-if [ -n "$stale_pids" ]; then
-    kill $stale_pids 2>/dev/null || true
-    sleep 1
-    remaining="$(pgrep -f "proxy\.py.*--port ${PROXY_PORT}" 2>/dev/null || true)"
-    if [ -n "$remaining" ]; then
-        kill -9 $remaining 2>/dev/null || true
-        sleep 1
-    fi
-    printf '  Done.\n'
+if [ -f "${REPO_DIR}/node_modules/.package-lock.json" ] || [ -d "${REPO_DIR}/node_modules" ]; then
+    printf '  npm dependencies: installed\n'
 else
-    printf '  None running.\n'
+    printf '  Warning: npm dependencies may not be installed\n'
 fi
-rm -f "${PID_FILE}"
 
-# ─── 9. Summary ───────────────────────────────────────────────────────────────
+# Quick proxy start/stop test
+printf '  Starting proxy for smoke test...\n'
+(
+    set -a
+    source "${ENV_FILE}" 2>/dev/null || true
+    set +a
+    cd "${REPO_DIR}"
+    node src/server.js >> "${LOG_FILE}" 2>&1 &
+    _smoke_pid=$!
+    sleep 3
+    if kill -0 "$_smoke_pid" 2>/dev/null; then
+        _health="$(curl -s -H "x-api-key: ${PROXY_API_KEY:-claude-zen-local-key}" "http://127.0.0.1:${PROXY_PORT}/health" 2>/dev/null || true)"
+        if echo "$_health" | grep -q "healthy\|ok"; then
+            printf '  Smoke test: PASSED (%s)\n' "$_health"
+        else
+            printf '  Smoke test: proxy started, health: %s\n' "$_health"
+        fi
+    else
+        printf '  Smoke test: proxy failed to start. Check %s\n' "${LOG_FILE}"
+    fi
+    kill "$_smoke_pid" 2>/dev/null || true
+    wait "$_smoke_pid" 2>/dev/null || true
+)
+
+# ─── 9. Summary ──────────────────────────────────────────────────────────────
 SHELL_RC=".bashrc"; case "${SHELL:-}" in *zsh) SHELL_RC=".zshrc" ;; esac
 
 cat << SUMMARY
 
- Setup complete
+  Setup complete!
 
-  Persistence:  ${PERSISTENCE_DIR}
-  Backends:     ${BACKENDS_FILE}
+  Config:       ${ENV_FILE}
+  Proxy repo:   ${REPO_DIR}
   Proxy port:   ${PROXY_PORT}
+  Settings:     ${SETTINGS_FILE} (wired to statusline)
+  Statusline:   ${STATUSLINE_SCRIPT}
   Claude home:  ${CLAUDE_PERSIST_DIR} (symlinked to ~/.claude)
-  Memory files: ${CLAUDE_MEMORY_DIR}
-  Memory link:  ${CLAUDE_MEMORY_LINK}
+  Memory:       ${CLAUDE_MEMORY_DIR}
 
   Activate:     source ~/${SHELL_RC}
 
-  Commands:
-    cz                  Pick a model -> launch Claude CLI (fresh session)
-    cz-last             Continue the most recent conversation (quick resume)
-    cz-danger-last      Same as cz-last but with auto-accept permissions
-    cz-recent           List all recent sessions -> pick any to resume
-    cz-danger-recent    Same as cz-recent but with auto-accept permissions
-    cz-resume <id>      Resume a specific session by ID prefix
-    cz-danger-resume <id>  Same as cz-resume but with auto-accept permissions
-    cz-danger           Pick a model -> launch (auto-accept permissions)
-    cz-model            Pick a model (no launch)
-    cz-model-current    Show current model (provider + model name)
-    cz-proxy-start      Start the proxy daemon
-    cz-proxy-stop       Stop it
-    cz-proxy-status     Check if running
-    cz-proxy-restart    Force-kill and restart the proxy
-    cz-fresh-key        Clear stored key and restart anonymous session
-    cz-undo-danger      Remove danger guardrails from workspace CLAUDE.md
+  Quick start:
+    cz                  Pick a model -> launch Claude Code through proxy
+    cz-danger           Same, with auto-accept permissions
+    cz-model            Change the model
 
-  Coexistence with ollama setup (setup_claude_ollama_local_in_devcontainer.sh):
-    cz and 'c' share the same ~/.claude -> .claule_persist/ for session history.
-    Run them in separate windows to use different models, same sessions.
-    Do NOT run them concurrently — shared state files can corrupt under simultaneous writes.
+  Other commands:
+    ccz                 Resume most recent session
+    cz-cloud            Use Anthropic cloud directly (no proxy)
+    cz-proxy-start      Start proxy daemon (auto-started on cz launch)
+    cz-proxy-stop       Stop proxy daemon
+    cz-proxy-status     Check proxy status
+    cz-model-current    Show current model
+    cz-undo-danger      Remove danger guardrails from CLAUDE.md
+    cz-help             Show all commands
 
-  Session persistence is handled automatically by the script.  All chats
-  are stored in .claude_persist/ which survives devcontainer rebuilds.
-  Use cz-last, cz-recent, or their -danger counterparts to pick up where
-  you left off.
+  Model:         $(sed -n 's/^UPSTREAM_MODEL=//p' "${ENV_FILE}" 2>/dev/null | head -1)
+  API key:       $(if grep -q '^UPSTREAM_API_KEY=.' "${ENV_FILE}" 2>/dev/null; then echo "configured"; else echo "not set (free models only)"; fi)
 
-  Models dynamically discovered from: OpenCode Zen (free+paid), Groq, Google (Gemini), OpenRouter
-  API keys are auto-prompted and stored in api_keys.json (one-time setup per provider)
-  Edit backends.json to customize:
-    ${BACKENDS_FILE}
+  To change models:
+    cz-model             Interactive picker
+    Edit: ${ENV_FILE}
+
+  Free models require no API key. Set UPSTREAM_API_KEY in .env.zen for
+  paid models (Claude, GPT, Gemini, etc.). Get a key at https://opencode.ai
+
+  Statusline (model / context % / git / cost) is wired automatically into
+  every cz / cz-danger session via ${SETTINGS_FILE}.
+  Customize it:  ${STATUSLINE_SCRIPT}
+  For portability, keep a copy of statusline.sh next to this setup script.
 
 SUMMARY
