@@ -31,3 +31,14 @@
   quota; retest with a fresh IP/quota window.
 - `[claude-code:unrecognized_model]` is cosmetic; could add modelOverrides to
   fully silence per-session.
+- [x] Post-rebuild hardening round:
+      - cz-model now lists paid models FIRST, free models LAST (custom last).
+      - Self-heal claude native binary: `_cz_ensure_claude_native` runs
+        install.cjs when --version reports "native binary not installed"
+        (fresh-rebuild failure: `Error: claude native binary not installed`).
+      - cz-model model change now always (re)starts the proxy (previously only
+        when a stale pidfile existed -> proxy left stopped).
+      - _cz_ensure_proxy now polls the /health endpoint up to ~12s instead of
+        a fixed 2s sleep -> no more spurious “proxy may not have started”.
+      - Setup script: Node fallback bumped setup_20.x -> setup_22.x (Node 20
+        EOL), added claude postinstall repair step after install.

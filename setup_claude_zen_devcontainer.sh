@@ -116,22 +116,22 @@ if have node; then
     # Check major version >= 20
     NODE_MAJOR="${NODE_VER#v}"
     NODE_MAJOR="${NODE_MAJOR%%.*}"
-    if [ "${NODE_MAJOR}" -lt 20 ] 2>/dev/null; then
+    if [ "${NODE_MAJOR}" -lt 22 ] 2>/dev/null; then
         printf '  Warning: Node.js %s found but 20+ is required. Attempting upgrade...\n' "${NODE_VER}" >&2
         if have nvm; then
-            nvm install 20
+            nvm install 22
         elif have apt-get; then
-            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
+            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - 2>/dev/null
             sudo apt-get install -y nodejs 2>/dev/null
         fi
     fi
 else
-    printf '  Installing Node.js 20...\n'
+    printf '  Installing Node.js 22 LTS...\n'
     if have curl; then
-        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - 2>/dev/null
         sudo apt-get install -y nodejs 2>/dev/null
     else
-        printf '  Error: curl not found. Install Node.js 20+ manually.\n' >&2
+        printf '  Error: curl not found. Install Node.js 22+ manually.\n' >&2
         exit 1
     fi
     if ! have node; then
@@ -159,6 +159,18 @@ else
     else
         printf '  Warning: claude not in PATH yet. It may be at %s/bin/claude\n' "${NPM_GLOBAL_DIR}"
         printf '  Restart your shell or run: export PATH="%s/bin:\${PATH}"\n' "${NPM_GLOBAL_DIR}"
+    fi
+fi
+
+# Ensure claude's native binary is present (npm postinstall can be skipped
+# with --ignore-scripts / --omit=optional on fresh installs)
+if have claude && ! claude --version >/dev/null 2>&1; then
+    PKG_DIR="${NPM_GLOBAL_DIR}/lib/node_modules/@anthropic-ai/claude-code"
+    if [ -f "${PKG_DIR}/install.cjs" ]; then
+        printf '  Running claude postinstall to fetch native binary...\n'
+        ( cd "${PKG_DIR}" && node install.cjs ) 2>&1 | tail -3
+    else
+        printf '  Warning: cannot locate claude install.cjs at %s\n' "${PKG_DIR}" >&2
     fi
 fi
 
@@ -290,7 +302,7 @@ export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 unalias cz cz-new cz-cloud cz-danger ccz cz-model cz-model-current \
        cz-proxy-start cz-proxy-stop cz-proxy-status cz-test-free-models \
        cz-undo-danger 2>/dev/null || true
-unset -f cz cz_new ccz _cz_find_claude _cz_ensure_proxy \
+unset -f cz cz_new ccz _cz_find_claude _cz_ensure_claude_native _cz_ensure_proxy \
           _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
           _cz_test_free_models \
           _cz_zen_models_endpoint _cz_fetch_zen_models _cz_fetch_free_models \
@@ -314,6 +326,46 @@ _cz_find_claude() {
     [ -n "$cmd" ] && { echo "$cmd"; return 0; }
     printf '\nError: claude not found. Install with:\n  npm install -g @anthropic-ai/claude-code\n\n' >&2
     return 1
+}
+
+# ── Ensure claude native binary exists (self-heal skipped postinstall) ─────
+# On fresh installs the npm postinstall can be skipped (--ignore-scripts,
+# --omit=optional, interrupted download); detect it and run install.cjs.
+_cz_ensure_claude_native() {
+    local claude_bin vres bin_dir pkgdir pkg
+    claude_bin="$(_cz_find_claude)" || return 1
+    vres="$("$claude_bin" --version 2>&1 || true)"
+    case "$vres" in
+        *"native binary not installed"*)
+            bin_dir="$(cd "$(dirname "$claude_bin")" 2>/dev/null && pwd || true)"
+            pkgdir=""
+            for pkg in \
+                "${bin_dir%%/bin}/lib/node_modules/@anthropic-ai/claude-code" \
+                "$(dirname "$claude_bin")/../node_modules/@anthropic-ai/claude-code"; do
+                if [ -f "${pkg}/install.cjs" ]; then
+                    pkgdir="$pkg"
+                    break
+                fi
+            done
+            if [ -z "$pkgdir" ]; then
+                printf '\n  Error: claude native binary missing and install.cjs not found.\n' >&2
+                printf '  Reinstall with: npm install -g @anthropic-ai/claude-code\n\n' >&2
+                return 1
+            fi
+            printf '  claude native binary missing; running postinstall...\n' >&2
+            ( cd "$pkgdir" && node install.cjs ) >/dev/null 2>&1
+            vres="$("$claude_bin" --version 2>&1 || true)"
+            case "$vres" in
+                *"native binary not installed"*)
+                    printf '\n  Error: claude postinstall failed.\n' >&2
+                    printf '  Run manually:   node %s/install.cjs\n\n' "$pkgdir" >&2
+                    return 1
+                    ;;
+            esac
+            printf '  claude native binary restored (postinstall run).\n' >&2
+            ;;
+    esac
+    return 0
 }
 
 # ── Ensure proxy is running ────────────────────────────────────────────────
@@ -360,13 +412,31 @@ _cz_ensure_proxy() {
     setsid nohup node src/server.js >> "$logf" 2>&1 < /dev/null &
     echo $! > "$pidf"
     disown 2>/dev/null || true
-    sleep 2
 
-    # Verify it started
-    if kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
-        printf '  Proxy started (PID %s)\n' "$(cat "$pidf")"
-        return 0
-    fi
+    # Wait for the /health endpoint so we never report a false failure
+    local key ncode tries
+    key="${PROXY_API_KEY:-claude-zen-local-key}"
+    tries=0
+    printf '  Waiting for proxy readiness'
+    while [ "$tries" -lt 12 ]; do
+        ncode="$(curl -s -m 2 -o /dev/null -w '%{http_code}' \
+            -H "x-api-key: ${key}" \
+            "http://127.0.0.1:${port}/health" 2>/dev/null || true)"
+        if [ "$ncode" = "200" ]; then
+            printf ' OK\n'
+            if [ -s "$pidf" ]; then
+                printf '  Proxy started (PID %s)\n' "$(cat "$pidf")"
+            fi
+            return 0
+        fi
+        if ! kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
+            break
+        fi
+        printf '.'
+        sleep 1
+        tries=$((tries + 1))
+    done
+    printf ' FAILED\n' >&2
     rm -f "$pidf"
     printf '\n  Warning: proxy may not have started. Check %s\n' "$logf" >&2
     return 1
@@ -397,6 +467,7 @@ _cz_launch() {
     local model_alias="${ANTHROPIC_MODEL_ALIAS:-claude-code-proxy}"
 
     _cz_ensure_proxy || true
+    _cz_ensure_claude_native || return 1
     local claude_bin
     claude_bin="$(_cz_find_claude)" || return 1
 
@@ -432,6 +503,7 @@ _cz_launch_danger() {
     local port="${ZEN_PORT:-__PROXY_PORT__}"
 
     _cz_ensure_proxy || true
+    _cz_ensure_claude_native || return 1
     local claude_bin
     claude_bin="$(_cz_find_claude)" || return 1
 
@@ -451,6 +523,7 @@ _cz_launch_danger() {
 
 # ── Cloud launch (direct Anthropic, no proxy) ─────────────────────────────
 _cz_cloud_launch() {
+    _cz_ensure_claude_native || return 1
     local b; b="$(_cz_find_claude)" || return 1
     "$b" "$@"
 }
@@ -536,36 +609,36 @@ _cz_model_pick() {
     grep -xE 'big-pickle|[a-zA-Z0-9._+-]+-free' "$all_list" > "$free_list"
     grep -vxE 'big-pickle|[a-zA-Z0-9._+-]+-free' "$all_list" > "$paid_list"
 
-    local free_count paid_count n paid_start custom_num choice new_model idx pid pidf m
+    local free_count paid_count n free_start custom_num choice new_model idx pid pidf m
     free_count="$(wc -l < "$free_list" | tr -d ' ')"
     paid_count="$(wc -l < "$paid_list" | tr -d ' ')"
-    paid_start=$((free_count + 1))
+    free_start=$((paid_count + 1))
     custom_num=$((free_count + paid_count + 1))
 
     printf '\n'
     printf '  Current model: %s\n' "$current_model"
     printf '  Tip: run cz-test-free-models to see which free models respond right now.\n'
     printf '\n'
-    if [ "$free_count" -gt 0 ]; then
-        printf '  Free models (no API key needed):\n'
+    if [ "$paid_count" -gt 0 ]; then
+        printf '  Paid models (requires UPSTREAM_API_KEY in .env.zen):\n'
         n=0
         while IFS= read -r m; do
             n=$((n + 1))
             printf '  %2d) %s\n' "$n" "$m"
-        done < "$free_list"
-    else
-        printf '  (No free models found upstream)\n'
-    fi
-    printf '\n'
-    if [ "$paid_count" -gt 0 ]; then
-        printf '  Paid models (requires UPSTREAM_API_KEY in .env.zen):\n'
-        n=$paid_start
-        while IFS= read -r m; do
-            printf '  %2d) %s\n' "$n" "$m"
-            n=$((n + 1))
         done < "$paid_list"
     else
         printf '  (No paid models found upstream)\n'
+    fi
+    printf '\n'
+    if [ "$free_count" -gt 0 ]; then
+        printf '  Free models (no API key needed):\n'
+        n=$free_start
+        while IFS= read -r m; do
+            printf '  %2d) %s\n' "$n" "$m"
+            n=$((n + 1))
+        done < "$free_list"
+    else
+        printf '  (No free models found upstream)\n'
     fi
     printf '\n'
     printf '  %2d) Enter custom model name\n' "$custom_num"
@@ -586,11 +659,11 @@ _cz_model_pick() {
     fi
 
     if printf '%s' "$choice" | grep -qE '^[0-9]+$'; then
-        if [ "$choice" -ge 1 ] && [ "$choice" -le "$free_count" ]; then
-            new_model="$(sed -n "${choice}p" "$free_list")"
-        elif [ "$choice" -ge "$paid_start" ] && [ "$choice" -lt "$custom_num" ]; then
-            idx=$((choice - paid_start + 1))
-            new_model="$(sed -n "${idx}p" "$paid_list")"
+        if [ "$choice" -ge 1 ] && [ "$choice" -le "$paid_count" ]; then
+            new_model="$(sed -n "${choice}p" "$paid_list")"
+        elif [ "$choice" -ge "$free_start" ] && [ "$choice" -lt "$custom_num" ]; then
+            idx=$((choice - free_start + 1))
+            new_model="$(sed -n "${idx}p" "$free_list")"
         elif [ "$choice" -eq "$custom_num" ]; then
             printf '  Enter model name: '
             if [ -t 0 ]; then
@@ -613,7 +686,8 @@ _cz_model_pick() {
         sed -i "s|^UPSTREAM_MODEL=.*|UPSTREAM_MODEL=${new_model}|" "$env_file"
         printf '  Model set to: %s\n' "$new_model"
 
-        # Restart proxy if running to pick up the change
+        # (Re)start the proxy so the new model is live immediately, whether
+        # the proxy is currently running or stopped.
         pidf="__PERSISTENCE_DIR__/proxy.pid"
         if [ -f "$pidf" ]; then
             pid=$(cat "$pidf" 2>/dev/null || true)
@@ -621,13 +695,10 @@ _cz_model_pick() {
                 printf '  Restarting proxy to apply model change...\n'
                 kill "$pid" 2>/dev/null || true
                 sleep 1
-                rm -f "$pidf"
-                _cz_ensure_proxy || true
-            else
-                rm -f "$pidf"
-                _cz_ensure_proxy || true
             fi
         fi
+        rm -f "$pidf"
+        _cz_ensure_proxy || true
     fi
     rm -f "$all_list" "$free_list" "$paid_list"
 }
