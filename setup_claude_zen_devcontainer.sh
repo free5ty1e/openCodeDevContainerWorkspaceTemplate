@@ -32,6 +32,7 @@
 #   ccz             Continue most recent Claude Code session
 #   cz-model        Change the upstream model (edits .env.zen)
 #   cz-model-current Show current model
+#   cz-test-free-models  Ping every free model to see which respond vs rate-limit
 #   cz-proxy-start  Start the proxy as a background daemon
 #   cz-proxy-stop   Stop the daemon
 #   cz-proxy-status Check if the proxy is running
@@ -225,7 +226,7 @@ else
 UPSTREAM_API_KEY=${READ_KEY}
 
 # Model to use (change this to switch models)
-UPSTREAM_MODEL=deepseek-v4-flash-free
+UPSTREAM_MODEL=hy3-free
 
 # Upstream endpoint
 UPSTREAM_CHAT_COMPLETIONS_URL=https://opencode.ai/zen/v1/chat/completions
@@ -275,7 +276,7 @@ PY
 }
 
 _wrapper_block() {
-    cat << WRAPEOF | sed \
+    cat << 'WRAPEOF' | sed \
         -e "s|__MARKER_BEGIN__|${MARKER_BEGIN}|g" \
         -e "s|__MARKER_END__|${MARKER_END}|g" \
         -e "s|__PERSISTENCE_DIR__|${PERSISTENCE_DIR}|g" \
@@ -287,9 +288,11 @@ __MARKER_BEGIN__
 export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
 unalias cz cz-new cz-cloud cz-danger ccz cz-model cz-model-current \
-       cz-proxy-start cz-proxy-stop cz-proxy-status cz-undo-danger 2>/dev/null || true
+       cz-proxy-start cz-proxy-stop cz-proxy-status cz-test-free-models \
+       cz-undo-danger 2>/dev/null || true
 unset -f cz cz_new ccz _cz_find_claude _cz_ensure_proxy \
          _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
+         _cz_test_free_models \
          cz_proxy_start cz_proxy_stop cz_proxy_status 2>/dev/null || true
 
 # ── Find the claude binary ─────────────────────────────────────────────────
@@ -353,9 +356,9 @@ _cz_ensure_proxy() {
     set -a
     source "$env_file"
     set +a
-    node src/server.js >> "$logf" 2>&1 &
+    setsid nohup node src/server.js >> "$logf" 2>&1 < /dev/null &
     echo $! > "$pidf"
-    set +a
+    disown 2>/dev/null || true
     sleep 2
 
     # Verify it started
@@ -363,6 +366,7 @@ _cz_ensure_proxy() {
         printf '  Proxy started (PID %s)\n' "$(cat "$pidf")"
         return 0
     fi
+    rm -f "$pidf"
     printf '\n  Warning: proxy may not have started. Check %s\n' "$logf" >&2
     return 1
 }
@@ -461,33 +465,36 @@ _cz_model_pick() {
 
     local current_model
     current_model="$(sed -n 's/^UPSTREAM_MODEL=//p' "$env_file" 2>/dev/null | head -1)"
-    [ -z "$current_model" ] && current_model="deepseek-v4-flash-free"
+    [ -z "$current_model" ] && current_model="hy3-free"
 
     printf '\n'
     printf '  Current model: %s\n' "$current_model"
+    printf '  Tip: run cz-test-free-models to see which free models respond right now.\n'
     printf '\n'
     printf '  Free models (no API key needed):\n'
-    printf '    1) deepseek-v4-flash-free\n'
+    printf '    1) hy3-free\n'
     printf '    2) big-pickle\n'
-    printf '    3) minimax-m2.5-free\n'
-    printf '    4) nemotron-3-super-free\n'
-    printf '    5) north-mini-code-free\n'
-    printf '    6) hy3-preview-free\n'
-    printf '    7) ling-2.6-flash\n'
+    printf '    3) laguna-s-2.1-free\n'
+    printf '    4) deepseek-v4-flash-free\n'
+    printf '    5) muse-spark-1.2-contributor-free\n'
+    printf '    6) mimo-v2.5-free\n'
+    printf '    7) nemotron-3-ultra-free\n'
+    printf '    8) nemotron-3.5-lightning-free\n'
+    printf '    9) ling-3.0-flash-fin-free\n'
     printf '\n'
     printf '  Paid models (requires UPSTREAM_API_KEY in .env.zen):\n'
-    printf '    8) claude-sonnet-4-6\n'
-    printf '    9) gpt-5.5\n'
-    printf '   10) gemini-3.5-flash\n'
-    printf '   11) deepseek-v4\n'
-    printf '   12) glm-5.1\n'
-    printf '   13) kimi-k2.6\n'
-    printf '   14) minimax-m2.7\n'
-    printf '   15) qwen3.5-plus\n'
+    printf '   10) claude-sonnet-4-6\n'
+    printf '   11) gpt-5.5\n'
+    printf '   12) gemini-3.5-flash\n'
+    printf '   13) deepseek-v4-flash\n'
+    printf '   14) glm-5.1\n'
+    printf '   15) kimi-k2.6\n'
+    printf '   16) minimax-m2.7\n'
+    printf '   17) qwen3.5-plus\n'
     printf '\n'
-    printf '   16) Enter custom model name\n'
+    printf '   18) Enter custom model name\n'
     printf '\n'
-    printf '  Select model (1-16, or Enter to keep current): '
+    printf '  Select model (1-18, or Enter to keep current): '
 
     local choice
     if [ -t 0 ]; then
@@ -498,22 +505,24 @@ _cz_model_pick() {
 
     local new_model=""
     case "${choice}" in
-        1)  new_model="deepseek-v4-flash-free" ;;
+        1)  new_model="hy3-free" ;;
         2)  new_model="big-pickle" ;;
-        3)  new_model="minimax-m2.5-free" ;;
-        4)  new_model="nemotron-3-super-free" ;;
-        5)  new_model="north-mini-code-free" ;;
-        6)  new_model="hy3-preview-free" ;;
-        7)  new_model="ling-2.6-flash" ;;
-        8)  new_model="claude-sonnet-4-6" ;;
-        9)  new_model="gpt-5.5" ;;
-        10) new_model="gemini-3.5-flash" ;;
-        11) new_model="deepseek-v4" ;;
-        12) new_model="glm-5.1" ;;
-        13) new_model="kimi-k2.6" ;;
-        14) new_model="minimax-m2.7" ;;
-        15) new_model="qwen3.5-plus" ;;
-        16)
+        3)  new_model="laguna-s-2.1-free" ;;
+        4)  new_model="deepseek-v4-flash-free" ;;
+        5)  new_model="muse-spark-1.2-contributor-free" ;;
+        6)  new_model="mimo-v2.5-free" ;;
+        7)  new_model="nemotron-3-ultra-free" ;;
+        8)  new_model="nemotron-3.5-lightning-free" ;;
+        9)  new_model="ling-3.0-flash-fin-free" ;;
+        10) new_model="claude-sonnet-4-6" ;;
+        11) new_model="gpt-5.5" ;;
+        12) new_model="gemini-3.5-flash" ;;
+        13) new_model="deepseek-v4-flash" ;;
+        14) new_model="glm-5.1" ;;
+        15) new_model="kimi-k2.6" ;;
+        16) new_model="minimax-m2.7" ;;
+        17) new_model="qwen3.5-plus" ;;
+        18)
             printf '  Enter model name: '
             if [ -t 0 ]; then
                 read -r new_model
@@ -545,6 +554,9 @@ _cz_model_pick() {
                 sleep 1
                 rm -f "$pidf"
                 _cz_ensure_proxy || true
+            else
+                rm -f "$pidf"
+                _cz_ensure_proxy || true
             fi
         fi
     fi
@@ -561,6 +573,93 @@ _cz_model_current() {
     else
         printf 'No .env.zen found. Run setup first.\n'
     fi
+}
+
+# ── Test free models (which respond vs which are rate-limited) ───────────
+_cz_test_free_models() {
+    local env_file="__ENV_FILE__"
+    local upstream_url="https://opencode.ai/zen/v1/chat/completions"
+
+    if [ -f "$env_file" ]; then
+        local env_upstream
+        env_upstream="$(sed -n 's/^UPSTREAM_CHAT_COMPLETIONS_URL=//p' "$env_file" 2>/dev/null | head -1)"
+        [ -n "$env_upstream" ] && upstream_url="$env_upstream"
+    fi
+
+    local models=(
+        "big-pickle"
+        "hy3-free"
+        "laguna-s-2.1-free"
+        "deepseek-v4-flash-free"
+        "muse-spark-1.2-contributor-free"
+        "mimo-v2.5-free"
+        "nemotron-3-ultra-free"
+        "nemotron-3.5-lightning-free"
+        "ling-3.0-flash-fin-free"
+    )
+
+    local ok_models=""
+    local limited_models=""
+    local dead_models=""
+    local tmp payload code msg result
+
+    printf '\n'
+    printf '  Testing free models -> %s\n' "$upstream_url"
+    printf '  Each sends one short prompt. 200 = responding, 429 = rate limited.\n'
+    printf '\n'
+    printf '  %-26s %6s  %s\n' "MODEL" "CODE" "RESULT"
+    printf '  %-26s %6s  %s\n' "-----" "----" "------"
+
+    for model in "${models[@]}"; do
+        tmp="$(mktemp 2>/dev/null || echo "/tmp/cz-test-free-models-$$")"
+        payload="{\"model\":\"${model}\",\"stream\":false,\"max_completion_tokens\":15,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}]}"
+
+        code="$(curl -s -m 60 -o "$tmp" -w '%{http_code}' \
+            -H "content-type: application/json" \
+            -d "$payload" \
+            "$upstream_url" 2>/dev/null || echo "000")"
+
+        msg="$(python3 - "$tmp" << 'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    err = d.get("error") or {}
+    if isinstance(err, dict):
+        m = err.get("message", "")
+    else:
+        m = d.get("message", "")
+    if not m:
+        m = ""
+    print(m[:110])
+except Exception:
+    exit(1)
+PY
+)"
+        [ -z "$msg" ] && msg="<no response body>"
+
+        case "$code" in
+            200) result="OK - responding";      ok_models="${ok_models} ${model}" ;;
+            429) result="rate limited";          limited_models="${limited_models} ${model}" ;;
+            *)   result="$msg";                  dead_models="${dead_models} ${model}" ;;
+        esac
+
+        printf '  %-26s %6s  %s\n' "$model" "$code" "$result"
+        rm -f "$tmp"
+    done
+
+    printf '\n'
+    if [ -n "$ok_models" ]; then
+        printf '  Working: %s\n' "$ok_models"
+    fi
+    if [ -n "$limited_models" ]; then
+        printf '  Rate limited right now: %s\n' "$limited_models"
+    fi
+    if [ -n "$dead_models" ]; then
+        printf '  Unavailable/erroring: %s\n' "$dead_models"
+    fi
+    printf '\n'
+    printf '  Switch to a working model with: cz-model\n'
+    printf '\n'
 }
 
 # ── Proxy daemon management ───────────────────────────────────────────────
@@ -742,6 +841,7 @@ cz-cloud()       { _cz_cloud_launch "$@"; }
 ccz()            { local b; b="$(_cz_find_claude)" || return 1; "$b" --continue "$@"; }
 cz-model()       { _cz_model_pick "$@"; }
 cz-model-current() { _cz_model_current "$@"; }
+cz-test-free-models() { _cz_test_free_models "$@"; }
 cz-proxy-start() { cz_proxy_start "$@"; }
 cz-proxy-stop()  { cz_proxy_stop "$@"; }
 cz-proxy-status(){ cz_proxy_status "$@"; }
@@ -760,6 +860,7 @@ USAGE:
 MODEL:
   cz-model              Change the upstream model (interactive picker)
   cz-model-current      Show currently selected model
+  cz-test-free-models   Ping every free model - see which respond vs rate-limit
 
 PROXY:
   cz-proxy-start        Start the translation proxy as a background daemon
@@ -803,9 +904,16 @@ for _tool in jq bc; do
     else
         printf '  Installing %s (required by statusline)...\n' "$_tool"
         if have apt-get; then
-            sudo apt-get install -y "$_tool" 2>/dev/null || apt-get install -y "$_tool" 2>/dev/null || {
-                printf '  Warning: could not install %s. Statusline will not render fully.\n' "$_tool" >&2
-            }
+            if { sudo apt-get install -y "$_tool" || apt-get install -y "$_tool"; } >/dev/null 2>&1; then
+                :
+            elif { sudo apt-get update || apt-get update; } >/dev/null 2>&1; then
+                printf '    (updated package lists, retrying)\n'
+                { sudo apt-get install -y "$_tool" || apt-get install -y "$_tool"; } >/dev/null 2>&1 || {
+                    printf '  Warning: could not install %s. Statusline will not render fully.\n' "$_tool" >&2
+                }
+            else
+                printf '  Warning: could not update apt. Statusline will not render fully.\n' >&2
+            fi
         else
             printf '  Warning: %s not found. Statusline will not render fully.\n' "$_tool" >&2
         fi
@@ -855,6 +963,7 @@ with open(src) as f:
     data = json.load(f)
 data.setdefault("statusLine", {})["type"] = "command"
 data["statusLine"]["command"] = f"bash {statusline}"
+data.setdefault("env", {})["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
 # Bump context_window to match large upstream models (e.g. DeepSeek V4)
 with open(dst, "w") as f:
     json.dump(data, f, indent=2)
@@ -868,7 +977,8 @@ else
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:${PROXY_PORT}",
     "ANTHROPIC_MODEL": "claude-code-proxy",
     "ANTHROPIC_API_KEY": "claude-zen-local-key",
-    "ENABLE_TOOL_SEARCH": "true"
+    "ENABLE_TOOL_SEARCH": "true",
+    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"
   },
   "model": "claude-code-proxy",
   "modelSettings": {
@@ -942,10 +1052,11 @@ else
     printf '  Warning: proxy source missing at %s/src/server.js\n' "${REPO_DIR}"
 fi
 
-if [ -f "${REPO_DIR}/node_modules/.package-lock.json" ] || [ -d "${REPO_DIR}/node_modules" ]; then
-    printf '  npm dependencies: installed\n'
+if grep -E '"dependencies"[[:space:]]*:' "${REPO_DIR}/package.json" >/dev/null 2>&1 \
+   && ! { [ -f "${REPO_DIR}/node_modules/.package-lock.json" ] || [ -d "${REPO_DIR}/node_modules" ]; } ; then
+    printf '  Warning: npm dependencies may not be installed (cd %s && npm install)\n' "${REPO_DIR}"
 else
-    printf '  Warning: npm dependencies may not be installed\n'
+    printf '  npm dependencies: installed\n'
 fi
 
 # Quick proxy start/stop test
@@ -997,6 +1108,7 @@ cat << SUMMARY
   Other commands:
     ccz                 Resume most recent session
     cz-cloud            Use Anthropic cloud directly (no proxy)
+    cz-test-free-models Test which free models respond vs are rate-limited
     cz-proxy-start      Start proxy daemon (auto-started on cz launch)
     cz-proxy-stop       Stop proxy daemon
     cz-proxy-status     Check proxy status
