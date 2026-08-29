@@ -78,6 +78,9 @@ fi
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Remember where the user launched from so we can return them there at the end
+# (matters when the script is sourced, and keeps `cz` from inheriting a stray cwd).
+ORIG_PWD="$(pwd)"
 PERSISTENCE_DIR="${SCRIPT_DIR}/.claude_zen"
 REPO_DIR="${PERSISTENCE_DIR}/repo"
 ENV_FILE="${PERSISTENCE_DIR}/.env.zen"
@@ -192,8 +195,8 @@ fi
 
 # ─── 4. Install npm dependencies ──────────────────────────────────────────────
 printf '\n%s\n' "=== Step 4: npm install ==="
-cd "${REPO_DIR}"
-npm install 2>&1 || {
+# Run npm install from the repo dir without changing the script's working directory.
+( cd "${REPO_DIR}" && npm install ) 2>&1 || {
     printf '  Error: npm install failed.\n' >&2
     exit 1
 }
@@ -405,13 +408,22 @@ _cz_ensure_proxy() {
     fi
 
     printf '\n  Starting zen proxy on port %s...\n' "$port"
-    cd "$repo"
+    # Start node from the repo dir, but restore the caller's cwd afterwards so
+    # `cz` launches Claude Code from the user's project folder (not .claude_zen/repo)
+    # — otherwise the statusline reports the wrong repo.
+    local _start_dir
+    _start_dir="$(pwd)"
+    if ! cd "$repo" 2>/dev/null; then
+        printf '\n  Proxy repo not found: %s. Re-run setup.\n' "$repo" >&2
+        return 1
+    fi
     set -a
     source "$env_file"
     set +a
     setsid nohup node src/server.js >> "$logf" 2>&1 < /dev/null &
     echo $! > "$pidf"
     disown 2>/dev/null || true
+    cd "$_start_dir" 2>/dev/null || true
 
     # Wait for the /health endpoint so we never report a false failure
     local key ncode tries
@@ -1289,3 +1301,7 @@ cat << SUMMARY
   For portability, keep a copy of statusline.sh next to this setup script.
 
 SUMMARY
+
+# Return the user to the directory they launched from (no-op when executed in a
+# subshell; restores cwd when the script is sourced).
+cd "${ORIG_PWD}" 2>/dev/null || true

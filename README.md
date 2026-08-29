@@ -237,6 +237,56 @@ After setup, source your shell rc file (`source ~/.zshrc`) and use:
 | `ollama-model` | Select a different Ollama model |
 | `ollama-model-current` | Show the currently selected model |
 
+## Claude CLI with Claude Zen (OpenCode Zen proxy)
+
+This project also includes a setup script that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) through [OpenCode Zen](https://opencode.ai) (or any OpenAI-compatible `chat/completions` endpoint) using the [claude-code-zen-proxy](https://github.com/chandan11248/claude-code-zen-proxy). The proxy translates between Claude Code's Anthropic Messages API and the upstream's OpenAI format, so you can use free Zen models (no Anthropic key) or paid models with a Zen API key.
+
+### Script: `setup_claude_zen_devcontainer.sh`
+
+```bash
+./setup_claude_zen_devcontainer.sh
+```
+
+Run it **once from the workspace root**. It will:
+
+1. Install **Node.js 22** (if missing) and the **`@anthropic-ai/claude-code`** CLI
+2. Clone **claude-code-zen-proxy** into `.claude_zen/repo` and `npm install` its dependencies
+3. Create `.claude_zen/.env.zen` (prompts for a Zen API key on first run; free models work without one)
+4. Add **shell aliases** to `~/.bashrc` / `~/.zshrc`
+5. **Persist Claude sessions** — symlinks `~/.claude` → `.claude_persist/` and `.ai_memory/`, so sessions, history, and memory survive container rebuilds
+6. Wire a **status line** into Claude Code (choose **two-line detailed** or **one-line compact** when prompted)
+7. Leave you in the **same directory you ran it from**
+
+> The script restores your original working directory when it finishes, and the `cz` launcher no longer changes your shell's directory — so Claude Code always reports the correct project/repo in the status line.
+
+### Commands
+
+After setup, source your shell rc (`source ~/.zshrc`) and use:
+
+| Command | Description |
+|---------|-------------|
+| `cz` | Pick a model, launch Claude Code through the Zen proxy |
+| `cz-new` | Same as `cz` |
+| `cz-danger` | Same, with `--dangerously-skip-permissions` (auto-accept) |
+| `cz-cloud` | Launch Claude Code directly via the Anthropic cloud (no proxy) |
+| `ccz` | Resume the most recent Claude Code session |
+| `cz-model` | Interactive model picker (edits `.env.zen`, restarts the proxy) |
+| `cz-model-current` | Show the currently selected model |
+| `cz-test-free-models` | Ping every free model to see which respond vs. rate-limit |
+| `cz-proxy-start` | Start the proxy as a background daemon |
+| `cz-proxy-stop` | Stop the proxy daemon |
+| `cz-proxy-status` | Check if the proxy is running |
+| `cz-undo-danger` | Remove danger-mode guardrails from `CLAUDE.md` |
+
+### Status line
+
+The status line shows the model, **effort level**, thinking on/off, git branch ± dirty, repo, context usage (with a color bar), token counts, **cache-hit %**, cost, and rate limits. At install time the script asks:
+
+- **1) Two-line detailed** (default) — identity on line 1, resource stats on line 2
+- **2) One-line compact** — everything on a single line
+
+> **Note on context usage:** when routed through the Zen proxy, the upstream free models don't report input-token counts, so the context bar shows `n/a` and token/cost stats are hidden. They populate automatically under `cz-cloud` (direct Anthropic) or any upstream that returns usage.
+
 ## Project Structure
 
 ```
@@ -257,7 +307,7 @@ After setup, source your shell rc file (`source ~/.zshrc`) and use:
   └── tasks.json                 # VS Code tasks for opencode + Ollama
 opencode.json                    # OpenCode Ollama provider config
 setup_claude_ollama_local_in_devcontainer.sh  # Claude CLI + local Ollama setup
-setup_claude_zen_devcontainer.sh             # Claude Zen / big-pickle model setup
+setup_claude_zen_devcontainer.sh             # Claude Code through OpenCode Zen proxy (claude-code-zen-proxy)
 .gitattributes                   # Enforce LF line endings
 ```
 
