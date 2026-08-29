@@ -329,12 +329,12 @@ export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
 unalias cz cz-new cz-cloud cz-danger ccz cz-model cz-model-current \
        cz-proxy-start cz-proxy-stop cz-proxy-status cz-test-free-models \
-       cz-undo-danger 2>/dev/null || true
+       cz-undo-danger cz-help 2>/dev/null || true
 unset -f cz cz_new ccz _cz_find_claude _cz_ensure_claude_native _cz_ensure_proxy \
           _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
           _cz_test_free_models \
           _cz_zen_models_endpoint _cz_fetch_zen_models _cz_fetch_free_models \
-          cz_proxy_start cz_proxy_stop cz_proxy_status 2>/dev/null || true
+          cz_proxy_start cz_proxy_stop cz_proxy_status cz-help 2>/dev/null || true
 
 # ── Find the claude binary ─────────────────────────────────────────────────
 _cz_find_claude() {
@@ -414,11 +414,15 @@ _cz_ensure_proxy() {
         rm -f "$pidf"
     fi
 
-    # Check if something is already on the port
+    # If a stale process already holds the port (e.g. an older, unpatched proxy
+    # left running from before a code change), kill it so `cz` always launches
+    # the current, patched proxy instead of talking to the old one.
     if command -v lsof >/dev/null 2>&1; then
-        if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
-            printf '\n  Proxy already running on port %s (not tracked by us).\n' "$port" >&2
-            return 0
+        _oldpid="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null | head -1)"
+        if [ -n "$_oldpid" ]; then
+            printf '\n  Port %s held by PID %s (stale?); restarting proxy...\n' "$port" "$_oldpid" >&2
+            kill "$_oldpid" 2>/dev/null || true
+            sleep 1
         fi
     fi
 
@@ -1255,6 +1259,9 @@ fi
 
 # Quick proxy start/stop test
 printf '  Starting proxy for smoke test...\n'
+# Clear any proxy already on the port so we test the freshly-patched code.
+pkill -f 'src/server.js' 2>/dev/null || true
+sleep 1
 (
     set -a
     source "${ENV_FILE}" 2>/dev/null || true
