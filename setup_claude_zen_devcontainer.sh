@@ -193,6 +193,31 @@ else
     }
 fi
 
+# ─── 3.5 Patch proxy: allow keyless free-model requests ──────────────────────
+# The upstream proxy hard-blocks requests when UPSTREAM_API_KEY is empty, but
+# OpenCode Zen FREE models need no key. Our local working tree removed that
+# guard; this patch reapplies the same fix on every fresh clone so free models
+# work out of the box (the change is not yet upstreamed). Idempotent.
+if [ -f "${REPO_DIR}/src/server.js" ]; then
+    python3 - "${REPO_DIR}/src/server.js" << 'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+guard = (
+    '        if (!config.upstreamApiKey) {\n'
+    '          writeError(response, 500, "UPSTREAM_API_KEY is not configured", "api_error");\n'
+    '          return;\n'
+    '        }\n'
+)
+if guard in t:
+    t = t.replace(guard, '')
+    p.write_text(t)
+    print('  Patched proxy: keyless free-model requests now allowed.')
+else:
+    print('  Proxy already patched (or guard absent) - skipping.')
+PY
+fi
+
 # ─── 4. Install npm dependencies ──────────────────────────────────────────────
 printf '\n%s\n' "=== Step 4: npm install ==="
 # Run npm install from the repo dir without changing the script's working directory.
@@ -316,7 +341,7 @@ _cz_find_claude() {
     local cmd
     cmd="$(command -v claude 2>/dev/null)" && { echo "$cmd"; return 0; }
     for p in \
-        "${__NPM_GLOBAL_DIR__}/bin/claude" \
+        "__NPM_GLOBAL_DIR__/bin/claude" \
         /home/vscode/.npm-global/bin/claude \
         /root/.npm-global/bin/claude \
         /usr/local/bin/claude \
