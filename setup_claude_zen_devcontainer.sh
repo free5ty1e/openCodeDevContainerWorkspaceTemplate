@@ -1028,8 +1028,29 @@ _install_shell_wrappers
 # ─── 6.5. Statusline integration ────────────────────────────────────────────
 printf '\n%s\n' "=== Step 6.5: Statusline integration ==="
 # The workspace ships with a rich statusline script (model, context usage,
-# git branch, cost, cache hit rate). Wire it into Claude Code's settings so
-# it shows in the terminal status panel for every zen session.
+# git branch, cost, cache hit rate, effort level). Wire it into Claude Code's
+# settings so it shows in the terminal status panel for every zen session.
+
+# Choose statusline style (the user picks at install time)
+STATUSLINE_MODE="full"
+printf '\n'
+printf '  Statusline style:\n'
+printf '    1) Two-line detailed (identity + resource stats) [default]\n'
+printf '    2) One-line compact\n'
+printf '  Pick [1-2, Enter = 1]: '
+if [ -t 0 ]; then
+  read -r _sl_choice
+elif [ -t 1 ]; then
+  read -r _sl_choice </dev/tty || true
+else
+  _sl_choice=""
+fi
+case "${_sl_choice:-1}" in
+  2) STATUSLINE_MODE="compact" ;;
+  *) STATUSLINE_MODE="full" ;;
+esac
+printf '  Statusline mode: %s\n' "${STATUSLINE_MODE}"
+export ZEN_STATUSLINE_MODE="${STATUSLINE_MODE}"
 
 # jq (JSON parsing) and bc (arithmetic) are required by statusline.sh
 for _tool in jq bc; do
@@ -1093,10 +1114,12 @@ if [ -f "${REPO_DIR}/zen-claude-settings.json" ]; then
     python3 - "${REPO_DIR}/zen-claude-settings.json" "${SETTINGS_FILE}" "${STATUSLINE_SCRIPT}" << 'PY'
 import json, sys
 src, dst, statusline = sys.argv[1], sys.argv[2], sys.argv[3]
+import os
+mode = os.environ.get("ZEN_STATUSLINE_MODE", "full")
 with open(src) as f:
     data = json.load(f)
 data.setdefault("statusLine", {})["type"] = "command"
-data["statusLine"]["command"] = f"bash {statusline}"
+data["statusLine"]["command"] = f"ZEN_STATUSLINE_MODE={mode} bash {statusline}"
 data.setdefault("env", {})["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
 # Bump context_window to match large upstream models (e.g. DeepSeek V4)
 with open(dst, "w") as f:
@@ -1124,7 +1147,7 @@ else
   },
   "statusLine": {
     "type": "command",
-    "command": "bash ${STATUSLINE_SCRIPT}"
+    "command": "ZEN_STATUSLINE_MODE=${STATUSLINE_MODE} bash ${STATUSLINE_SCRIPT}"
   }
 }
 JSONEOF
@@ -1228,7 +1251,7 @@ cat << SUMMARY
   Proxy repo:   ${REPO_DIR}
   Proxy port:   ${PROXY_PORT}
   Settings:     ${SETTINGS_FILE} (wired to statusline)
-  Statusline:   ${STATUSLINE_SCRIPT}
+  Statusline:   ${STATUSLINE_SCRIPT} (mode: ${STATUSLINE_MODE})
   Claude home:  ${CLAUDE_PERSIST_DIR} (symlinked to ~/.claude)
   Memory:       ${CLAUDE_MEMORY_DIR}
 

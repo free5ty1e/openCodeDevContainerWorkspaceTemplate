@@ -2,28 +2,33 @@
 # ==============================================================================
 # statusline.sh — Claude Code status line for the zen-proxy setup
 #
-# Claude Code pipes a JSON payload on stdin on every refresh. We print a 2-line
-# status line packed with live session stats.
+# Claude Code pipes a JSON payload on stdin on every refresh. We print a status
+# line packed with live session stats.
 #
-# IMPORTANT (why this is written the way it is):
-#   When Claude Code runs THROUGH the zen translation proxy, the CLI does NOT
-#   receive upstream token usage, so fields like context_window.used_percentage
-#   and the token/cost counts come back null or 0. Every field below is
-#   null-guarded and stats are shown *only when present*, so the bar never
-#   fills up with misleading zeros and never goes blank on a missing field.
+# MODE (set at install time via the setup script, or override with env):
+#   ZEN_STATUSLINE_MODE=full     two lines: identity + resource stats (default)
+#   ZEN_STATUSLINE_MODE=compact  one condensed line
 #
-# Field names verified against the Claude Code 2.1.251 statusLine payload
-# (captured live from a running session).
+# WHY null-safe / "n/a": when Claude Code runs THROUGH the zen translation
+# proxy, the CLI receives no upstream token usage, so context_window.used_percentage
+# and the token/cost counts come back null or 0. Every field is guarded and stats
+# show only when present; context shows "n/a" (never a fake "100% free") when the
+# proxy didn't report real usage.
+#
+# Field names verified against the Claude Code 2.1.251 statusLine payload.
 # ==============================================================================
 
 input="$(cat)"
 [ -z "$input" ] && exit 0
 
-# Fallback if jq is missing (statusline would otherwise be blank).
 if ! command -v jq >/dev/null 2>&1; then
   printf '%s\n' "$(whoami 2>/dev/null)@$(hostname -s 2>/dev/null)"
   exit 0
 fi
+
+# Mode: full (default) or compact
+MODE="${ZEN_STATUSLINE_MODE:-full}"
+case "$MODE" in compact|one|1|single) MODE=compact ;; *) MODE=full ;; esac
 
 # ---- Single jq pass -> tab-separated, null-safe values -----------------------
 vals="$(printf '%s' "$input" | jq -r '
@@ -76,7 +81,7 @@ if [ -n "$shortdir" ]; then
   shortdir="$(basename "$(dirname "$shortdir")")/$(basename "$shortdir")"
 fi
 
-# ---- Token formatter (1234 -> 1.2k, 44000 -> 44k) -----------------------------
+# ---- Helpers ----------------------------------------------------------------
 format_k() {
   local c="$1"
   case "$c" in
@@ -91,58 +96,93 @@ format_k() {
   fi
 }
 
-# ---- Colors (subtle) ----------------------------------------------------------
+# Context bar: 10 block chars, filled = pct.
+ctx_bar() {
+  local pct="$1" w=10 f i bars=""
+  f="$(awk -v p="$pct" -v w="$w" 'BEGIN{printf "%d", p*w/100+0.5}' 2>/dev/null || echo 0)"
+  case "$f" in *[!0-9]*) f=0 ;; esac
+  [ "$f" -gt "$w" ] && f=$w
+  for ((i = 0; i < w; i++)); do
+    if [ "$i" -lt "$f" ]; then bars="${bars}█"; else bars="${bars}░"; fi
+  done
+  printf '%s' "$bars"
+}
+
+# Context color by threshold.
+ctx_color() {
+  local p="$1" c="$GR"
+  awk "BEGIN{exit !($p >= 80)}" 2>/dev/null && c="$RE"
+  awk "BEGIN{exit !($p >= 60)}" 2>/dev/null && c="$YE"
+  printf '%s' "$c"
+}
+
+# Cache hit % (read / (read + write)).
+cache_hit() {
+  local ct=$(( ${cacheRead:-0} + ${cacheWrite:-0} ))
+  if [ "$ct" -gt 0 ]; then printf '%d' "$(( cacheRead * 100 / ct ))"; else printf '0'; fi
+}
+
+# ---- Colors (subtle) ---------------------------------------------------------
 R=$'\033[0m'; DIM=$'\033[2m'; CY=$'\033[36m'; YE=$'\033[33m'
 GR=$'\033[32m'; RE=$'\033[31m'
+SEP="${DIM} • ${R}"
 
-# ---- Line 1: identity / mode --------------------------------------------------
-l1=""
-add() { [ -n "$2" ] && l1="${l1}${l1:+${DIM} • ${R}}${CY}$1${R}: $2"; }
-add "repo"   "$repo"
-add "branch" "${branch}${dirty:+ ±$dirty}"
-add "dir"    "$shortdir"
-add "model"  "$model"
-add "effort" "$effort"
-[ "$thinking" = true ] && add "think" "on" || add "think" "off"
-[ "$style" != "default" ] && [ -n "$style" ] && add "style" "$style"
-[ "$fast" = true ] && add "fast" "on"
+# ---- Context segment (shared by both modes) ----------------------------------
+ctx_seg() {
+  if [ -n "$used" ] && [ "$used" != "0" ] && [ "$used" != "0.0" ]; then
+    printf '%s' "📊 [$(ctx_bar "$used")] $(ctx_color "$used")${used}%${R}"
+  else
+    printf '%s' "📊 n/a"
+  fi
+}
 
-# ---- Line 2: resource usage / stats -------------------------------------------
-l2=""
-add2() { [ -n "$2" ] && l2="${l2}${l2:+${DIM} • ${R}}${YE}$1${R}: $2"; }
+# ---- FULL mode: two lines ----------------------------------------------------
+if [ "$MODE" = full ]; then
+  L1=""
+  seg() { [ -n "$2" ] && L1="${L1}${L1:+$SEP}$1$2"; }
+  seg "📦 " "$repo"
+  seg "🌿 " "${branch}${dirty:+ ±$dirty}"
+  seg "📁 " "$shortdir"
+  seg "🤖 " "$model"
+  seg "🎚️ " "$effort"
+  [ "$thinking" = true ] && seg "💭 " "on" || seg "💭 " "off"
+  [ "$style" != "default" ] && [ -n "$style" ] && seg "🎨 " "$style"
+  [ "$fast" = true ] && seg "⚡ " "fast"
 
-# Context window (color by usage when a real % is present)
-if [ -n "$used" ] && [ "$used" != "0" ] && [ "$used" != "0.0" ]; then
-  ctx_color="$GR"
-  if awk "BEGIN{exit !($used >= 80)}" 2>/dev/null; then ctx_color="$RE"
-  elif awk "BEGIN{exit !($used >= 60)}" 2>/dev/null; then ctx_color="$YE"; fi
-  add2 "ctx" "${ctx_color}${used}%${R}"
-elif [ -n "$remain" ]; then
-  add2 "ctx" "${remain}% free"
-else
-  add2 "ctx" "n/a"
+  L2=""
+  seg2() { [ -n "$2" ] && L2="${L2}${L2:+$SEP}$1$2"; }
+  seg2 "" "$(ctx_seg)"
+  if [ "${inTok:-0}" -gt 0 ] || [ "${outTok:-0}" -gt 0 ]; then
+    seg2 "📥📤 " "$(format_k "$inTok")/$(format_k "$outTok")"
+  fi
+  if [ "${cacheRead:-0}" -gt 0 ] || [ "${cacheWrite:-0}" -gt 0 ]; then
+    seg2 "💾 " "$(cache_hit)%"
+  fi
+  awk "BEGIN{exit !($cost > 0)}" 2>/dev/null && seg2 "💰 " "$(printf '$%.2f' "$cost")"
+  [ -n "$rate5h" ] && seg2 "⏳5h " "${rate5h}%"
+  [ -n "$rate7d" ] && seg2 "⏳7d " "${rate7d}%"
+  seg2 "🏷️ " "$ver"
+  [ "$exceeds" = true ] && seg2 "⚠️ " "200k"
+
+  [ -n "$L1" ] && printf '%s\n' "$L1"
+  [ -n "$L2" ] && printf '%s\n' "$L2"
+  exit 0
 fi
 
-# Tokens (only when the CLI actually counted some)
-if [ "${inTok:-0}" -gt 0 ] || [ "${outTok:-0}" -gt 0 ]; then
-  add2 "tok" "in $(format_k "$inTok") / out $(format_k "$outTok")"
-fi
-
-# Cache read/write (only when present)
+# ---- COMPACT mode: one line --------------------------------------------------
+L=""
+segc() { [ -n "$2" ] && L="${L}${L:+$SEP}$1$2"; }
+segc "📦 " "$repo"
+segc "🌿 " "${branch}${dirty:+ ±$dirty}"
+segc "🤖 " "$model"
+segc "🎚️ " "$effort"
+segc "" "$(ctx_seg)"
 if [ "${cacheRead:-0}" -gt 0 ] || [ "${cacheWrite:-0}" -gt 0 ]; then
-  add2 "cache" "R $(format_k "$cacheRead") / W $(format_k "$cacheWrite")"
+  segc "💾 " "$(cache_hit)%"
 fi
-
-# Cost (only when > 0 — proxied sessions report 0)
-if awk "BEGIN{exit !($cost > 0)}" 2>/dev/null; then
-  add2 "cost" "$(printf '$%.2f' "$cost")"
+if [ "${inTok:-0}" -gt 0 ] || [ "${outTok:-0}" -gt 0 ]; then
+  segc "📥📤 " "$(format_k "$inTok")/$(format_k "$outTok")"
 fi
-
-# Upstream rate limits (usually absent through the proxy — show if present)
-[ -n "$rate5h" ] && add2 "5h" "${rate5h}%"
-[ -n "$rate7d" ] && add2 "7d" "${rate7d}%"
-
-add2 "v" "$ver"
-[ "$exceeds" = true ] && add2 "warn" "${RE}200k!${R}"
-
-if [ -n "$l2" ]; then printf '%s\n%s\n' "$l1" "$l2"; else printf '%s\n' "$l1"; fi
+awk "BEGIN{exit !($cost > 0)}" 2>/dev/null && segc "💰 " "$(printf '$%.2f' "$cost")"
+segc "🏷️ " "$ver"
+[ -n "$L" ] && printf '%s\n' "$L"
