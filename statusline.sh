@@ -1,263 +1,148 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ==============================================================================
+# statusline.sh — Claude Code status line for the zen-proxy setup
+#
+# Claude Code pipes a JSON payload on stdin on every refresh. We print a 2-line
+# status line packed with live session stats.
+#
+# IMPORTANT (why this is written the way it is):
+#   When Claude Code runs THROUGH the zen translation proxy, the CLI does NOT
+#   receive upstream token usage, so fields like context_window.used_percentage
+#   and the token/cost counts come back null or 0. Every field below is
+#   null-guarded and stats are shown *only when present*, so the bar never
+#   fills up with misleading zeros and never goes blank on a missing field.
+#
+# Field names verified against the Claude Code 2.1.251 statusLine payload
+# (captured live from a running session).
+# ==============================================================================
 
-## Legacy:
-### input=$(cat); model=$(echo \"$input\" | jq -r \".model.display_name\"); used=$(echo \"$input\" | jq -r \".context_window.total_input_tokens // 0\"); limit=${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-200000}; pct=$(echo \"$input\" | jq -r .context_window.used_percentage); echo \"Model: $model | Context: $used/$limit ($pct%) | Limit: $limit\"
+input="$(cat)"
+[ -z "$input" ] && exit 0
 
-## Legacy 2: 
-# input=$(cat)
-# # Extract values using jq
-# path=$(echo "$input" | jq -r '.workspace.current_dir // "unknown"')
-# mode=$(echo "$input" | jq -r '.output_style.name // "unknown"')
-
-# # Attempt to find effort level (not in standard JSON, but maybe available or just default)
-# # Since it's not in the provided schema, we can just provide a placeholder if missing
-# effort=$(echo "$input" | jq -r '.effort_level // "unknown"')
-
-# # Count agents/subagents: Check if agent object exists
-# agent_count=$(echo "$input" | jq -r 'if .agent then "1" else "0" end')
-
-# # Process count: Use pgrep to find instances of claude (or similar)
-# # Note: This might vary depending on how many shells are open.
-# proc_count=$(pgrep -c "claude" || echo "0")
-
-# echo "Path: $path | Mode: $mode | Effort: $effort | Agents: $agent_count | Shells: $proc_count"
-
-
-## V3:
-# # 1. Capture the piped stdin JSON blob from Claude Code
-# input=$(cat)
-
-# # 2. Extract specific variables safely via jq
-# DIR_PATH=$(echo "$input" | jq -r '.workspace.current_dir // empty')
-# MODEL=$(echo "$input" | jq -r '.model.display_name // empty')
-# USAGE=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
-# COST=$(echo "$input" | jq -r '(.cost.total_cost_usd // 0) | printf("%.4f", .)')
-
-# # Extract just the parent folder name for clean formatting
-# DIR_NAME=$(basename "$DIR_PATH")
-
-# # 3. Read Git branch manually within the captured workspace directory
-# if [ -d "$DIR_PATH" ] && git -C "$DIR_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-#     GIT_BRANCH=$(git -C "$DIR_PATH" branch --show-current 2>/dev/null)
-#     GIT_STR=" 🌿 $GIT_BRANCH |"
-# else
-#     GIT_STR=""
-# fi
-
-# # 4. Apply optional ANSI color codes for visual tracking (e.g., warning if context > 75%)
-# if (( $(echo "$USAGE > 75.0" | bc -l) )); then
-#     CONTEXT_COLOR="\033[31m" # Red
-# else
-#     CONTEXT_COLOR="\033[32m" # Green
-# fi
-# RESET="\033[0m"
-
-# # 5. Output the single line string back to Claude's terminal panel
-# printf "📁 %s |%s 🤖 %s | 💰 \$%s | Ctx: %b%.1f%%%b\n" \
-#     "$DIR_NAME" "$GIT_STR" "$MODEL" "$COST" "$CONTEXT_COLOR" "$USAGE" "$RESET"
-
-
-## V4: Finalized version with all features integrated
-# # 1. Capture the piped stdin JSON blob from Claude Code
-# input=$(cat)
-
-# # 2. Extract workspace and session data safely via jq
-# DIR_PATH=$(echo "$input" | jq -r '.workspace.current_dir // empty')
-# MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
-# USAGE=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
-# COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
-
-# # Extract token counts from input JSON
-# IN_TOKENS=$(echo "$input" | jq -r '.context_window.total_input_tokens // .context_window.current_usage.input_tokens // 0')
-# OUT_TOKENS=$(echo "$input" | jq -r '.context_window.total_output_tokens // .context_window.current_usage.output_tokens // 0')
-# DEFAULT_MAX_TOKENS=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
-
-# # 3. Read Environment Variable Overrides
-# COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$DEFAULT_MAX_TOKENS}"
-# MAX_OUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-N/A}"
-# COMPACT_PCT="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-80}"
-
-# # Calculate exact auto-compaction trigger token count based on percentage override
-# COMPACT_THRESHOLD=$(( COMPACT_WINDOW * COMPACT_PCT / 100 ))
-# TOTAL_CTX=$(( IN_TOKENS + OUT_TOKENS ))
-
-# # Helper function to format token counts into 'k' notation (e.g., 44000 -> 44k)
-# format_k() {
-#     local count=$1
-#     if [[ "$count" =~ ^[0-9]+$ ]]; then
-#         if [ "$count" -ge 1000 ]; then
-#             echo "$((count / 1000))k"
-#         else
-#             echo "$count"
-#         fi
-#     else
-#         echo "$count"
-#     fi
-# }
-
-# IN_K=$(format_k "$IN_TOKENS")
-# OUT_K=$(format_k "$OUT_TOKENS")
-# MAX_OUT_K=$(format_k "$MAX_OUT_TOKENS")
-# CTX_K=$(format_k "$TOTAL_CTX")
-# LIMIT_K=$(format_k "$COMPACT_WINDOW")
-# COMPACT_K=$(format_k "$COMPACT_THRESHOLD")
-
-# # Parent directory name
-# DIR_NAME=$(basename "$DIR_PATH")
-
-# # 4. Read Git branch manually
-# if [ -d "$DIR_PATH" ] && git -C "$DIR_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-#     GIT_BRANCH=$(git -C "$DIR_PATH" branch --show-current 2>/dev/null)
-#     GIT_STR=" 🌿 $GIT_BRANCH |"
-# else
-#     GIT_STR=""
-# fi
-
-# # 5. Dynamic ANSI colors based on configured override percentage
-# WARNING_PCT=$(( COMPACT_PCT - 10 ))
-# USAGE_INT=$(printf "%.0f" "$USAGE")
-
-# if [ "$USAGE_INT" -ge "$COMPACT_PCT" ]; then
-#     CONTEXT_COLOR="\033[31m" # Red (Auto-compaction active/imminent)
-# elif [ "$USAGE_INT" -ge "$WARNING_PCT" ]; then
-#     CONTEXT_COLOR="\033[33m" # Yellow (Approaching threshold)
-# else
-#     CONTEXT_COLOR="\033[32m" # Green
-# fi
-# RESET="\033[0m"
-
-# # 6. Render the full status line
-# printf "📁 %s |%s 🤖 %s | 💰 \$%.2f | 📥 %s | 📤 %s/%s | Ctx: %b%s/%s (%.1f%%)%b | ⚡ Compact @ %s (%s%%)\n" \
-#     "$DIR_NAME" \
-#     "$GIT_STR" \
-#     "$MODEL" \
-#     "$COST" \
-#     "$IN_K" \
-#     "$OUT_K" "$MAX_OUT_K" \
-#     "$CONTEXT_COLOR" "$CTX_K" "$LIMIT_K" "$USAGE" "$RESET" \
-#     "$COMPACT_K" "$COMPACT_PCT"
-
-
-## V5: More stats, accurate context window
-#!/bin/bash
-
-# 1. Capture the piped stdin JSON blob from Claude Code
-input=$(cat)
-
-# 2. Extract core fields via jq
-DIR_PATH=$(echo "$input" | jq -r '.workspace.current_dir // empty')
-MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
-USAGE=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
-COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
-
-# Extract Cumulative Tokens across session
-IN_TOKENS=$(echo "$input" | jq -r '.context_window.total_input_tokens // .context_window.current_usage.input_tokens // 0')
-OUT_TOKENS=$(echo "$input" | jq -r '.context_window.total_output_tokens // .context_window.current_usage.output_tokens // 0')
-DEFAULT_MAX_TOKENS=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
-
-# Extract Cache Stats
-CACHE_READ=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
-CACHE_WRITE=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-
-# Extract Rate Limits (if available)
-RATE_5H=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-
-# 3. Read Environment Variable Overrides
-COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$DEFAULT_MAX_TOKENS}"
-MAX_OUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-N/A}"
-COMPACT_PCT="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-80}"
-
-# 4. Perform Computations
-CUMULATIVE_SESSION=$(( IN_TOKENS + OUT_TOKENS ))
-ACTIVE_CTX_TOKENS=$(echo "$COMPACT_WINDOW * $USAGE / 100" | bc -l | awk '{printf "%.0f", $1}')
-COMPACT_THRESHOLD=$(( COMPACT_WINDOW * COMPACT_PCT / 100 ))
-
-# Calculate Cache Efficiency Hit Rate
-CACHE_TOTAL=$(( CACHE_READ + CACHE_WRITE ))
-if [ "$CACHE_TOTAL" -gt 0 ]; then
-    CACHE_HIT_PCT=$(echo "$CACHE_READ * 100 / $CACHE_TOTAL" | bc -l | awk '{printf "%.0f", $1}')
-else
-    CACHE_HIT_PCT="0"
+# Fallback if jq is missing (statusline would otherwise be blank).
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' "$(whoami 2>/dev/null)@$(hostname -s 2>/dev/null)"
+  exit 0
 fi
 
-# Formatting Helper (Handles precision cleanly)
+# ---- Single jq pass -> tab-separated, null-safe values -----------------------
+vals="$(printf '%s' "$input" | jq -r '
+  [
+    (.model.display_name // ""),
+    (.effort.level // ""),
+    (.thinking.enabled // false),
+    (.output_style.name // ""),
+    (.fast_mode // false),
+    (.exceeds_200k_tokens // false),
+    ((.workspace.repo // null) | if . then (.owner + "/" + .name) else "" end),
+    (.workspace.current_dir // ""),
+    (.version // ""),
+    (.context_window.total_input_tokens // 0),
+    (.context_window.total_output_tokens // 0),
+    (.context_window.context_window_size // 0),
+    (.context_window.used_percentage // ""),
+    (.context_window.remaining_percentage // ""),
+    ((.context_window.current_usage // {}) | .cache_read_input_tokens // 0),
+    ((.context_window.current_usage // {}) | .cache_creation_input_tokens // 0),
+    (.cost.total_cost_usd // 0),
+    ((.rate_limits.five_hour_window // .rate_limits.five_hour // null) | if . then (.used_percentage // "") else "" end),
+    ((.rate_limits.seven_day_window // .rate_limits.seven_day // null) | if . then (.used_percentage // "") else "" end)
+  ] | @tsv
+' 2>/dev/null)"
+
+IFS=$'\t' read -r model effort thinking style fast exceeds repo dir ver \
+  inTok outTok winSize used remain cacheRead cacheWrite cost rate5h rate7d <<< "$vals"
+
+# ---- Git branch + dirty count (non-blocking, stderr swallowed) ---------------
+branch=""
+dirty=""
+if [ -n "$dir" ] && command -v git >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    branch="$(timeout 1 git -C "$dir" -c core.optionalLocks=false rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  else
+    branch="$(git -C "$dir" -c core.optionalLocks=false rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  fi
+  if [ -n "$branch" ]; then
+    dc="$(git -C "$dir" -c core.optionalLocks=false status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${dc:-0}" -gt 0 ] && dirty="$dc"
+  fi
+fi
+
+# ---- Path shortening (~/..., last two components) -----------------------------
+home="${HOME:-}"
+shortdir="${dir/#$home/~}"
+[ -z "$shortdir" ] && shortdir="$dir"
+if [ -n "$shortdir" ]; then
+  shortdir="$(basename "$(dirname "$shortdir")")/$(basename "$shortdir")"
+fi
+
+# ---- Token formatter (1234 -> 1.2k, 44000 -> 44k) -----------------------------
 format_k() {
-    local count=$1
-    if [[ "$count" =~ ^[0-9]+$ ]]; then
-        if [ "$count" -ge 10000 ]; then
-            echo "$((count / 1000))k"
-        elif [ "$count" -ge 1000 ]; then
-            echo "$count" | awk '{printf "%.1fk", $1/1000}'
-        else
-            echo "$count"
-        fi
-    else
-        echo "$count"
-    fi
+  local c="$1"
+  case "$c" in
+    ''|*[!0-9]*) printf '%s' "$c"; return ;;
+  esac
+  if [ "$c" -ge 10000 ]; then
+    printf '%dk' "$((c / 1000))"
+  elif [ "$c" -ge 1000 ]; then
+    awk -v n="$c" 'BEGIN{printf "%.1fk", n/1000}'
+  else
+    printf '%s' "$c"
+  fi
 }
 
-IN_K=$(format_k "$IN_TOKENS")
-OUT_K=$(format_k "$OUT_TOKENS")
-SESSION_K=$(format_k "$CUMULATIVE_SESSION")
-MAX_OUT_K=$(format_k "$MAX_OUT_TOKENS")
-CTX_K=$(format_k "$ACTIVE_CTX_TOKENS")
-LIMIT_K=$(format_k "$COMPACT_WINDOW")
-COMPACT_K=$(format_k "$COMPACT_THRESHOLD")
+# ---- Colors (subtle) ----------------------------------------------------------
+R=$'\033[0m'; DIM=$'\033[2m'; CY=$'\033[36m'; YE=$'\033[33m'
+GR=$'\033[32m'; RE=$'\033[31m'
 
-# 5. Git Context & Dirty Files Tracker
-DIR_NAME=$(basename "$DIR_PATH")
-if [ -d "$DIR_PATH" ] && git -C "$DIR_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    GIT_BRANCH=$(git -C "$DIR_PATH" branch --show-current 2>/dev/null)
-    DIRTY_COUNT=$(git -C "$DIR_PATH" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$DIRTY_COUNT" -gt 0 ]; then
-        GIT_STR=" 🌿 $GIT_BRANCH (±$DIRTY_COUNT) |"
-    else
-        GIT_STR=" 🌿 $GIT_BRANCH |"
-    fi
+# ---- Line 1: identity / mode --------------------------------------------------
+l1=""
+add() { [ -n "$2" ] && l1="${l1}${l1:+${DIM} • ${R}}${CY}$1${R}: $2"; }
+add "repo"   "$repo"
+add "branch" "${branch}${dirty:+ ±$dirty}"
+add "dir"    "$shortdir"
+add "model"  "$model"
+add "effort" "$effort"
+[ "$thinking" = true ] && add "think" "on" || add "think" "off"
+[ "$style" != "default" ] && [ -n "$style" ] && add "style" "$style"
+[ "$fast" = true ] && add "fast" "on"
+
+# ---- Line 2: resource usage / stats -------------------------------------------
+l2=""
+add2() { [ -n "$2" ] && l2="${l2}${l2:+${DIM} • ${R}}${YE}$1${R}: $2"; }
+
+# Context window (color by usage when a real % is present)
+if [ -n "$used" ] && [ "$used" != "0" ] && [ "$used" != "0.0" ]; then
+  ctx_color="$GR"
+  if awk "BEGIN{exit !($used >= 80)}" 2>/dev/null; then ctx_color="$RE"
+  elif awk "BEGIN{exit !($used >= 60)}" 2>/dev/null; then ctx_color="$YE"; fi
+  add2 "ctx" "${ctx_color}${used}%${R}"
+elif [ -n "$remain" ]; then
+  add2 "ctx" "${remain}% free"
 else
-    GIT_STR=""
+  add2 "ctx" "n/a"
 fi
 
-# 6. Rate Limit Badge
-if [ -n "$RATE_5H" ]; then
-    RATE_STR=$(printf " | ⏳ 5h Quota: %.0f%%" "$RATE_5H")
-else
-    RATE_STR=""
+# Tokens (only when the CLI actually counted some)
+if [ "${inTok:-0}" -gt 0 ] || [ "${outTok:-0}" -gt 0 ]; then
+  add2 "tok" "in $(format_k "$inTok") / out $(format_k "$outTok")"
 fi
 
-# 7. ANSI Color Coding for Context Window
-WARNING_PCT=$(( COMPACT_PCT - 10 ))
-USAGE_INT=$(printf "%.0f" "$USAGE")
-
-if [ "$USAGE_INT" -ge "$COMPACT_PCT" ]; then
-    CONTEXT_COLOR="\033[31m" # Red (Auto-compact imminent)
-elif [ "$USAGE_INT" -ge "$WARNING_PCT" ]; then
-    CONTEXT_COLOR="\033[33m" # Yellow (Approaching threshold)
-else
-    CONTEXT_COLOR="\033[32m" # Green
+# Cache read/write (only when present)
+if [ "${cacheRead:-0}" -gt 0 ] || [ "${cacheWrite:-0}" -gt 0 ]; then
+  add2 "cache" "R $(format_k "$cacheRead") / W $(format_k "$cacheWrite")"
 fi
-RESET="\033[0m"
 
-# 8. Render full status line
-# printf "📁 %s |%s 🤖 %s | 💰 \$%.2f | 🧮 Ses: %s (📥 %s / 📤 %s max %s) | ⚡ Cache Hit: %s%% | Ctx: %b%s/%s (%.1f%%)%b | ✂️ Compact @ %s (%s%%)%s\n" \
-#     "$DIR_NAME" \
-#     "$GIT_STR" \
-#     "$MODEL" \
-#     "$COST" \
-#     "$SESSION_K" "$IN_K" "$OUT_K" "$MAX_OUT_K" \
-#     "$CACHE_HIT_PCT" \
-#     "$CONTEXT_COLOR" "$CTX_K" "$LIMIT_K" "$USAGE" "$RESET" \
-#     "$COMPACT_K" "$COMPACT_PCT" \
-#     "$RATE_STR"
-    
-printf "📁 %s | 🤖 %s | Ctx: %b%s/%s (%.1f%%)%b | ✂️ Cmp@ %s (%s%%) | 🧮 Ses: %s (📥 %s / 📤 %s max %s) |%s ⚡ CHit: %s%%| 💰 \$%.2f%s\n" \
-    "$DIR_NAME" \
-    "$MODEL" \
-    "$CONTEXT_COLOR" "$CTX_K" "$LIMIT_K" "$USAGE" "$RESET" \
-    "$COMPACT_K" "$COMPACT_PCT" \
-    "$SESSION_K" "$IN_K" "$OUT_K" "$MAX_OUT_K" \
-    "$GIT_STR" \
-    "$CACHE_HIT_PCT" \
-    "$COST" \
-    "$RATE_STR"
+# Cost (only when > 0 — proxied sessions report 0)
+if awk "BEGIN{exit !($cost > 0)}" 2>/dev/null; then
+  add2 "cost" "$(printf '$%.2f' "$cost")"
+fi
 
+# Upstream rate limits (usually absent through the proxy — show if present)
+[ -n "$rate5h" ] && add2 "5h" "${rate5h}%"
+[ -n "$rate7d" ] && add2 "7d" "${rate7d}%"
+
+add2 "v" "$ver"
+[ "$exceeds" = true ] && add2 "warn" "${RE}200k!${R}"
+
+if [ -n "$l2" ]; then printf '%s\n%s\n' "$l1" "$l2"; else printf '%s\n' "$l1"; fi
