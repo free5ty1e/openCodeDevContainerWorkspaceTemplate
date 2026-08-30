@@ -95,6 +95,8 @@ MARKER_END="# <<< claude-zen-devcontainer <<<"
 STATUSLINE_SOURCE="${SCRIPT_DIR}/.claude/statusline.sh"
 STATUSLINE_SCRIPT="${PERSISTENCE_DIR}/statusline.sh"
 SETTINGS_FILE="${PERSISTENCE_DIR}/zen-claude-settings.json"
+OPENROUTER_ENV_FILE="${PERSISTENCE_DIR}/.env.openrouter"
+OPENROUTER_SETTINGS_FILE="${PERSISTENCE_DIR}/openrouter-claude-settings.json"
 
 PROXY_REPO_URL="https://github.com/chandan11248/claude-code-zen-proxy.git"
 
@@ -290,6 +292,40 @@ ENVEOF
     printf '  Created %s\n' "${ENV_FILE}"
 fi
 
+# ─── 5.5 Create .env.openrouter (OpenRouter backend) ─────────────────────────
+printf '\n%s\n' "=== Step 5.5: OpenRouter config ==="
+if [ -f "${OPENROUTER_ENV_FILE}" ]; then
+    printf '  Existing .env.openrouter found.\n'
+else
+    printf '\n'
+    printf '  OpenRouter API key setup (optional, more stable backend than Zen)\n'
+    printf '  Get a free key at: https://openrouter.ai/keys\n'
+    printf '  (leave blank to fill in later; the cor alias needs it to run)\n'
+    printf '  Set your API key (or press Enter to skip): '
+    READ_OR_KEY=""
+    if [ -t 0 ]; then
+        read -r READ_OR_KEY
+    elif [ -t 1 ]; then
+        read -r READ_OR_KEY </dev/tty || true
+    fi
+    cat > "${OPENROUTER_ENV_FILE}" << ENVEOF
+# OpenRouter configuration (https://openrouter.ai)
+# Get a key at: https://openrouter.ai/keys  (free tier + free models available)
+
+# Your OpenRouter API key (required to use cor / cor-danger)
+OPENROUTER_API_KEY=${READ_OR_KEY}
+
+# Default model (OpenRouter model ID).
+#   Free:   google/gemini-2.0-flash-001:free, deepseek/deepseek-chat-v3.1:free
+#   Paid:   anthropic/claude-3.7-sonnet, openai/gpt-4o
+OPENROUTER_MODEL=google/gemini-2.0-flash-001:free
+
+# OpenRouter is Anthropic-compatible; Claude Code talks to it directly.
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+ENVEOF
+    printf '  Created %s\n' "${OPENROUTER_ENV_FILE}"
+fi
+
 # ─── 6. Shell aliases ─────────────────────────────────────────────────────────
 printf '\n%s\n' "=== Step 6: Shell aliases ==="
 
@@ -329,12 +365,14 @@ export PATH="__NPM_GLOBAL_DIR__/bin:${PATH}"
 
 unalias cz cz-new cz-cloud cz-danger ccz cz-model cz-model-current \
        cz-proxy-start cz-proxy-stop cz-proxy-status cz-test-free-models \
-       cz-undo-danger cz-help 2>/dev/null || true
+       cz-undo-danger cz-help \
+       cor cor-danger cor-model cor-model-current 2>/dev/null || true
 unset -f cz cz_new ccz _cz_find_claude _cz_ensure_claude_native _cz_ensure_proxy \
           _cz_launch _cz_launch_danger _cz_model_pick _cz_model_current \
           _cz_test_free_models \
           _cz_zen_models_endpoint _cz_fetch_zen_models _cz_fetch_free_models \
-          cz_proxy_start cz_proxy_stop cz_proxy_status cz-help 2>/dev/null || true
+          cz_proxy_start cz_proxy_stop cz_proxy_status cz-help \
+          _cor_launch _cor_launch_danger _cor_model_pick _cor_model_current 2>/dev/null || true
 
 # ── Find the claude binary ─────────────────────────────────────────────────
 _cz_find_claude() {
@@ -567,6 +605,164 @@ _cz_cloud_launch() {
     _cz_ensure_claude_native || return 1
     local b; b="$(_cz_find_claude)" || return 1
     "$b" "$@"
+}
+
+# ── OpenRouter launch (Anthropic-compatible API, no custom proxy) ───────────
+# OpenRouter speaks Claude Code's native Anthropic Messages protocol, so we point
+# Claude Code directly at it. No translation proxy means no thinking-block /
+# signature bugs. It also returns real token usage, so the statusline populates.
+_cor_launch() {
+    local dir="__PERSISTENCE_DIR__"
+    local env_file="${dir}/.env.openrouter"
+    local settings_file="${dir}/openrouter-claude-settings.json"
+    local workspace_root="${dir%/.claude_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+
+    if [ ! -f "$env_file" ]; then
+        printf 'Error: .env.openrouter not found. Re-run setup_claude_zen_devcontainer.sh\n' >&2
+        return 1
+    fi
+    if [ ! -f "$settings_file" ]; then
+        printf 'Error: openrouter-claude-settings.json not found. Re-run setup.\n' >&2
+        return 1
+    fi
+
+    set -a
+    source "$env_file"
+    set +a
+    local api_key="${OPENROUTER_API_KEY:-}"
+    local model_alias="${OPENROUTER_MODEL:-google/gemini-2.0-flash-001:free}"
+    local base="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
+
+    if [ -z "$api_key" ]; then
+        printf 'Error: OPENROUTER_API_KEY is empty in %s\n' "$env_file" >&2
+        return 1
+    fi
+
+    _cz_ensure_claude_native || return 1
+    local claude_bin
+    claude_bin="$(_cz_find_claude)" || return 1
+
+    ANTHROPIC_BASE_URL="$base" \
+    ANTHROPIC_API_KEY="$api_key" \
+    ANTHROPIC_MODEL="$model_alias" \
+    "$claude_bin" --settings "$settings_file" "$@"
+}
+
+_cor_launch_danger() {
+    local dir="__PERSISTENCE_DIR__"
+    local env_file="${dir}/.env.openrouter"
+    local settings_file="${dir}/openrouter-claude-settings.json"
+    local workspace_root="${dir%/.claude_zen}"
+    [ -z "$workspace_root" ] && workspace_root="${dir%/*}"
+
+    if [ ! -f "$env_file" ]; then
+        printf 'Error: .env.openrouter not found. Re-run setup.\n' >&2
+        return 1
+    fi
+    if [ ! -f "$settings_file" ]; then
+        printf 'Error: openrouter-claude-settings.json not found. Re-run setup.\n' >&2
+        return 1
+    fi
+
+    set -a
+    source "$env_file"
+    set +a
+    local api_key="${OPENROUTER_API_KEY:-}"
+    local model_alias="${OPENROUTER_MODEL:-google/gemini-2.0-flash-001:free}"
+    local base="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
+
+    if [ -z "$api_key" ]; then
+        printf 'Error: OPENROUTER_API_KEY is empty in %s\n' "$env_file" >&2
+        return 1
+    fi
+
+    _cz_ensure_claude_native || return 1
+    local claude_bin
+    claude_bin="$(_cz_find_claude)" || return 1
+
+    _cz_install_danger_guardrails "$workspace_root" "$dir"
+
+    printf '\n'
+    printf '  DANGER MODE (OpenRouter)\n'
+    printf '  Auto-accepting ALL permissions.\n'
+    printf '\n'
+
+    ANTHROPIC_BASE_URL="$base" \
+    ANTHROPIC_API_KEY="$api_key" \
+    ANTHROPIC_MODEL="$model_alias" \
+    "$claude_bin" --settings "$settings_file" --dangerously-skip-permissions "$@"
+}
+
+_cor_model_pick() {
+    local env_file="__PERSISTENCE_DIR__/.env.openrouter"
+    local key=""
+    [ -f "$env_file" ] && key="$(sed -n 's/^OPENROUTER_API_KEY=//p' "$env_file" 2>/dev/null | head -1)"
+    local url="https://openrouter.ai/api/v1/models"
+    local list
+    if [ -n "$key" ]; then
+        list="$(curl -s --connect-timeout 5 --max-time 20 -H "Authorization: Bearer $key" "$url" 2>/dev/null)"
+    else
+        list="$(curl -s --connect-timeout 5 --max-time 20 "$url" 2>/dev/null)"
+    fi
+    local ids
+    ids="$(printf '%s' "$list" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+arr=d.get("data",[])
+ids=[m["id"] for m in arr if isinstance(m,dict) and m.get("id")]
+free=[i for i in ids if i.endswith(":free")]
+paid=[i for i in ids if not i.endswith(":free")]
+print("\n".join(free+paid))
+' 2>/dev/null)"
+    if [ -z "$ids" ]; then
+        printf '  Could not fetch OpenRouter models. Check OPENROUTER_API_KEY in .env.openrouter.\n' >&2
+        return 1
+    fi
+    local n=0
+    printf '\n  OpenRouter models (free first):\n'
+    while IFS= read -r m; do
+        n=$((n+1))
+        printf '  %2d) %s\n' "$n" "$m"
+    done <<< "$ids"
+    printf '  %2d) Enter custom model name\n' "$((n+1))"
+    printf '  Select model (1-%d, or Enter to keep current): ' "$((n+1))"
+    local choice
+    if [ -t 0 ]; then read -r choice; elif [ -t 1 ]; then read -r choice </dev/tty || true; fi
+    if [ -z "$choice" ]; then printf '  Keeping current model.\n'; return 0; fi
+    local new_model=""
+    if [ "$choice" = "$((n+1))" ]; then
+        printf '  Enter model name: '
+        if [ -t 0 ]; then read -r new_model; elif [ -t 1 ]; then read -r new_model </dev/tty || true; fi
+    elif printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+        new_model="$(printf '%s' "$ids" | sed -n "${choice}p")"
+    else
+        printf '  Invalid choice.\n' >&2; return 1
+    fi
+    if [ -n "$new_model" ] && [ -f "$env_file" ]; then
+        python3 - "$env_file" "$new_model" << 'PY'
+import sys, re
+p, m = sys.argv[1], sys.argv[2]
+s = open(p).read()
+if re.search(r'^OPENROUTER_MODEL=', s, re.M):
+    s = re.sub(r'^OPENROUTER_MODEL=.*$', 'OPENROUTER_MODEL='+m, s, flags=re.M)
+else:
+    s += '\nOPENROUTER_MODEL='+m+'\n'
+open(p,'w').write(s)
+PY
+        printf '  OpenRouter model set to: %s\n' "$new_model"
+    fi
+}
+
+_cor_model_current() {
+    local env_file="__PERSISTENCE_DIR__/.env.openrouter"
+    if [ -f "$env_file" ]; then
+        local m; m="$(sed -n 's/^OPENROUTER_MODEL=//p' "$env_file" 2>/dev/null | head -1)"
+        [ -z "$m" ] && m="(not set)"
+        printf 'OpenRouter model: %s\n' "$m"
+    else
+        printf 'No .env.openrouter found.\n'
+    fi
 }
 
 # ── Dynamic model discovery (free models change frequently) ───────────────
@@ -1021,6 +1217,10 @@ cz-proxy-start() { cz_proxy_start "$@"; }
 cz-proxy-stop()  { cz_proxy_stop "$@"; }
 cz-proxy-status(){ cz_proxy_status "$@"; }
 cz-undo-danger() { _cz_uninstall_danger_rules "$@"; }
+cor()             { _cor_launch "$@"; }
+cor-danger()      { _cor_launch_danger "$@"; }
+cor-model()       { _cor_model_pick "$@"; }
+cor-model-current(){ _cor_model_current "$@"; }
 
 cz-help() {
     cat << 'HELPEOF'
@@ -1195,6 +1395,26 @@ JSONEOF
     printf '  Created %s (fallback, with statusLine)\n' "${SETTINGS_FILE}"
 fi
 
+# OpenRouter settings: same statusLine + modelSettings, but NO ANTHROPIC_* env
+# overrides, so `cor` can supply OpenRouter's base URL / key / model via shell env.
+if [ -f "${SETTINGS_FILE}" ]; then
+    python3 - "${SETTINGS_FILE}" "${OPENROUTER_SETTINGS_FILE}" << 'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    data = json.load(f)
+env = data.get("env", {})
+for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY"):
+    env.pop(k, None)
+data["env"] = env
+# The model comes from ANTHROPIC_MODEL env (set by `cor`), never a fixed id.
+data.pop("model", None)
+with open(dst, "w") as f:
+    json.dump(data, f, indent=2); f.write("\n")
+print(f"  Created {dst} (OpenRouter, statusLine)")
+PY
+fi
+
 # ─── 7. Claude Code persistence (survives devcontainer rebuild) ─────────────
 printf '\n%s\n' "=== Step 7: Claude Code persistence ==="
 CLAUDE_PERSIST_DIR="${SCRIPT_DIR}/.claude_persist"
@@ -1302,9 +1522,12 @@ cat << SUMMARY
   Activate:     source ~/${SHELL_RC}
 
   Quick start:
-    cz                  Pick a model -> launch Claude Code through proxy
+    cz                  Pick a model -> launch Claude Code through Zen proxy
     cz-danger           Same, with auto-accept permissions
-    cz-model            Change the model
+    cor                 Launch Claude Code via OpenRouter (more stable, real usage stats)
+    cor-danger          Same, with auto-accept permissions
+    cz-model            Change Zen model
+    cor-model           Change OpenRouter model
 
   Other commands:
     ccz                 Resume most recent session
@@ -1313,7 +1536,8 @@ cat << SUMMARY
     cz-proxy-start      Start proxy daemon (auto-started on cz launch)
     cz-proxy-stop       Stop proxy daemon
     cz-proxy-status     Check proxy status
-    cz-model-current    Show current model
+    cz-model-current    Show current Zen model
+    cor-model-current   Show current OpenRouter model
     cz-undo-danger      Remove danger guardrails from CLAUDE.md
     cz-help             Show all commands
 

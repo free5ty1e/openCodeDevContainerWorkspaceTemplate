@@ -287,6 +287,31 @@ The status line shows the model, **effort level**, thinking on/off, git branch Â
 
 > **Note on context usage:** when routed through the Zen proxy, the upstream free models don't report input-token counts, so the context bar shows `n/a` and token/cost stats are hidden. They populate automatically under `cz-cloud` (direct Anthropic) or any upstream that returns usage.
 
+## OpenRouter (alternative, more stable backend)
+
+If the Zen proxy's thinking/tool translation gives you trouble, you can point Claude Code **directly** at [OpenRouter](https://openrouter.ai), which exposes a native **Anthropic-compatible** Messages API. There is no custom translation proxy, so there are no thinking-block or signature bugs, and OpenRouter reports real token usage back (so the status line's context bar and cache-hit % populate).
+
+### Configure
+
+The setup script creates `.claude_zen/.env.openrouter` (it prompts for a key; get a free one at https://openrouter.ai/keys). Edit it anytime:
+
+```bash
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=google/gemini-2.0-flash-001:free   # free; or anthropic/claude-3.7-sonnet, openai/gpt-4o, etc.
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `cor` | Launch Claude Code directly via OpenRouter |
+| `cor-danger` | Same, with auto-accept permissions |
+| `cor-model` | Pick an OpenRouter model (updates `.env.openrouter`) |
+| `cor-model-current` | Show the current OpenRouter model |
+
+`cor` uses the same status line as `cz`. No proxy daemon is required, and Claude Code talks its own protocol end-to-end.
+
 ## Project Structure
 
 ```
