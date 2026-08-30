@@ -5,3 +5,5 @@ bak/
 .claude_zen/
 .claude_config/
 .claude_persist/
+.venv
+*.pyc
