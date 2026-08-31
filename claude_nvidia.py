@@ -499,7 +499,7 @@ def setup_claude_persistence():
         # Regular directory - check if it's empty or has content
         if not os.listdir(CLAUDE_CONFIG_DIR):
             # Empty directory - just symlink it
-            os.unlink(CLAUDE_CONFIG_DIR)
+            shutil.rmtree(CLAUDE_CONFIG_DIR)
             os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
             print(f"  ✅ Symlinked empty ~/.claude → {CLAUDE_PERSIST_DIR}")
         else:
@@ -510,7 +510,7 @@ def setup_claude_persistence():
                 shutil.rmtree(CLAUDE_PERSIST_DIR)
             shutil.copytree(CLAUDE_CONFIG_DIR, CLAUDE_PERSIST_DIR, dirs_exist_ok=True)
             # Now replace with symlink
-            os.unlink(CLAUDE_CONFIG_DIR)
+            shutil.rmtree(CLAUDE_CONFIG_DIR)
             os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
             print(f"  ✅ Migrated ~/.claude → {CLAUDE_PERSIST_DIR}")
     else:
