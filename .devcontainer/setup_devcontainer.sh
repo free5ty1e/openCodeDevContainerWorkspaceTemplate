@@ -21,10 +21,10 @@ echo ""
 echo "📁 Initializing .ai_working/..."
 bash .devcontainer/setup_ai_working.sh
 
-# 3. Mount RB4 DLC share (if available)
-echo ""
-echo "📦 Mounting RB4 DLC share..."
-bash .devcontainer/mount_rb4_dlc.sh
+# # 3. Mount RB4 DLC share (if available)
+# echo ""
+# echo "📦 Mounting RB4 DLC share..."
+# bash .devcontainer/mount_rb4_dlc.sh
 
 # 4. Fix permissions for opencode data
 echo ""

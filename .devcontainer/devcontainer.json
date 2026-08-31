@@ -7,12 +7,12 @@
   },
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-  "mounts": [
-    "source=${localWorkspaceFolder}/.ai_working/opencode_data,target=/home/vscode/.local/share/opencode,type=bind,consistency=cached",
-    "source=${localWorkspaceFolder}/.ai_working/opencode_data/state,target=/home/vscode/.local/state,type=bind,consistency=cached",
-    "source=/etc/localtime,target=/etc/localtime,type=bind,readonly=true",
-    "source=/etc/timezone,target=/etc/timezone,type=bind,readonly=true"
-  ],
+  // "mounts": [
+  //   "source=${localWorkspaceFolder}/.ai_working/opencode_data,target=/home/vscode/.local/share/opencode,type=bind,consistency=cached",
+  //   "source=${localWorkspaceFolder}/.ai_working/opencode_data/state,target=/home/vscode/.local/state,type=bind,consistency=cached",
+  //   "source=/etc/localtime,target=/etc/localtime,type=bind,readonly=true",
+  //   "source=/etc/timezone,target=/etc/timezone,type=bind,readonly=true"
+  // ],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -29,20 +29,20 @@
       }
     }
   },
-  "forwardPorts": [
-    3000,
-    11434
-  ],
-  "portsAttributes": {
-    "3000": {
-      "label": "Preview",
-      "onAutoForward": "notify"
-    },
-    "11434": {
-      "label": "Ollama",
-      "onAutoForward": "notify"
-    }
-  },
+  // "forwardPorts": [
+  //   3000,
+  //   11434
+  // ],
+  // "portsAttributes": {
+  //   "3000": {
+  //     "label": "Preview",
+  //     "onAutoForward": "notify"
+  //   },
+  //   "11434": {
+  //     "label": "Ollama",
+  //     "onAutoForward": "notify"
+  //   }
+  // },
   "postCreateCommand": "bash .devcontainer/setup_devcontainer.sh",
   "remoteUser": "vscode"
 }
