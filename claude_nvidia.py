@@ -480,15 +480,32 @@ def start_proxy():
     """Start the litellm proxy in the background and wait until ready."""
     stop_running_proxy()
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    # Always prefer the workspace venv litellm binary; fall back to shutil.which
-    litellm_bin = "/workspace/.venv/bin/litellm"
-    if not os.path.isfile(litellm_bin) or not os.access(litellm_bin, os.X_OK):
+    # Try litellm binary sources in order of preference
+    litellm_bin = None
+    # 1. Try workspace venv
+    venv_litellm = "/workspace/.venv/bin/litellm"
+    if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
+        litellm_bin = venv_litellm
+    # 2. Try shutil.which
+    if litellm_bin is None:
         bin_path = shutil.which("litellm")
         if bin_path:
             litellm_bin = bin_path
+    # 3. Last resort: use python -m litellm with venv python
+    if litellm_bin is None:
+        venv_python = "/workspace/.venv/bin/python3"
+        if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
+            litellm_bin = [venv_python, "-m", "litellm"]
+        else:
+            litellm_bin = [sys.executable, "-m", "litellm"]
     with open(LOG_FILE, "w") as logf:
+        # litellm_bin may be a string path or a list [python, "-m", "litellm"]
+        if isinstance(litellm_bin, str):
+            cmd = [litellm_bin, "--config", CONFIG_FILE, "--port", str(PROXY_PORT)]
+        else:
+            cmd = litellm_bin + ["--config", CONFIG_FILE, "--port", str(PROXY_PORT)]
         proc = subprocess.Popen(
-            [litellm_bin, "--config", CONFIG_FILE, "--port", str(PROXY_PORT)],
+            cmd,
             stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,
