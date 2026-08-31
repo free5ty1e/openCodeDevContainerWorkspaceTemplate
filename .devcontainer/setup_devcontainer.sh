@@ -31,6 +31,15 @@ echo ""
 echo "🔧 Fixing permissions..."
 mkdir -p /home/vscode/.local/state /home/vscode/.local/share /home/vscode/.local/config 2>/dev/null || true
 sudo chown -R vscode:vscode /home/vscode/.local 2>/dev/null || chown -R vscode:vscode /home/vscode/.local 2>/dev/null || true
+# opencode writes temp files to /tmp/opencode; ensure it's writable by the
+# vscode user. This dir is root-owned by default, which crashes opencode.
+if [ -d /tmp/opencode ]; then
+    sudo chown -R vscode:vscode /tmp/opencode 2>/dev/null \
+        || chown -R vscode:vscode /tmp/opencode 2>/dev/null || true
+else
+    mkdir -p /tmp/opencode 2>/dev/null || true
+    sudo chown -R vscode:vscode /tmp/opencode 2>/dev/null || true
+fi
 echo "   ✅ Permissions fixed"
 
 # 5. Initialize PS4 PKG investigation tools
