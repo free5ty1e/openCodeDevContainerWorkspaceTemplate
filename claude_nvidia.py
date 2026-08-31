@@ -68,13 +68,14 @@ def _claude_version_ok():
     if shutil.which("claude") is None:
         return False
     rc, out = _run(["claude", "--version"])
-    # Check for various success conditions
-    if rc != 0:
+    # Accept if version output is non-empty and doesn't contain error messages
+    if rc != 0 or not out:
         return False
-    # Accept if version string is present OR if stderr is empty (no error messages)
-    has_version = "2.1.251" in out or "2.0" in out or "1." in out
-    no_errors = "error" not in out.lower() and "not installed" not in out.lower()
-    return has_version and no_errors
+    # Check that it looks like a valid version (has digits and dots)
+    import re
+    has_valid_version = bool(re.match(r".*\d+\.\d+", out.strip()))
+    no_error_messages = "error" not in out.lower() and "not installed" not in out.lower()
+    return has_valid_version and no_error_messages
 
 
 def ensure_claude_cli():
@@ -91,20 +92,23 @@ def ensure_claude_cli():
 
     print("  📦 Installing claude CLI via npm (@anthropic-ai/claude-code)...")
     # npm global installs often need root inside a devcontainer.
-    npm_cmd = ["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code", "@anthropic-ai/claude-code"]
+    # Use --legacy-peer-deps to avoid peer dependency issues, and --no-audit
+    # to speed up install. rc=217 (EPIPE) can happen in devcontainers and is
+    # usually non-fatal - retry once.
+    npm_cmd = ["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code", "@anthropic-ai/claude-code", "--legacy-peer-deps", "--no-audit"]
     rc, out = _run(npm_cmd)
     print(f"   npm install rc={rc}")
 
-    # Check if install failed for non-permission reasons
-    if rc != 0 and "npm ERR!" in out:
-        print(f"   npm install had errors: {out[:200]}")
-        # Try with sudo if not already root
-        if os.geteuid() != 0:
-            rc, out = _run(["sudo"] + npm_cmd)
-        else:
-            print("   Skipping sudo retry (already running as root)")
+    # Retry once if rc=217 (EPIPE) or other non-permission errors
+    if rc != 0 and rc != 0 and "permission" not in out.lower():
+        print("   Retrying install...")
+        rc, out = _run(npm_cmd)
 
-    # Find the installed package dir to fix the native binary if postinstall was skipped.
+    # Check if install failed for permission reasons
+    if rc != 0 and ("permission" in out.lower() or "EACCES" in out or "EPIPE" in out):
+        rc, out = _run(["sudo"] + npm_cmd)
+
+    # Find the installed package dir to fix the native binary if postinit was skipped.
     pkg_dir = None
     for cand in [
         "/usr/lib/node_modules/@anthropic-ai/claude-code",
@@ -131,7 +135,9 @@ def ensure_claude_cli():
                     _run(["sudo", "rm", "-f", stale])
         rc3, out3 = _run(["node", install_cjs])
         print(f"   node install rc={rc3}")
-        if not _claude_version_ok() and "permission" in out3.lower():
+        # After install.cjs, verify and potentially re-run
+        if not _claude_version_ok():
+            # Try one more time with sudo
             _run(["sudo", "node", install_cjs])
 
     if _claude_version_ok():
