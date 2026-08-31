@@ -482,7 +482,7 @@ def start_proxy():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     # Try litellm binary sources in order of preference
     litellm_bin = None
-    # 1. Try workspace venv
+    # 1. Try workspace venv litellm binary
     venv_litellm = "/workspace/.venv/bin/litellm"
     if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
         litellm_bin = venv_litellm
@@ -491,13 +491,19 @@ def start_proxy():
         bin_path = shutil.which("litellm")
         if bin_path:
             litellm_bin = bin_path
-    # 3. Last resort: use python -m litellm with venv python
+    # 3. Last resort: ensure litellm is available, then use python -m litellm
     if litellm_bin is None:
+        # Ensure litellm is installed for the venv python
         venv_python = "/workspace/.venv/bin/python3"
         if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
-            litellm_bin = [venv_python, "-m", "litellm"]
-        else:
-            litellm_bin = [sys.executable, "-m", "litellm"]
+            # Install litellm in the venv
+            subprocess.run(
+                [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
+                capture_output=True, timeout=120,
+            )
+        # Use venv python or fall back to system python
+        python_to_use = venv_python if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK) else sys.executable
+        litellm_bin = [python_to_use, "-m", "litellm"]
     with open(LOG_FILE, "w") as logf:
         # litellm_bin may be a string path or a list [python, "-m", "litellm"]
         if isinstance(litellm_bin, str):
