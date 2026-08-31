@@ -23,6 +23,15 @@ LOG_FILE = os.path.join(CONFIG_DIR, "proxy.log")
 PID_FILE = os.path.join(CONFIG_DIR, "proxy.pid")
 
 # ─── Step 1: Check & install prerequisites ──────────────────────────────
+def _get_python():
+    """Return the python executable to use for pip installs.
+    Prefers the workspace virtualenv if it exists."""
+    venv_python = "/workspace/.venv/bin/python3"
+    if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
+        return venv_python
+    return sys.executable
+
+
 def install_if_missing(pkg_name, pip_name=None):
     """Check if a package is importable; install via pip if not."""
     pip_name = pip_name or pkg_name
@@ -35,7 +44,7 @@ def install_if_missing(pkg_name, pip_name=None):
     print(f"  📦 Installing {pip_name}...")
     try:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", pip_name],
+            [_get_python(), "-m", "pip", "install", "-q", pip_name],
             check=True,
             capture_output=True,
         )
@@ -381,14 +390,67 @@ def stop_running_proxy():
             pass
 
 
+def _get_venv_python():
+    """Return the workspace virtualenv python executable, if it exists."""
+    venv_py = "/workspace/.venv/bin/python3"
+    if os.path.isfile(venv_py) and os.access(venv_py, os.X_OK):
+        return venv_py
+    return None
+
+
+def _get_python():
+    """Return the python executable to use for pip installs.
+    Prefers the workspace virtualenv if it exists."""
+    venv_python = _get_venv_python()
+    if venv_python:
+        return venv_python
+    return sys.executable
+
+
+def _get_litellm_bin():
+    """Return the path to the litellm binary, preferring the venv."""
+    # Check venv first
+    venv_litellm = "/workspace/.venv/bin/litellm"
+    if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
+        return venv_litellm
+    # Fall back to shutil.which
+    bin_path = shutil.which("litellm")
+    if bin_path:
+        return bin_path
+    # Last resort: use the python -m approach with venv python
+    return None
+
+
+def install_if_missing(pkg_name, pip_name=None):
+    """Check if a package is importable; install via pip if not."""
+    pip_name = pip_name or pkg_name
+    try:
+        __import__(pkg_name)
+        print(f"  ✅ {pkg_name} already available")
+        return True
+    except ImportError:
+        pass
+    print(f"  📦 Installing {pip_name}...")
+    try:
+        subprocess.run(
+            [_get_python(), "-m", "pip", "install", "-q", pip_name],
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        print(f"  ❌ Failed to install {pip_name}.")
+        return False
+
+
 def start_proxy():
     """Start the litellm proxy in the background and wait until ready."""
     stop_running_proxy()
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    litellm_bin = shutil.which("litellm")
+    litellm_bin = _get_litellm_bin()
     if litellm_bin is None:
-        # Fall back to the module's console entry point location.
-        litellm_bin = os.path.join(os.path.dirname(sys.executable), "litellm")
+        # Try using the venv python with -m litellm
+        litellm_bin = "/workspace/.venv/bin/python3"
     with open(LOG_FILE, "w") as logf:
         proc = subprocess.Popen(
             [litellm_bin, "--config", CONFIG_FILE, "--port", str(PROXY_PORT)],
