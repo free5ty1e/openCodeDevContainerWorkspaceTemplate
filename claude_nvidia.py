@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 import subprocess
@@ -449,7 +450,106 @@ def test_proxy_connection(selected_model):
 
 
 # ─── Step 9: Launch Claude Code ──────────────────────────────────────────
-def launch_claude_with_model(selected_model):
+def setup_claude_persistence():
+    """Set up Claude Code persistence using .claude_persist in workspace.
+
+    Migrates ~/.claude to workspace/.claude_persist so sessions survive
+    devcontainer rebuilds. This mirrors the pattern from setup_claude_zen_devcontainer.sh.
+    """
+    import shutil
+
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    WORKSPACE_ROOT = os.path.abspath(SCRIPT_DIR)
+    CLAUDE_PERSIST_DIR = os.path.join(WORKSPACE_ROOT, ".claude_persist")
+    CLAUDE_CONFIG_DIR = os.path.expanduser("~/.claude")
+
+    # Ensure the persist directory exists
+    os.makedirs(CLAUDE_PERSIST_DIR, exist_ok=True)
+
+    # Check current state of ~/.claude
+    if os.path.islink(CLAUDE_CONFIG_DIR):
+        # Already a symlink - check if it points to our persist dir
+        try:
+            CURRENT_TARGET = os.readlink(CLAUDE_CONFIG_DIR)
+        except OSError:
+            CURRENT_TARGET = ""
+        if CURRENT_TARGET == CLAUDE_PERSIST_DIR:
+            print(f"✅ ~/.claude already symlinked to {CLAUDE_PERSIST_DIR}")
+            return
+        else:
+            print(f"  ~/.claude symlinked to {CURRENT_TARGET}, re-linking to {CLAUDE_PERSIST_DIR}")
+            # Migrate existing content if persist dir is empty
+            if not os.path.exists(CLAUDE_PERSIST_DIR) or not os.listdir(CLAUDE_PERSIST_DIR):
+                print(f"  Migrating existing ~/.claude content to {CLAUDE_PERSIST_DIR}")
+                # Remove the symlink first
+                os.unlink(CLAUDE_CONFIG_DIR)
+                # Copy content from original target if it still exists
+                if os.path.isdir(CURRENT_TARGET):
+                    shutil.copytree(CURRENT_TARGET, CLAUDE_PERSIST_DIR, dirs_exist_ok=True)
+                # Now create symlink
+                os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
+                print(f"  ✅ Migrated ~/.claude → {CLAUDE_PERSIST_DIR}")
+            else:
+                # Persist dir has content, just re-point the symlink
+                os.unlink(CLAUDE_CONFIG_DIR)
+                os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
+                print(f"  ✅ Re-linked ~/.claude → {CLAUDE_PERSIST_DIR}")
+            return
+    elif os.path.isdir(CLAUDE_CONFIG_DIR):
+        # Regular directory - check if it's empty or has content
+        if not os.listdir(CLAUDE_CONFIG_DIR):
+            # Empty directory - just symlink it
+            os.unlink(CLAUDE_CONFIG_DIR)
+            os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
+            print(f"  ✅ Symlinked empty ~/.claude → {CLAUDE_PERSIST_DIR}")
+        else:
+            # Has content - copy to persist dir and symlink
+            print(f"  Copying existing ~/.claude to {CLAUDE_PERSIST_DIR}")
+            # Remove the persist dir if it exists and copy content
+            if os.path.exists(CLAUDE_PERSIST_DIR):
+                shutil.rmtree(CLAUDE_PERSIST_DIR)
+            shutil.copytree(CLAUDE_CONFIG_DIR, CLAUDE_PERSIST_DIR, dirs_exist_ok=True)
+            # Now replace with symlink
+            os.unlink(CLAUDE_CONFIG_DIR)
+            os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
+            print(f"  ✅ Migrated ~/.claude → {CLAUDE_PERSIST_DIR}")
+    else:
+        # No ~/.claude exists yet - create symlink
+        os.symlink(CLAUDE_PERSIST_DIR, CLAUDE_CONFIG_DIR)
+        print(f"  ✅ Created ~/.claude → {CLAUDE_PERSIST_DIR} (populated on first launch)")
+
+
+def setup_statusline_symlink():
+    """Set up statusline.sh symlink in the Claude config directory.
+
+    Claude Code looks for statusline.sh in its config directory or we can
+    ensure it's available. We'll create a symlink from workspace/statusline.sh
+    to the Claude config location.
+    """
+    CLAUDE_CONFIG_DIR = os.path.expanduser("~/.claude")
+    # statusline_src is now set up via the persistence mechanism - it will be in ~/.claude/
+
+    # Check if statusline.sh exists in the workspace
+    workspace_statusline = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusline.sh")
+
+    if os.path.exists(workspace_statusline):
+        # Create symlink in the persist dir (which ~/.claude points to)
+        statusline_dst = os.path.join(CLAUDE_CONFIG_DIR, "statusline.sh")
+        if not os.path.exists(statusline_dst):
+            try:
+                # Ensure parent dir exists (should already via persistence setup)
+                os.makedirs(os.path.dirname(statusline_dst), exist_ok=True)
+                os.symlink(workspace_statusline, statusline_dst)
+                print(f"📐 Symlinked workspace statusline.sh → {statusline_dst}")
+            except OSError as e:
+                print(f"⚠️  Could not create symlink: {e}")
+        else:
+            print(f"✅ statusline.sh already exists at {statusline_dst}")
+    else:
+        print(f"⚠️  workspace statusline.sh not found at {workspace_statusline}")
+
+
+def launch_claude_with_model(selected_model, dangerously_skip_permissions=False):
     """Configure environment to use the litellm proxy and launch Claude Code."""
     env = os.environ.copy()
     # Point Claude Code at the local litellm proxy, which exposes the
@@ -462,6 +562,14 @@ def launch_claude_with_model(selected_model):
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     # Don't let claude try to discover/switch to a gateway model.
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"
+    # Pass through the dangerously skip permissions flag
+    env["CLAUDE_CODE_SKIP_PERMISSIONS"] = "1" if dangerously_skip_permissions else "0"
+
+    # Set up Claude Code persistence so sessions survive devcontainer rebuilds
+    setup_claude_persistence()
+
+    # Set up statusline.sh symlink so Claude Code uses our custom status line
+    setup_statusline_symlink()
 
     print("\n🚀 Launching Claude Code with selected NVIDIA model...")
     print("   (This will open an interactive Claude Code session)")
@@ -476,7 +584,7 @@ def launch_claude_with_model(selected_model):
 
 
 # ─── Usage Notes ─────────────────────────────────────────────────────────
-def print_usage_notes():
+def print_usage_notes(dangerously_skip_permissions=False):
     """Print usage notes and relevant environment variables."""
     print("=" * 60)
     print("  NVIDIA → Claude Code Bridge Script")
@@ -493,6 +601,14 @@ def print_usage_notes():
     print("     NVIDIA_API_KEY='nvapi-...'")
     print("   • Or run the script once - it will prompt and cache the key")
     print("     to ~/.nvidia_api_key_cache for future runs.")
+    print()
+    if dangerously_skip_permissions:
+        print("⚡  DANGEROUSLY SKIP PERMISSIONS: --dangerously-skip-permissions")
+        print("   Flag passed - Claude Code will skip permission prompts.")
+        print("   (Safe in devcontainer environments)")
+    else:
+        print("⚡  PERMISSIONS: Claude Code will show permission prompts")
+        print("   (Use --dangerously-skip-permissions to skip these)")
     print()
     print("🌐  HOW IT WORKS:")
     print("   Claude Code speaks the Anthropic Messages API (/v1/messages).")
@@ -514,7 +630,18 @@ def print_usage_notes():
 
 # ─── Main ────────────────────────────────────────────────────────────────
 def main():
-    print_usage_notes()
+    parser = argparse.ArgumentParser(
+        description="Bridge NVIDIA NIM models with the Claude Code CLI"
+    )
+    parser.add_argument(
+        "--dangerously-skip-permissions",
+        action="store_true",
+        default=False,
+        help="Skip Claude Code permission prompts (safe in devcontainer environments)",
+    )
+    args = parser.parse_args()
+
+    print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
 
     if not ensure_prerequisites():
         print("❌ Prerequisites check failed. Exiting.")
@@ -542,7 +669,7 @@ def main():
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
             print("   Check ~/.claude_nvidia/proxy.log for details.")
             print("   You may still attempt to launch manually.")
-        launch_claude_with_model(selected_model)
+        launch_claude_with_model(selected_model, args.dangerously_skip_permissions)
     finally:
         # Stop the proxy after Claude Code exits.
         stop_running_proxy()
