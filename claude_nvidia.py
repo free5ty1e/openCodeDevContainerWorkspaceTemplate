@@ -104,9 +104,13 @@ def ensure_claude_cli():
     rc, out = _run(npm_cmd, label="npm-install")
     print(f"   npm install rc={rc}")
 
-    # Retry once if rc=217 (EPIPE) or other non-permission errors (but not if permission-related)
+    # Retry once if rc=217 (EPIPE/ENOTEMPTY) or other non-permission errors (but not if permission-related)
     if rc != 0 and "permission" not in out.lower():
-        print("   Retrying npm install...")
+        print("   Retrying npm install (cleaning target first)...")
+        # Try cleaning the global node_modules dir first
+        cleanup_cmd = ["npm", "bin", "cache", "clean", "--force"]
+        _run(cleanup_cmd, label="npm-cache-clean")
+        # Retry the install
         rc, out = _run(npm_cmd, label="npm-install-retry")
 
     # Check if install failed for permission reasons - use sudo if needed
