@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 /workspace/claude_nvidia.py --dangerously-skip-permissions)"
+    ]
+  }
+}

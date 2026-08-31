@@ -59,13 +59,23 @@ def _claude_version_ok():
     if shutil.which("claude") is None:
         return False
     rc, out = _run(["claude", "--version"])
-    if rc != 0 or "native binary not installed" in out:
+    # Check for various success conditions
+    if rc != 0:
         return False
-    return True
+    # Accept if version string is present OR if stderr is empty (no error messages)
+    has_version = "2.1.251" in out or "2.0" in out or "1." in out
+    no_errors = "error" not in out.lower() and "not installed" not in out.lower()
+    return has_version and no_errors
 
 
 def ensure_claude_cli():
     """Install the claude CLI via npm if not already present, fixing native binary."""
+    # First check node availability
+    node_result = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        print("  ❌ Node.js not found. Cannot install claude CLI.")
+        return False
+
     if _claude_version_ok():
         print("  ✅ claude CLI found (native binary OK).")
         return True
@@ -74,8 +84,16 @@ def ensure_claude_cli():
     # npm global installs often need root inside a devcontainer.
     npm_cmd = ["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code", "@anthropic-ai/claude-code"]
     rc, out = _run(npm_cmd)
-    if rc != 0 and "permissions" in out.lower():
-        rc, out = _run(["sudo"] + npm_cmd)
+    print(f"   npm install rc={rc}")
+
+    # Check if install failed for non-permission reasons
+    if rc != 0 and "npm ERR!" in out:
+        print(f"   npm install had errors: {out[:200]}")
+        # Try with sudo if not already root
+        if os.geteuid() != 0:
+            rc, out = _run(["sudo"] + npm_cmd)
+        else:
+            print("   Skipping sudo retry (already running as root)")
 
     # Find the installed package dir to fix the native binary if postinstall was skipped.
     pkg_dir = None
@@ -103,6 +121,7 @@ def ensure_claude_cli():
                 except PermissionError:
                     _run(["sudo", "rm", "-f", stale])
         rc3, out3 = _run(["node", install_cjs])
+        print(f"   node install rc={rc3}")
         if not _claude_version_ok() and "permission" in out3.lower():
             _run(["sudo", "node", install_cjs])
 
