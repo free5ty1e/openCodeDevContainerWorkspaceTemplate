@@ -54,11 +54,14 @@ def install_if_missing(pkg_name, pip_name=None):
         return False
 
 
-def _run(cmd):
-    """Run a command, return (rc, output)."""
+def _run(cmd, label=""):
+    """Run a command, return (rc, output).  Labels help with verbose logging."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return p.returncode, p.stdout + p.stderr
+        output = p.stdout + p.stderr
+        if label:
+            print(f"  [{label}] rc={p.returncode}, output={output[:200] if output else 'empty'}...")
+        return p.returncode, output
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
         return -1, str(e)
 
@@ -80,11 +83,13 @@ def _claude_version_ok():
 
 def ensure_claude_cli():
     """Install the claude CLI via npm if not already present, fixing native binary."""
-    # First check node availability
+    # First check node availability with verbose logging
+    print("  🔍 Checking node.js availability...")
     node_result = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=10)
     if node_result.returncode != 0:
         print("  ❌ Node.js not found. Cannot install claude CLI.")
         return False
+    print(f"  ✅ Node.js available: {node_result.stdout.strip()}")
 
     if _claude_version_ok():
         print("  ✅ claude CLI found (native binary OK).")
@@ -96,17 +101,18 @@ def ensure_claude_cli():
     # to speed up install. rc=217 (EPIPE) can happen in devcontainers and is
     # usually non-fatal - retry once.
     npm_cmd = ["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code", "@anthropic-ai/claude-code", "--legacy-peer-deps", "--no-audit"]
-    rc, out = _run(npm_cmd)
+    rc, out = _run(npm_cmd, label="npm-install")
     print(f"   npm install rc={rc}")
 
-    # Retry once if rc=217 (EPIPE) or other non-permission errors
-    if rc != 0 and rc != 0 and "permission" not in out.lower():
-        print("   Retrying install...")
-        rc, out = _run(npm_cmd)
+    # Retry once if rc=217 (EPIPE) or other non-permission errors (but not if permission-related)
+    if rc != 0 and "permission" not in out.lower():
+        print("   Retrying npm install...")
+        rc, out = _run(npm_cmd, label="npm-install-retry")
 
-    # Check if install failed for permission reasons
+    # Check if install failed for permission reasons - use sudo if needed
     if rc != 0 and ("permission" in out.lower() or "EACCES" in out or "EPIPE" in out):
-        rc, out = _run(["sudo"] + npm_cmd)
+        print("   Install failed with permission error, retrying with sudo...")
+        rc, out = _run(["sudo"] + npm_cmd, label="npm-install-sudo")
 
     # Find the installed package dir to fix the native binary if postinit was skipped.
     pkg_dir = None
@@ -119,7 +125,7 @@ def ensure_claude_cli():
             pkg_dir = cand
             break
     if pkg_dir is None:
-        rc2, out2 = _run(["npm", "root", "-g"])
+        rc2, out2 = _run(["npm", "root", "-g"], label="npm-root")
         pkg_dir = os.path.join(out2.strip(), "@anthropic-ai", "claude-code")
 
     install_cjs = os.path.join(pkg_dir, "install.cjs")
@@ -132,13 +138,13 @@ def ensure_claude_cli():
                 try:
                     os.remove(stale)
                 except PermissionError:
-                    _run(["sudo", "rm", "-f", stale])
-        rc3, out3 = _run(["node", install_cjs])
+                    _run(["sudo", "rm", "-f", stale], label="rm-stale")
+        rc3, out3 = _run(["node", install_cjs], label="node-install")
         print(f"   node install rc={rc3}")
         # After install.cjs, verify and potentially re-run
         if not _claude_version_ok():
             # Try one more time with sudo
-            _run(["sudo", "node", install_cjs])
+            _run(["sudo", "node", install_cjs], label="node-install-sudo")
 
     if _claude_version_ok():
         print("  ✅ claude CLI installed and working.")
