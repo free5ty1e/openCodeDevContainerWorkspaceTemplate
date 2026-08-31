@@ -1,0 +1,250 @@
+AnyApi models test list: 
+Burned 100k daily tokens on this then rest were 402'ing
+
+Found 291 models. Testing them sequentially to respect rate limits...
+
+❌ nvidia/nemotron-3-nano-30b-a3b:free: HTTP 404
+❌ nvidia/nemotron-nano-12b-v2-vl:free: HTTP 404
+❌ nvidia/nemotron-nano-9b-v2:free: HTTP 404
+❌ qwen/qwen3-coder:free: HTTP 404
+❌ google/gemma-4-26b-a4b-it:free: HTTP 429
+✅ nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free: OK
+❌ poolside/laguna-xs.2:free: HTTP 404
+❌ poolside/laguna-m.1:free: HTTP 404
+✅ nvidia/nemotron-3-ultra-550b-a55b:free: The user wants me to
+❌ dots-studio/dots-3-note-preview:free: Failed ('NoneType' object has no attribute 'strip')
+❌ stealth/ox-alpha: HTTP 404
+✅ anthropic/claude-sonnet-4: OK
+✅ amazon/nova-lite-v1: OK
+✅ openai/gpt-oss-120b: 
+❌ openai/gpt-oss-20b: Failed ('NoneType' object has no attribute 'strip')
+✅ amazon/nova-2-lite-v1: OK
+✅ anthropic/claude-haiku-4.5: OK
+❌ qwen/qwen3-coder-30b-a3b-instruct: Failed ('NoneType' object has no attribute 'strip')
+✅ qwen/qwen3-32b: OK
+❌ moonshotai/kimi-k2.5: Failed ('NoneType' object has no attribute 'strip')
+❌ google/gemini-2.5-flash: Failed ('NoneType' object has no attribute 'strip')
+✅ google/gemini-2.5-pro: OK
+❌ google/gemini-2.0-flash-001: HTTP 404
+✅ anthropic/claude-sonnet-4.6: OK
+❌ moonshotai/kimi-k2-thinking: Failed ('NoneType' object has no attribute 'strip')
+✅ anthropic/claude-sonnet-4.5: OK
+✅ openai/gpt-4.1: OK
+✅ openai/gpt-4o: OK
+✅ openai/gpt-4o-mini: OK
+❌ openai/gpt-5: Failed ('NoneType' object has no attribute 'strip')
+❌ openai/gpt-5-mini: Failed ('NoneType' object has no attribute 'strip')
+❌ openai/gpt-5-nano: Failed ('NoneType' object has no attribute 'strip')
+❌ openai/gpt-5.1-codex-max: HTTP 404
+✅ openai/gpt-5.2: OK
+❌ openai/o3: Failed ('NoneType' object has no attribute 'strip')
+❌ openai/o3-mini: Failed ('NoneType' object has no attribute 'strip')
+✅ openai/gpt-4.1-mini: OK
+✅ openai/gpt-4.1-nano: OK
+✅ openai/gpt-4o-2024-11-20: OK
+✅ openai/gpt-4o-2024-08-06: OK
+✅ openai/gpt-4o-mini-2024-07-18: OK
+✅ openai/gpt-4-turbo: OK
+✅ openai/gpt-3.5-turbo-0613: OK
+✅ openai/gpt-3.5-turbo-instruct: OK
+✅ openai/gpt-3.5-turbo-16k: OK
+✅ openai/gpt-3.5-turbo: OK
+✅ cohere/command-r7b-12-2024: OK
+✅ cohere/command-r-plus-08-2024: OK
+✅ cohere/command-r-08-2024: OK.
+✅ qwen/qwen-2.5-coder-32b-instruct: OK
+✅ deepseek/deepseek-r1-0528: OK
+✅ deepseek/deepseek-chat: OK
+✅ mancer/weaver: Alex: *
+✅ undi95/remm-slerp-l2-13b: OK
+✅ gryphe/mythomax-l2-13b: OK
+✅ mistralai/mistral-small-3.2-24b-instruct: OK
+✅ mistralai/mistral-small-3.1-24b-instruct: OK.
+❌ mistralai/mistral-large-2407: HTTP 429
+✅ mistralai/mixtral-8x22b-instruct: OK
+❌ microsoft/wizardlm-2-8x22b: HTTP 429
+❌ mistralai/mistral-large: HTTP 429
+✅ anthropic/claude-3-haiku: OK
+❌ perplexity/sonar-reasoning-pro: HTTP 400
+❌ perplexity/sonar-pro: HTTP 400
+❌ perplexity/sonar-deep-research: HTTP 400
+❌ openai/o3-mini-high: Failed ('NoneType' object has no attribute 'strip')
+❌ perplexity/sonar: HTTP 400
+✅ meta-llama/llama-3.3-70b-instruct: OK
+✅ qwen/qwen3-coder: OK
+✅ bytedance/ui-tars-1.5-7b: OK
+✅ google/gemini-2.5-flash-lite: OK
+✅ deepseek/deepseek-chat-v3.1: OK
+❌ z-ai/glm-4.6: Failed ('NoneType' object has no attribute 'strip')
+✅ openai/gpt-5.1-codex-mini: OK
+❌ openai/o4-mini: Failed ('NoneType' object has no attribute 'strip')
+❌ openai/gpt-5-pro: Failed (The read operation timed out)
+❌ openai/gpt-5-image: Failed ('NoneType' object has no attribute 'strip')
+✅ google/gemma-2-27b-it: OK
+✅ mistralai/mistral-nemo: OK
+✅ meta-llama/llama-3.1-70b-instruct: OK
+✅ meta-llama/llama-3.1-8b-instruct: OK
+✅ sao10k/l3-lunaris-8b: OK
+✅ nousresearch/hermes-3-llama-3.1-405b: OK
+✅ nousresearch/hermes-3-llama-3.1-70b: * [User:
+✅ sao10k/l3.1-euryale-70b: OK
+✅ qwen/qwen-2.5-72b-instruct: OK
+✅ meta-llama/llama-3.2-3b-instruct: OK
+❌ thedrummer/rocinante-12b: HTTP 404
+✅ qwen/qwen-2.5-7b-instruct: OK
+✅ anthracite-org/magnum-v4-72b: OK
+✅ thedrummer/unslopnemo-12b: OK
+✅ sao10k/l3.3-euryale-70b: OK
+❌ sao10k/l3.1-70b-hanami-x1: HTTP 404
+✅ microsoft/phi-4: OK
+❌ deepseek/deepseek-r1-distill-llama-70b: Failed ('NoneType' object has no attribute 'strip')
+✅ mistralai/mistral-small-24b-instruct-2501: OK
+✅ qwen/qwen-plus: OK
+✅ qwen/qwen2.5-vl-72b-instruct: OK
+✅ mistralai/mistral-saba: OK
+✅ thedrummer/skyfall-36b-v2: OK
+✅ google/gemma-3-27b-it: OK
+✅ cohere/command-a: OK
+✅ google/gemma-3-12b-it: OK
+✅ google/gemma-3-4b-it: OK
+✅ deepseek/deepseek-chat-v3-0324: OK
+✅ meta-llama/llama-4-scout: OK
+✅ meta-llama/llama-4-maverick: OK
+❌ bytedance-seed/seed-1.6-flash: Failed ('NoneType' object has no attribute 'strip')
+❌ minimax/minimax-m2.1: Failed ('NoneType' object has no attribute 'strip')
+✅ google/gemini-3-flash-preview: OK
+✅ nvidia/nemotron-3-nano-30b-a3b: We need to respond with
+❌ openai/gpt-5.2-chat: HTTP 404
+✅ relace/relace-search: OK
+❌ z-ai/glm-4.6v: Failed ('NoneType' object has no attribute 'strip')
+✅ mistralai/ministral-14b-2512: OK
+✅ mistralai/ministral-8b-2512: OK.
+✅ mistralai/ministral-3b-2512: OK
+❌ mistralai/mistral-large-2512: HTTP 429
+❌ allenai/olmo-3-32b-think: HTTP 404
+❌ google/gemini-3-pro-image-preview: Failed ('NoneType' object has no attribute 'strip')
+❌ deepcogito/cogito-v2.1-671b: HTTP 404
+✅ openai/gpt-5.1: OK
+✅ openai/gpt-5.1-codex: OK
+✅ amazon/nova-premier-v1: OK
+
+If you
+❌ perplexity/sonar-pro-search: HTTP 400
+✅ mistralai/voxtral-small-24b-2507: OK
+❌ openai/gpt-oss-safeguard-20b: Failed ('NoneType' object has no attribute 'strip')
+❌ minimax/minimax-m2: Failed ('NoneType' object has no attribute 'strip')
+✅ qwen/qwen3-vl-32b-instruct: OK
+✅ ibm-granite/granite-4.0-h-micro: OK
+❌ openai/gpt-5-image-mini: Failed ('NoneType' object has no attribute 'strip')
+✅ qwen/qwen3-vl-8b-thinking: OK
+✅ qwen/qwen3-vl-8b-instruct: OK
+✅ google/gemini-2.5-flash-image: OK
+✅ qwen/qwen3-vl-30b-a3b-thinking: OK
+✅ qwen/qwen3-vl-30b-a3b-instruct: OK
+✅ deepseek/deepseek-v3.2-exp: OK
+✅ thedrummer/cydonia-24b-v4.1: OK
+✅ qwen/qwen3-vl-235b-a22b-thinking: OK
+✅ qwen/qwen3-vl-235b-a22b-instruct: OK
+✅ qwen/qwen3-max: OK
+✅ qwen/qwen3-coder-plus: OK
+✅ deepseek/deepseek-v3.1-terminus: OK
+✅ qwen/qwen3-coder-flash: OK
+✅ qwen/qwen3-next-80b-a3b-thinking: OK
+✅ qwen/qwen3-next-80b-a3b-instruct: OK
+✅ qwen/qwen-plus-2025-07-28: OK
+❌ qwen/qwen-plus-2025-07-28:thinking: HTTP 404
+✅ moonshotai/kimi-k2-0905: OK
+✅ qwen/qwen3-30b-a3b-thinking-2507: OK
+✅ nousresearch/hermes-4-70b: OK
+✅ nousresearch/hermes-4-405b: OK
+✅ mistralai/mistral-medium-3.1: OK
+❌ z-ai/glm-4.5v: Failed ('NoneType' object has no attribute 'strip')
+❌ ai21/jamba-large-1.7: HTTP 404
+✅ mistralai/codestral-2508: OK
+✅ qwen/qwen3-30b-a3b-instruct-2507: OK
+✅ z-ai/glm-4.5: OK
+❌ z-ai/glm-4.5-air: Failed ('NoneType' object has no attribute 'strip')
+✅ qwen/qwen3-235b-a22b-thinking-2507: OK
+✅ qwen/qwen3-235b-a22b-2507: OK
+❌ switchpoint/router: HTTP 404
+✅ moonshotai/kimi-k2: OK
+✅ tencent/hunyuan-a13b-instruct: OK
+✅ baidu/ernie-4.5-vl-424b-a47b: OK
+❌ minimax/minimax-m1: Failed ('NoneType' object has no attribute 'strip')
+❌ google/gemma-3n-e4b-it: HTTP 404
+✅ mistralai/mistral-medium-3: OK
+✅ qwen/qwen3-30b-a3b: OK
+✅ qwen/qwen3-8b: OK
+❌ qwen/qwen3-14b: Failed ('NoneType' object has no attribute 'strip')
+✅ qwen/qwen3-235b-a22b: OK
+❌ openai/o4-mini-high: Failed ('NoneType' object has no attribute 'strip')
+✅ aion-labs/aion-rp-llama-3.1-8b: OK
+❌ inflection/inflection-3-pi: HTTP 404
+✅ openai/gpt-5.2-codex: OK
+✅ qwen/qwen3-coder-next: OK
+✅ minimax/minimax-m2-her: OK
+✅ writer/palmyra-x5: OK
+❌ openai/gpt-audio-mini: HTTP 400
+✅ morph/morph-v3-large: OK
+✅ morph/morph-v3-fast: OK
+❌ google/gemini-3.1-pro-preview: Failed ('NoneType' object has no attribute 'strip')
+✅ openai/gpt-5.3-codex: OK
+✅ deepseek/deepseek-v3.2: OK
+✅ meta-llama/llama-3.2-1b-instruct: OK
+✅ ai21/jamba-1-5-large: OK
+✅ ai21/jamba-1-5-mini: OK.
+❌ amazon/nova-2-multimodal-embeddings: HTTP 400
+❌ cohere/command-r-plus: HTTP 404
+❌ cohere/command-r: HTTP 404
+✅ mistral/mistral-large-2407-v1: OK
+✅ mistral/mistral-large-3-675b-instruct: OK
+✅ mistral/mistral-small-2402: OK
+✅ openai/gpt-5.4: OK
+✅ openai/gpt-5.4-nano: OK
+❌ minimax/minimax-m2.7: Failed ('NoneType' object has no attribute 'strip')
+❌ stepfun/step-3.5-flash: Failed ('NoneType' object has no attribute 'strip')
+✅ z-ai/glm-5.1: OK
+❌ z-ai/glm-5: Failed ('NoneType' object has no attribute 'strip')
+❌ z-ai/glm-4.7-flash: Failed ('NoneType' object has no attribute 'strip')
+✅ x-ai/grok-4.20-multi-agent: OK
+✅ x-ai/grok-4.20: OK
+✅ rekaai/reka-edge: OK
+✅ aion-labs/aion-2.0: OK
+✅ amazon/nova-micro-v1: OK
+✅ amazon/nova-pro-v1: OK
+❌ z-ai/glm-4.7: Failed ('NoneType' object has no attribute 'strip')
+✅ upstage/solar-pro-3: OK
+✅ qwen/qwen3.5-plus-02-15: OK
+✅ qwen/qwen3.5-flash-02-23: OK
+❌ qwen/qwen3.5-9b: Failed ('NoneType' object has no attribute 'strip')
+✅ qwen/qwen3.5-397b-a17b: OK
+✅ qwen/qwen3.5-35b-a3b: OK
+✅ qwen/qwen3.5-27b: OK
+✅ qwen/qwen3.5-122b-a10b: OK
+✅ qwen/qwen3-max-thinking: OK
+❌ openai/gpt-audio: HTTP 400
+✅ openai/gpt-5.4-mini: OK
+✅ nvidia/nemotron-3-super-120b-a12b: We need to respond exactly
+✅ mistralai/mistral-small-2603: OK
+✅ meta-llama/llama-guard-4-12b: safe
+✅ kwaipilot/kat-coder-pro-v2: OK
+❌ inception/mercury-2: Failed ('NoneType' object has no attribute 'strip')
+✅ google/gemma-4-26b-a4b-it: OK
+❌ google/gemini-3.1-pro-preview-customtools: Failed ('NoneType' object has no attribute 'strip')
+✅ google/gemini-3.1-flash-lite-preview: OK
+✅ google/gemini-3.1-flash-image-preview: OK
+✅ google/gemini-2.5-pro-preview-05-06: OK
+✅ google/gemini-2.5-pro-preview: OK
+❌ bytedance-seed/seed-2.0-mini: Failed ('NoneType' object has no attribute 'strip')
+❌ bytedance-seed/seed-2.0-lite: Failed ('NoneType' object has no attribute 'strip')
+❌ arcee-ai/trinity-large-thinking: Failed ('NoneType' object has no attribute 'strip')
+✅ google/gemma-4-31b-it: OK
+❌ minimax/minimax-m2.5: Failed ('NoneType' object has no attribute 'strip')
+✅ z-ai/glm-5-turbo: OK
+✅ moonshotai/kimi-k2.6: OK
+✅ qwen/qwen3.5-plus-20260420: OK
+✅ qwen/qwen3.6-flash: OK
+✅ qwen/qwen3.6-35b-a3b: OK
+✅ qwen/qwen3.6-max-preview: OK
+✅ qwen/qwen3.6-27b: OK
+❌ deepseek/deepseek-v4-pro: Failed ('NoneType' object has no attribute 'strip')
