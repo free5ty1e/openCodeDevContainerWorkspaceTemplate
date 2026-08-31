@@ -72,7 +72,7 @@ def ensure_claude_cli():
     """Install the claude CLI via npm if not already present, fixing native binary."""
     # First check node availability
     node_result = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
+    if node_result.returncode != 0:
         print("  ❌ Node.js not found. Cannot install claude CLI.")
         return False
 
