@@ -535,22 +535,61 @@ def setup_statusline_symlink():
     if os.path.exists(workspace_statusline):
         # Create symlink in the persist dir (which ~/.claude points to)
         statusline_dst = os.path.join(CLAUDE_CONFIG_DIR, "statusline.sh")
-        if not os.path.exists(statusline_dst):
+
+        # Resolve the actual path since ~/.claude may be a symlink to .claude_persist
+        actual_statusline_path = os.path.realpath(statusline_dst)
+
+        # Check if it's already a symlink pointing to workspace/statusline.sh
+        if os.path.islink(statusline_dst):
+            # It's already a symlink - check if target is correct
             try:
-                # Ensure parent dir exists (should already via persistence setup)
-                os.makedirs(os.path.dirname(statusline_dst), exist_ok=True)
-                os.symlink(workspace_statusline, statusline_dst)
-                print(f"📐 Symlinked workspace statusline.sh → {statusline_dst}")
-            except OSError as e:
-                print(f"⚠️  Could not create symlink: {e}")
+                real_target = os.readlink(statusline_dst)
+                # Normalize the target path - if it's relative, prepend ~/.claude
+                if not os.path.isabs(real_target):
+                    real_target = os.path.join(CLAUDE_CONFIG_DIR, real_target)
+                # Check if the resolved target is the workspace statusline.sh
+                resolved_target = os.path.realpath(real_target)
+                workspace_resolved = os.path.realpath(workspace_statusline)
+                if resolved_target == workspace_resolved:
+                    print(f"✅ statusline.sh symlink already correct at {statusline_dst}")
+                    return
+            except OSError:
+                pass
+            # Symlink exists but wrong target - remove and recreate
+            os.unlink(statusline_dst)
+        elif os.path.exists(statusline_dt := statusline_dst):
+            # It's a regular file (not symlink) - remove it to create symlink
+            # But first check if it's the same as workspace/statusline.sh (by content/inode)
+            try:
+                if os.path.samestat(os.stat(statusline_dst), os.stat(workspace_statusline)):
+                    print(f"✅ statusline.sh already matches workspace version at {statusline_dst}")
+                    return
+            except OSError:
+                pass
+            os.unlink(statusline_dst)
         else:
-            print(f"✅ statusline.sh already exists at {statusline_dst}")
+            # File doesn't exist - good, will create symlink
+            pass
+
+        # Create the symlink
+        try:
+            # Ensure parent dir exists (should already via persistence setup)
+            os.makedirs(os.path.dirname(statusline_dst), exist_ok=True)
+            os.symlink(workspace_statusline, statusline_dst)
+            print(f"📐 Symlinked workspace statusline.sh → {statusline_dst}")
+        except OSError as e:
+            print(f"⚠️  Could not create symlink: {e}")
     else:
         print(f"⚠️  workspace statusline.sh not found at {workspace_statusline}")
 
 
 def launch_claude_with_model(selected_model, dangerously_skip_permissions=False):
     """Configure environment to use the litellm proxy and launch Claude Code."""
+    # Build claude command with optional --dangerously-skip-permissions flag
+    claude_cmd = ["claude"]
+    if dangerously_skip_permissions:
+        claude_cmd.append("--dangerously-skip-permissions")
+
     env = os.environ.copy()
     # Point Claude Code at the local litellm proxy, which exposes the
     # Anthropic-compatible /v1/messages endpoint.
@@ -562,8 +601,6 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     # Don't let claude try to discover/switch to a gateway model.
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"
-    # Pass through the dangerously skip permissions flag
-    env["CLAUDE_CODE_SKIP_PERMISSIONS"] = "1" if dangerously_skip_permissions else "0"
 
     # Set up Claude Code persistence so sessions survive devcontainer rebuilds
     setup_claude_persistence()
@@ -575,7 +612,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     print("   (This will open an interactive Claude Code session)")
 
     try:
-        subprocess.run(["claude"], env=env)
+        subprocess.run(claude_cmd, env=env)
     except FileNotFoundError:
         print("❌ Error: 'claude' CLI tool is not installed on your system.")
         print("   Install it via: curl -fsSL https://claude.ai | bash")
