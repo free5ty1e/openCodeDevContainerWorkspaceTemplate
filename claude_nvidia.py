@@ -98,25 +98,42 @@ def ensure_claude_cli():
     print("  📦 Installing claude CLI via npm (@anthropic-ai/claude-code)...")
     # npm global installs often need root inside a devcontainer.
     # Use --legacy-peer-deps to avoid peer dependency issues, and --no-audit
-    # to speed up install. rc=217 (EPIPE) can happen in devcontainers and is
-    # usually non-fatal - retry once.
+    # to speed up install. rc=217 (EPIPE/ENOTEMPTY) can happen in devcontainers and is
+    # usually non-fatal - retry with cleanup.
     npm_cmd = ["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code", "@anthropic-ai/claude-code", "--legacy-peer-deps", "--no-audit"]
     rc, out = _run(npm_cmd, label="npm-install")
     print(f"   npm install rc={rc}")
 
-    # Retry once if rc=217 (EPIPE/ENOTEMPTY) or other non-permission errors (but not if permission-related)
-    if rc != 0 and "permission" not in out.lower():
-        print("   Retrying npm install (cleaning target first)...")
-        # Try cleaning the global node_modules dir first
+    # Handle ENOTEMPTY/EPIPE: clean the target dir and retry
+    if rc != 0 and ("ENOTEMPTY" in out or "EPIPE" in out or "npm error syscall rename" in out):
+        print("   ENOTEMPTY/EPIPE detected - cleaning target directory and retrying...")
+        # Find the target dir and clean it
         cleanup_cmd = ["npm", "bin", "cache", "clean", "--force"]
         _run(cleanup_cmd, label="npm-cache-clean")
+        # Also remove any partial install of the package
+        for cand in [
+            "/home/vscode/.npm-global/lib/node_modules/@anthropic-ai/claude-code",
+            "/usr/lib/node_modules/@anthropic-ai/claude-code",
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code",
+        ]:
+            if os.path.isdir(cand):
+                print(f"   Removing partial install at {cand}")
+                shutil.rmtree(cand, ignore_errors=True)
         # Retry the install
         rc, out = _run(npm_cmd, label="npm-install-retry")
 
     # Check if install failed for permission reasons - use sudo if needed
-    if rc != 0 and ("permission" in out.lower() or "EACCES" in out or "EPIPE" in out):
+    if rc != 0 and ("permission" in out.lower() or "EACCES" in out):
         print("   Install failed with permission error, retrying with sudo...")
         rc, out = _run(["sudo"] + npm_cmd, label="npm-install-sudo")
+    # Also handle ENOTEMPTY after the retry if we still have issues
+    if rc != 0 and "ENOTEMPTY" in out:
+        print("   ENOTEMPTY still present after retry, attempting force cleanup...")
+        # Remove the global node_modules dir entirely
+        global_node_dir = os.path.expanduser("~/.npm-global/lib/node_modules")
+        if os.path.isdir(global_node_dir):
+            shutil.rmtree(global_node_dir, ignore_errors=True)
+        rc, out = _run(["sudo"] + npm_cmd if os.path.exists("/usr/bin/sudo") else npm_cmd, label="npm-install-sudo-force")
 
     # Find the installed package dir to fix the native binary if postinit was skipped.
     pkg_dir = None
