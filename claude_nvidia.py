@@ -182,6 +182,7 @@ def ensure_litellm():
     Handles both venv and system installs. This is a prerequisite so the
     proxy can start immediately without failing at launch time.
     Tries [proxy] extra first, falls back to base litellm.
+    Always uses --break-system-packages for system installs (PEP 668).
     """
     import shutil
 
@@ -208,7 +209,7 @@ def ensure_litellm():
             print("  ✅ litellm[proxy] installed in workspace venv")
             return True
 
-    # 4. Try installing litellm[proxy] system-wide
+    # 4. Try installing litellm[proxy] system-wide with --break-system-packages
     print("  📦 Ensuring litellm[proxy] system-wide...")
     subprocess.run(
         ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
@@ -218,18 +219,8 @@ def ensure_litellm():
         print("  ✅ litellm[proxy] installed system-wide")
         return True
 
-    # 5. Fall back to base litellm install system-wide
+    # 5. Fall back to base litellm install system-wide with --break-system-packages
     print("  📦 Ensuring litellm base package system-wide...")
-    subprocess.run(
-        ["pip", "install", "--break-system-packages", "-q", "litellm"],
-        capture_output=True, timeout=180,
-    )
-    if shutil.which("litellm"):
-        print("  ✅ litellm installed system-wide")
-        return True
-
-    # 6. Try installing without extras flag
-    print("  📦 Ensuring litellm (base) system-wide...")
     subprocess.run(
         ["pip", "install", "--break-system-packages", "-q", "litellm"],
         capture_output=True, timeout=180,
@@ -238,7 +229,22 @@ def ensure_litellm():
         print("  ✅ litellm installed system-wide (base)")
         return True
 
-    print("  ❌ Could not install litellm. Please run: pip install litellm")
+    # 6. Try pip install --user as alternative
+    print("  📦 Trying pip install --user...")
+    subprocess.run(
+        ["pip", "install", "--user", "-q", "litellm[proxy]"],
+        capture_output=True, timeout=120,
+    )
+    # Check user bin dir for litellm CLI
+    user_bin = os.path.expanduser("~/.local/bin")
+    if os.path.isfile(os.path.join(user_bin, "litellm")) and os.access(os.path.join(user_bin, "litellm"), os.X_OK):
+        # Add user bin to PATH for this session's subprocess.Popen
+        os.environ["PATH"] = f"{user_bin}:{os.environ.get('PATH', '')}"
+        print("  ✅ litellm[proxy] installed via pip --user")
+        return True
+
+    print("  ❌ Could not install litellm. "
+          "Try: pip install --break-system-packages litellm[proxy]")
     return False
 
 
