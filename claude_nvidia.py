@@ -491,19 +491,26 @@ def start_proxy():
         bin_path = shutil.which("litellm")
         if bin_path:
             litellm_bin = bin_path
-    # 3. Last resort: ensure litellm is available, then use python -m litellm
+    # 3. Last resort: ensure litellm is available
     if litellm_bin is None:
-        # Ensure litellm is installed for the venv python
+        # Try installing litellm into workspace venv first
         venv_python = "/workspace/.venv/bin/python3"
+        venv_litellm_after_install = "/workspace/.venv/bin/litellm"
         if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
-            # Install litellm in the venv
             subprocess.run(
                 [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
                 capture_output=True, timeout=120,
             )
-        # Use venv python or fall back to system python
-        python_to_use = venv_python if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK) else sys.executable
-        litellm_bin = [python_to_use, "-m", "litellm"]
+            # Check if litellm binary now exists in venv
+            if os.path.isfile(venv_litellm_after_install) and os.access(venv_litellm_after_install, os.X_OK):
+                litellm_bin = venv_litellm_after_install
+        # If still no litellm binary, use venv python with -m litellm (not sys.executable)
+        # This ensures we use the workspace venv python even if pip install didn't create the binary
+        if litellm_bin is None and os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
+            litellm_bin = [venv_python, "-m", "litellm"]
+        # Absolute fallback: system python with -m litellm
+        if litellm_bin is None:
+            litellm_bin = [sys.executable, "-m", "litellm"]
     with open(LOG_FILE, "w") as logf:
         # litellm_bin may be a string path or a list [python, "-m", "litellm"]
         if isinstance(litellm_bin, str):
