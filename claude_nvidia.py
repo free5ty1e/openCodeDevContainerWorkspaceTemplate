@@ -790,6 +790,9 @@ def setup_statusline_symlink():
                 resolved_target = os.path.realpath(real_target)
                 workspace_resolved = os.path.realpath(workspace_statusline)
                 if resolved_target == workspace_resolved:
+                    # Ensure the workspace statusline.sh is executable
+                    if os.path.isfile(workspace_statusline):
+                        os.chmod(workspace_statusline, 0o755)
                     print(f"✅ statusline.sh symlink already correct at {statusline_dst}")
                     return
             except OSError:
@@ -801,6 +804,9 @@ def setup_statusline_symlink():
             # But first check if it's the same as workspace/statusline.sh (by content/inode)
             try:
                 if os.path.samestat(os.stat(statusline_dst), os.stat(workspace_statusline)):
+                    # Ensure the workspace statusline.sh is executable
+                    if os.path.isfile(workspace_statusline):
+                        os.chmod(workspace_statusline, 0o755)
                     print(f"✅ statusline.sh already matches workspace version at {statusline_dst}")
                     return
             except OSError:
@@ -814,10 +820,40 @@ def setup_statusline_symlink():
         try:
             # Ensure parent dir exists (should already via persistence setup)
             os.makedirs(os.path.dirname(statusline_dst), exist_ok=True)
+            # Ensure the workspace statusline.sh is executable
+            if os.path.isfile(workspace_statusline):
+                os.chmod(workspace_statusline, 0o755)
             os.symlink(workspace_statusline, statusline_dst)
             print(f"📐 Symlinked workspace statusline.sh → {statusline_dst}")
         except OSError as e:
             print(f"⚠️  Could not create symlink: {e}")
+
+        # Now configure the statusLine in settings.json
+        settings_file = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
+        resolved_statusline = os.path.realpath(statusline_dst)
+        statusline_command = f'ZEN_STATUSLINE_MODE=full bash {resolved_statusline}'
+
+        try:
+            # Read existing settings
+            if os.path.exists(settings_file):
+                with open(settings_file, "r") as f:
+                    settings = json.load(f)
+            else:
+                settings = {}
+
+            # Update or add statusLine configuration
+            settings["statusLine"] = {
+                "type": "command",
+                "command": statusline_command
+            }
+
+            # Write back
+            with open(settings_file, "w") as f:
+                json.dump(settings, f, indent=2)
+
+            print(f"⚙️  Configured statusLine in {settings_file}")
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"⚠️  Could not configure statusLine: {e}")
     else:
         print(f"⚠️  workspace statusline.sh not found at {workspace_statusline}")
 
