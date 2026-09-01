@@ -480,16 +480,18 @@ def start_proxy():
     """Start the litellm proxy in the background and wait until ready."""
     stop_running_proxy()
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    # Ensure litellm CLI is available - prefer venv binary, fall back to system install
-    venv_litellm = "/workspace/.venv/bin/litellm"
+    # Determine if workspace venv exists
+    venv_exists = os.path.isdir("/workspace/.venv")
     litellm_bin = None
 
-    # 1. Try workspace venv litellm binary
-    if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
-        litellm_bin = venv_litellm
+    # 1. Try workspace venv litellm binary (if venv exists)
+    if venv_exists:
+        venv_litellm = "/workspace/.venv/bin/litellm"
+        if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
+            litellm_bin = venv_litellm
 
     # 2. If venv binary not usable, try installing litellm[proxy] into venv
-    if litellm_bin is None:
+    if litellm_bin is None and venv_exists:
         venv_python = "/workspace/.venv/bin/python3"
         if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
             print("   📦 Ensuring litellm[proxy] is installed in venv...")
@@ -497,7 +499,7 @@ def start_proxy():
                 [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
                 capture_output=True, timeout=120,
             )
-            # Check if litellm binary now exists in venv
+            venv_litellm = "/workspace/.venv/bin/litellm"
             if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
                 litellm_bin = venv_litellm
 
@@ -508,12 +510,23 @@ def start_proxy():
         if bin_path:
             litellm_bin = bin_path
 
-    # 4. Last resort: install system-wide and try again
+    # 4. Last resort: install litellm[proxy] system-wide
     if litellm_bin is None:
-        import subprocess
         print("   📦 Installing litellm[proxy] system-wide...")
         subprocess.run(
             ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
+            capture_output=True, timeout=180,
+        )
+        bin_path = shutil.which("litellm")
+        if bin_path:
+            litellm_bin = bin_path
+
+    # 5. Absolute fallback: if still nothing, try installing and check again
+    if litellm_bin is None:
+        print("   📦 Ensuring litellm is available...")
+        # Install litellm base package system-wide
+        subprocess.run(
+            ["pip", "install", "--break-system-packages", "-q", "litellm"],
             capture_output=True, timeout=180,
         )
         bin_path = shutil.which("litellm")
