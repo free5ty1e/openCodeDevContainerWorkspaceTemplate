@@ -176,11 +176,77 @@ def ensure_claude_cli():
     return False
 
 
+def ensure_litellm():
+    """Ensure litellm is installed and the CLI binary is available on PATH.
+
+    Handles both venv and system installs. This is a prerequisite so the
+    proxy can start immediately without failing at launch time.
+    Tries [proxy] extra first, falls back to base litellm.
+    """
+    import shutil
+
+    print("🔍 Ensuring litellm is available...")
+
+    # 1. Check if litellm CLI is already on PATH
+    if shutil.which("litellm"):
+        print("  ✅ litellm CLI already available on PATH")
+        return True
+
+    # 2. Check workspace venv
+    venv_exists = os.path.isdir("/workspace/.venv")
+    venv_python = "/workspace/.venv/bin/python3" if venv_exists else None
+    venv_litellm = "/workspace/.venv/bin/litellm" if venv_exists else None
+
+    # 3. Try to install litellm[proxy] into workspace venv (if venv exists)
+    if venv_exists and venv_python and os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
+        print("  📦 Ensuring litellm[proxy] in workspace venv...")
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
+            capture_output=True, timeout=120,
+        )
+        if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
+            print("  ✅ litellm[proxy] installed in workspace venv")
+            return True
+
+    # 4. Try installing litellm[proxy] system-wide
+    print("  📦 Ensuring litellm[proxy] system-wide...")
+    subprocess.run(
+        ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
+        capture_output=True, timeout=180,
+    )
+    if shutil.which("litellm"):
+        print("  ✅ litellm[proxy] installed system-wide")
+        return True
+
+    # 5. Fall back to base litellm install system-wide
+    print("  📦 Ensuring litellm base package system-wide...")
+    subprocess.run(
+        ["pip", "install", "--break-system-packages", "-q", "litellm"],
+        capture_output=True, timeout=180,
+    )
+    if shutil.which("litellm"):
+        print("  ✅ litellm installed system-wide")
+        return True
+
+    # 6. Try installing without extras flag
+    print("  📦 Ensuring litellm (base) system-wide...")
+    subprocess.run(
+        ["pip", "install", "--break-system-packages", "-q", "litellm"],
+        capture_output=True, timeout=180,
+    )
+    if shutil.which("litellm"):
+        print("  ✅ litellm installed system-wide (base)")
+        return True
+
+    print("  ❌ Could not install litellm. Please run: pip install litellm")
+    return False
+
+
 def ensure_prerequisites():
     """Ensure litellm (with the proxy extras) and the claude CLI are available."""
     print("🔍 Checking prerequisites...")
     ok = True
-    ok &= install_if_missing("litellm", "litellm[proxy]")
+    ok &= ensure_litellm()
     ok &= ensure_claude_cli()
     return ok
 
