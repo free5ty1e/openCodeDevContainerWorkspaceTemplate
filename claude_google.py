@@ -12,10 +12,14 @@ import urllib.request
 import urllib.error
 
 # ─── Configuration ───────────────────────────────────────────────────────
+# Google Gemini API uses ?key=API_KEY for authentication, NOT Bearer tokens!
 GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-GOOGLE_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GOOGLE_CHAT_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+def get_google_chat_url(model):
+    return GOOGLE_CHAT_URL_TEMPLATE.format(model=model)
 CACHE_FILE = os.path.expanduser("~/.google_api_key_cache")
-PROXY_PORT = 4499
+PROXY_PORT = 4500
 PROXY_MASTER_KEY = "sk-google-bridge"
 CONFIG_DIR = os.path.expanduser("~/.claude_google")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "litellm_proxy.yaml")
@@ -82,6 +86,31 @@ def _claude_version_ok():
 
 
 def ensure_claude_cli():
+    """Check for updates to Claude CLI and optionally upgrade."""
+    # Existing checks remain
+    # After confirming CLI is present, prompt for upgrade if a newer version is available
+    current_version = None
+    # Get current version
+    rc, out = _run(["claude", "--version"], label="cli-version")
+    if rc == 0:
+        current_version = out.strip()
+        print(f"   Current claude CLI version: {current_version}")
+    # Prompt for upgrade (handle EOF gracefully – default to 'n')
+    try:
+        resp = input("   Check for Claude CLI upgrade? (y/N): ").strip().lower()
+    except EOFError:
+        resp = "n"
+    if resp == "y":
+        print("   Upgrading claude CLI via npm...")
+        _run(["npm", "install", "-g", "@anthropic-ai/claude-code@latest"], label="cli-upgrade")
+        # Re-verify
+        rc2, out2 = _run(["claude", "--version"], label="cli-version-after")
+        if rc2 == 0:
+            print(f"   New claude CLI version: {out2.strip()}")
+    # Continue with existing logic (return True if already okay)
+    if _claude_version_ok():
+        return True
+    # If not ok, fall through to install (original install logic follows)
     """Install the claude CLI via npm if not already present, fixing native binary."""
     # First check node availability with verbose logging
     print("  🔍 Checking node.js availability...")
@@ -198,18 +227,7 @@ def ensure_litellm():
     venv_python = "/workspace/.venv/bin/python3" if venv_exists else None
     venv_litellm = "/workspace/.venv/bin/litellm" if venv_exists else None
 
-    # 3. Try to install litellm[proxy] into workspace venv (if venv exists)
-    if venv_exists and venv_python and os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
-        print("  📦 Ensuring litellm[proxy] in workspace venv...")
-        subprocess.run(
-            [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
-            capture_output=True, timeout=120,
-        )
-        if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
-            print("  ✅ litellm[proxy] installed in workspace venv")
-            return True
-
-    # 4. Try installing litellm[proxy] system-wide with --break-system-packages
+    # 3. Try installing litellm[proxy] system-wide with --break-system-packages
     print("  📦 Ensuring litellm[proxy] system-wide...")
     subprocess.run(
         ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
@@ -219,17 +237,7 @@ def ensure_litellm():
         print("  ✅ litellm[proxy] installed system-wide")
         return True
 
-    # 5. Fall back to base litellm install system-wide with --break-system-packages
-    print("  📦 Ensuring litellm base package system-wide...")
-    subprocess.run(
-        ["pip", "install", "--break-system-packages", "-q", "litellm"],
-        capture_output=True, timeout=180,
-    )
-    if shutil.which("litellm"):
-        print("  ✅ litellm installed system-wide (base)")
-        return True
-
-    # 6. Try pip install --user as alternative
+    # 4. Fall back to pip install --user as alternative
     print("  📦 Trying pip install --user...")
     subprocess.run(
         ["pip", "install", "--user", "-q", "litellm[proxy]"],
@@ -258,10 +266,19 @@ def ensure_prerequisites():
 
 
 # ─── Step 2: Prompt for API key if not cached ───────────────────────────
-def get_api_key():
-    """Return a valid Google API key, prompting if needed and caching it."""
-    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+def get_api_key(clear=False):
+    """Return a valid Google API key, prompting if needed and caching it.
+    If `clear` is True, the cached key is removed and the user is prompted again.
+    """
+    # Handle clear flag
+    if clear and os.path.exists(CACHE_FILE):
+        try:
+            os.remove(CACHE_FILE)
+            print(f"🗑️  Cleared cached Google API key at {CACHE_FILE}.")
+        except OSError:
+            print(f"⚠️  Failed to delete cached Google API key at {CACHE_FILE}.")
 
+    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
     if GOOGLE_API_KEY:
         print("✅ Google API key found in environment.")
         return GOOGLE_API_KEY
@@ -278,42 +295,59 @@ def get_api_key():
             print(f"⚠️  Could not read cached API key from {CACHE_FILE}.")
 
     print("🔑 Google API key not found.")
-    try:
-        api_key = input("   Please enter your Google API key: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n❌ No API key provided. Exiting.")
-        sys.exit(1)
-
+    api_key = input("   Please enter your Google API key (or press Enter for anonymous): ").strip()
     if not api_key:
-        print("❌ No API key provided. Exiting.")
-        sys.exit(1)
-
+        print("⚠️  No API key provided – proceeding in anonymous mode.")
+        return ""
     try:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, "w") as f:
             f.write(api_key)
-        print(f"💾 API key cached to {CACHE_FILE}.")
+        print(f"💾 API key cached to {CACHE_FILE}")
     except OSError:
         print(f"⚠️  Could not cache API key to {CACHE_FILE}.")
-
     os.environ["GOOGLE_API_KEY"] = api_key
     return api_key
 
 
 # ─── Step 3: Fetch models from Google ────────────────────────────────────
 def http_get_json(url, api_key):
+    """GET JSON from the Google Gemini API.
+
+    Google authenticates via ?key=<API_KEY> query param (or x-goog-api-key
+    header) — NOT Authorization: Bearer. Use both for max compatibility.
+    """
+    sep = "&" if "?" in url else "?"
+    authed_url = f"{url}{sep}key={api_key}"
     req = urllib.request.Request(
-        url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        authed_url, headers={"Accept": "application/json", "x-goog-api-key": api_key}
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
 
 def fetch_models(api_key):
-    """Fetch the list of available chat models from Google API."""
+    """Fetch the list of available models from the Google Gemini API.
+
+    Response shape: {"models": [{"name": "models/gemini-1.5-flash",
+    "supportedGenerationMethods": ["generateContent", ...], ...}]}.
+    We normalize to OpenAI-style {"id": "gemini-1.5-flash"} dicts.
+    """
     try:
         data = http_get_json(GOOGLE_API_URL, api_key)
-        return data.get("data", [])
+        raw = data.get("models", [])
+        models = []
+        for m in raw:
+            # Keep only models that support text generation
+            methods = m.get("supportedGenerationMethods", [])
+            if methods and "generateContent" not in methods:
+                continue
+            name = m.get("name", "")
+            # Strip the "models/" prefix for a clean id
+            model_id = name.split("/", 1)[-1] if "/" in name else name
+            if model_id:
+                models.append({"id": model_id, "owned_by": "google"})
+        return models
     except Exception as e:
         print(f"❌ Failed to retrieve models: {e}")
         sys.exit(1)
@@ -409,42 +443,12 @@ def display_and_select(standard, free, combined):
 
 
 def check_model_access(selected_model, api_key):
-    """Verify the selected model is usable with the given API key.
-
-    Some Google models are not accessible to every account (they return
-    404 'Function not found for account'). This catches that early so the
-    user can pick a different model instead of failing inside Claude Code.
-    Returns True if the model responds, False otherwise.
+    """Check model access using the litellm proxy test step.
+    This validates that the selected model works via the local proxy.
+    Any 200 response from the proxy counts as "accessible".
     """
     print(f"   🔍 Checking access to {selected_model}...")
-    payload = {
-        "model": selected_model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 5,
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        GOOGLE_CHAT_URL,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            if resp.status == 200:
-                print(f"   ✅ Model accessible and responding.")
-                return True
-            print(f"   ⚠️  Model returned status {resp.status}. May still work.")
-            return False
-    except urllib.error.HTTPError as e:
-        print(f"   ❌ Model NOT accessible (status {e.code}).")
-        print(f"      {e.read().decode()[:300]}")
-        return False
-    except Exception as e:
-        print(f"   ⚠️  Access check error: {type(e).__name__}: {str(e)[:120]}")
-        return False
+    return test_proxy_connection(selected_model)
 
 
 # ─── Step 6: Generate litellm proxy config ───────────────────────────────
@@ -452,8 +456,12 @@ def generate_litellm_config(selected_model, api_key):
     """Write a litellm PROXY config mapping the model to Google's Gemini API.
 
     Claude Code speaks the Anthropic Messages API (/v1/messages), but Google
-    only exposes a Gemini API endpoint. litellm's proxy translates between the two,
-    so Claude Code's conversation and tool calls work against the Google model.
+    exposes a Gemini API. litellm's proxy translates between the two.
+
+    litellm's native Gemini provider is `gemini/<model>` — the `google_` prefix
+    is NOT a valid provider and causes `/v1/messages` to fail with
+    "No connected db". Use `gemini/` so litellm can resolve the provider and
+    authenticate via the api_key.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
     config = {
@@ -461,13 +469,12 @@ def generate_litellm_config(selected_model, api_key):
             {
                 "model_name": "google",
                 "litellm_params": {
-                    "model": f"google_{selected_model}",
+                    "model": f"gemini/{selected_model}",
                     "api_key": api_key,
-                    "api_base": "https://generativelanguage.googleapis.com/v1beta",
                 },
             }
         ],
-        "general_settings": {"master_key": PROXY_MASTER_KEY},
+        "general_settings": {"master_key": PROXY_MASTER_KEY, "store_model_in_db": False},
         "litellm_settings": {"drop_params": True},
     }
     with open(CONFIG_FILE, "w") as f:
@@ -874,7 +881,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     # Anthropic-compatible /v1/messages endpoint.
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
-    env["ANTHROPIC_MODEL"] = "nvidia"
+    env["ANTHROPIC_MODEL"] = "gemini"
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
@@ -955,6 +962,12 @@ def main():
         default=False,
         help="Skip Claude Code permission prompts (safe in devcontainer environments)",
     )
+    parser.add_argument(
+        "--clear-api-key",
+        action="store_true",
+        default=False,
+        help="Clear the cached Google API key and prompt again",
+    )
     args = parser.parse_args()
 
     print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
@@ -963,7 +976,8 @@ def main():
         print("❌ Prerequisites check failed. Exiting.")
         sys.exit(1)
 
-    api_key = get_api_key()
+    # Get API key exactly once. --clear-api-key removes the cached key first.
+    api_key = get_api_key(clear=args.clear_api_key)
 
     print("\n🔄 Fetching model list from Google AI API...")
     all_raw_models = fetch_models(api_key)
@@ -971,12 +985,9 @@ def main():
     standard, free, combined = categorize_models(all_raw_models)
     selected_model = display_and_select(standard, free, combined)
 
-    if not check_model_access(selected_model, api_key):
-        print("\n⚠️  The selected model is not accessible with your API key.")
-        print("    Please run the script again and pick a different model.")
-        print("    (Some Google models are restricted to certain accounts.)")
-        sys.exit(1)
-
+    # Generate config and start the proxy FIRST, then validate the connection
+    # through the proxy. (check_model_access requires a live proxy, so it can't
+    # run before start_proxy().)
     generate_litellm_config(selected_model, api_key)
     proc = start_proxy()
 

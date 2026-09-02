@@ -12,13 +12,14 @@ import urllib.request
 import urllib.error
 
 # ─── Configuration ───────────────────────────────────────────────────────
-NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/models"
-NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-CACHE_FILE = os.path.expanduser("~/.nvidia_api_key_cache")
-PROXY_PORT = 4499  # NVIDIA (default) — overridable via CLAUDE_BRIDGE_PORT
-PROXY_PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT", PROXY_PORT))
-PROXY_MASTER_KEY = "sk-claude-bridge"
-CONFIG_DIR = os.path.expanduser("~/.claude_nvidia")
+# TODO: Replace these with your actual provider's base URL and endpoints
+ANYAPI_BASE_URL = "https://api.anyapi.example/v1"
+ANYAPI_MODELS_ENDPOINT = f"{ANYAPI_BASE_URL}/models"
+ANYAPI_CHAT_ENDPOINT_TEMPLATE = f"{ANYAPI_BASE_URL}/models/{{model}}:chat"
+CACHE_FILE = os.path.expanduser("~/.anyapi_api_key_cache")
+PROXY_PORT = 4502
+PROXY_MASTER_KEY = "sk-anyapi-bridge"
+CONFIG_DIR = os.path.expanduser("~/.claude_anyapi")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "litellm_proxy.yaml")
 LOG_FILE = os.path.join(CONFIG_DIR, "proxy.log")
 PID_FILE = os.path.join(CONFIG_DIR, "proxy.pid")
@@ -199,18 +200,7 @@ def ensure_litellm():
     venv_python = "/workspace/.venv/bin/python3" if venv_exists else None
     venv_litellm = "/workspace/.venv/bin/litellm" if venv_exists else None
 
-    # 3. Try to install litellm[proxy] into workspace venv (if venv exists)
-    if venv_exists and venv_python and os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
-        print("  📦 Ensuring litellm[proxy] in workspace venv...")
-        subprocess.run(
-            [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
-            capture_output=True, timeout=120,
-        )
-        if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
-            print("  ✅ litellm[proxy] installed in workspace venv")
-            return True
-
-    # 4. Try installing litellm[proxy] system-wide with --break-system-packages
+    # 3. Try installing litellm[proxy] system-wide with --break-system-packages
     print("  📦 Ensuring litellm[proxy] system-wide...")
     subprocess.run(
         ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
@@ -220,17 +210,7 @@ def ensure_litellm():
         print("  ✅ litellm[proxy] installed system-wide")
         return True
 
-    # 5. Fall back to base litellm install system-wide with --break-system-packages
-    print("  📦 Ensuring litellm base package system-wide...")
-    subprocess.run(
-        ["pip", "install", "--break-system-packages", "-q", "litellm"],
-        capture_output=True, timeout=180,
-    )
-    if shutil.which("litellm"):
-        print("  ✅ litellm installed system-wide (base)")
-        return True
-
-    # 6. Try pip install --user as alternative
+    # 4. Fall back to pip install --user as alternative
     print("  📦 Trying pip install --user...")
     subprocess.run(
         ["pip", "install", "--user", "-q", "litellm[proxy]"],
@@ -260,22 +240,23 @@ def ensure_prerequisites():
 
 # ─── Step 2: Prompt for API key if not cached ───────────────────────────
 def get_api_key(clear=False):
-    """Return a valid NVIDIA API key, prompting if needed and caching it.
+    """Return a valid API key, prompting if needed and caching it.
     If `clear` is True, the cached key is removed and the user is prompted again.
+    If the user provides an empty key, anonymous mode is used.
     """
     # Handle clear flag
     if clear and os.path.exists(CACHE_FILE):
         try:
             os.remove(CACHE_FILE)
-            print(f"🗑️  Cleared cached NVIDIA API key at {CACHE_FILE}.")
+            print(f"🗑️  Cleared cached API key at {CACHE_FILE}.")
         except OSError:
-            print(f"⚠️  Failed to delete cached NVIDIA API key at {CACHE_FILE}.")
+            print(f"⚠️  Failed to delete cached API key at {CACHE_FILE}.")
 
-    NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
+    API_KEY = os.environ.get("ANYAPI_API_KEY")
 
-    if NVIDIA_API_KEY:
-        print("✅ NVIDIA API key found in environment.")
-        return NVIDIA_API_KEY
+    if API_KEY:
+        print("✅ API key found in environment.")
+        return API_KEY
 
     if os.path.exists(CACHE_FILE):
         try:
@@ -283,21 +264,21 @@ def get_api_key(clear=False):
                 cached = f.read().strip()
             if cached:
                 print(f"✅ Found cached API key in {CACHE_FILE}.")
-                os.environ["NVIDIA_API_KEY"] = cached
+                os.environ["ANYAPI_API_KEY"] = cached
                 return cached
         except OSError:
             print(f"⚠️  Could not read cached API key from {CACHE_FILE}.")
 
-    print("🔑 NVIDIA API key not found.")
+    print("🔑 API key not found.")
     try:
-        api_key = input("   Please enter your NVIDIA API key (or press Enter for anonymous): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n❌ No API key provided. Exiting.")
-        sys.exit(1)
-
-    if not api_key:
-        print("⚠️  No API key provided – proceeding without cached key.")
+        api_key = input("   Please enter your API key (or press Enter for anonymous): ").strip()
+    except EOFError:
+        print("⚠️  No API key provided – proceeding in anonymous mode.")
         return ""
+    if not api_key:
+        print("⚠️  No API key provided – proceeding in anonymous mode.")
+        return ""
+
     try:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, "w") as f:
@@ -306,24 +287,59 @@ def get_api_key(clear=False):
     except OSError:
         print(f"⚠️  Could not cache API key to {CACHE_FILE}.")
 
-    os.environ["NVIDIA_API_KEY"] = api_key
+    os.environ["ANYAPI_API_KEY"] = api_key
     return api_key
 
 
-# ─── Step 3: Fetch models from NVIDIA ────────────────────────────────────
+# ─── Step 3: Fetch models from anyAPI ────────────────────────────────────
 def http_get_json(url, api_key):
-    req = urllib.request.Request(
-        url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-    )
+    """GET JSON from the anyAPI provider.
+    If api_key is empty, no Authorization header is sent (anonymous mode).
+    """
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    # Build URL with key if needed
+    sep = "&" if "?" in url else "?"
+    authed_url = f"{url}{sep}key={api_key}" if api_key else url
+    req = urllib.request.Request(authed_url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
 
 def fetch_models(api_key):
-    """Fetch the list of available chat models from NVIDIA API."""
+    """Fetch the list of available models from the anyAPI provider.
+
+    The provider is expected to return a JSON response with a top-level
+    "models" array, where each model has at least an "id" field and
+    optionally an "owned_by" field.  Free/community models should have
+    "owned_by": "community" or the id should contain "free".
+
+    All models are returned in a combined list with free-tier models
+    sorted to the bottom (mirroring the behaviour of the NVIDIA/OpenCode/Google scripts).
+    """
     try:
-        data = http_get_json(NVIDIA_API_URL, api_key)
-        return data.get("data", [])
+        data = http_get_json(ANYAPI_MODELS_ENDPOINT, api_key)
+        raw = data.get("models", [])
+        models = []
+        for m in raw:
+            model_id = m.get("id", "")
+            if not model_id:
+                continue
+            owned_by = m.get("owned_by", "").lower()
+            model_id_lower = model_id.lower()
+
+            # Non-chat keywords filter
+            NON_CHAT_KEYWORDS = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
+            if any(keyword in model_id_lower for keyword in NON_CHAT_KEYWORDS):
+                continue
+
+            is_free = (
+                "community" in owned_by
+                or "free" in model_id_lower
+            )
+            models.append({"id": model_id, "owned_by": owned_by, "is_free": is_free})
+        return models
     except Exception as e:
         print(f"❌ Failed to retrieve models: {e}")
         sys.exit(1)
@@ -331,9 +347,12 @@ def fetch_models(api_key):
 
 # ─── Step 4: Categorize, filter, and sort models ────────────────────────
 def categorize_models(all_raw_models):
-    """Categorize models into standard and free/tier, sorted with free at bottom."""
+    """Categorize models into standard and free/tier, sorted with free at bottom.
+
+    Free models are sorted and separated at the bottom of the selector list.
+    """
     NON_CHAT_KEYWORDS = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
-    FREE_KEYWORDS = ["community", "instruct", "chat", "deepseek", "kimi", "glm", "llama", "gemma", "nemotron"]
+    FREE_KEYWORDS = ["community", "free"]
 
     standard_chat_models = []
     free_tier_chat_models = []
@@ -346,9 +365,11 @@ def categorize_models(all_raw_models):
         if any(keyword in model_id_lower for keyword in NON_CHAT_KEYWORDS):
             continue
 
+        # Check if this is a free model
         is_free = (
             "community" in owned_by
-            or any(keyword in model_id_lower for keyword in ["deepseek", "kimi", "glm"])
+            or any(keyword in model_id_lower for keyword in ["deepseek", "kimi", "glm", "llama", "gemma", "nemotron", "free"])
+            or "free" in model_id_lower
         )
         if is_free:
             if model_id not in free_tier_chat_models:
@@ -389,17 +410,17 @@ def get_selection_input(prompt, max_val):
 def display_and_select(standard, free, combined):
     """Display the model list with numbers and get user selection."""
     print("\n========================================")
-    print("       AVAILABLE NVIDIA CHAT MODELS     ")
+    print("       ANYAPI CHAT MODELS               ")
     print("========================================")
 
     current_number = 1
     if standard:
-        print("\n--- Standard & Enterprise Chat Models ---")
+        print("\n--- Standard Chat Models ---")
         for model_id in standard:
             print(f"[{current_number}] {model_id}")
             current_number += 1
     if free:
-        print("\n--- Free & Community Tier Chat Models ---")
+        print("\n--- Free & Community Tier ---")
         for model_id in free:
             print(f"[{current_number}] {model_id} (Free Tier)")
             current_number += 1
@@ -416,64 +437,40 @@ def display_and_select(standard, free, combined):
 def check_model_access(selected_model, api_key):
     """Verify the selected model is usable with the given API key.
 
-    Some NVIDIA models are not accessible to every account (they return
-    404 'Function not found for account'). This catches that early so the
-    user can pick a different model instead of failing inside Claude Code.
+    Some models are not accessible to every account. This catches that early
+    so the user can pick a different model instead of failing inside Claude Code.
     Returns True if the model responds, False otherwise.
     """
     print(f"   🔍 Checking access to {selected_model}...")
-    payload = {
-        "model": selected_model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 5,
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        NVIDIA_CHAT_URL,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            if resp.status == 200:
-                print(f"   ✅ Model accessible and responding.")
-                return True
-            print(f"   ⚠️  Model returned status {resp.status}. May still work.")
-            return False
-    except urllib.error.HTTPError as e:
-        print(f"   ❌ Model NOT accessible (status {e.code}).")
-        print(f"      {e.read().decode()[:300]}")
-        return False
-    except Exception as e:
-        print(f"   ⚠️  Access check error: {type(e).__name__}: {str(e)[:120]}")
-        return False
+    # Use the proxy test – it validates that the model works via the local proxy.
+    return test_proxy_connection(selected_model)
 
 
 # ─── Step 6: Generate litellm proxy config ───────────────────────────────
 def generate_litellm_config(selected_model, api_key):
-    """Write a litellm PROXY config mapping the model to NVIDIA's OpenAI API.
+    """Write a litellm PROXY config mapping the model to the anyAPI provider.
 
-    Claude Code speaks the Anthropic Messages API (/v1/messages), but NVIDIA
-    only exposes an OpenAI-compatible API (/v1/chat/completions). litellm's
-    proxy translates between the two, so Claude Code's conversation and tool
-    calls work against the NVIDIA model.
+    Claude Code speaks the Anthropic Messages API (/v1/messages), but the
+    anyAPI provider exposes an OpenAI-compatible API. Use the `openai/`
+    provider prefix with the anyAPI custom api_base — `anyapi_` is NOT a
+    valid litellm provider prefix and breaks /v1/messages routing.
+    If api_key is empty (anonymous mode), omit it from the config.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    params = {
+        "model": f"openai/{selected_model}",
+        "api_base": ANYAPI_BASE_URL,
+    }
+    if api_key:
+        params["api_key"] = api_key
     config = {
         "model_list": [
             {
-                "model_name": "nvidia",
-                "litellm_params": {
-                    "model": f"nvidia_nim/{selected_model}",
-                    "api_key": api_key,
-                    "api_base": "https://integrate.api.nvidia.com/v1",
-                },
+                "model_name": "anyapi",
+                "litellm_params": params,
             }
         ],
-        "general_settings": {"master_key": PROXY_MASTER_KEY},
+        "general_settings": {"master_key": PROXY_MASTER_KEY, "store_model_in_db": False},
         "litellm_settings": {"drop_params": True},
     }
     with open(CONFIG_FILE, "w") as f:
@@ -656,7 +653,7 @@ def test_proxy_connection(selected_model):
     """Quick validation via the proxy to verify the model responds."""
     print(f"\n🧪 Testing selected model through proxy ({selected_model})...")
     payload = {
-        "model": "nvidia",
+        "model": "anyapi",
         "max_tokens": 50,
         "messages": [{"role": "user", "content": "Hello! Please respond with a simple greeting."}],
     }
@@ -703,7 +700,7 @@ def setup_claude_persistence():
     """Set up Claude Code persistence using .claude_persist in workspace.
 
     Migrates ~/.claude to workspace/.claude_persist so sessions survive
-    devcontainer rebuilds. This mirrors the pattern from setup_claude_zen_devcontainer.sh.
+    devcontainer rebuilds.
     """
     import shutil
 
@@ -809,7 +806,7 @@ def setup_statusline_symlink():
                 pass
             # Symlink exists but wrong target - remove and recreate
             os.unlink(statusline_dst)
-        elif os.path.exists(statusline_dt := statusline_dst):
+        elif os.path.exists(statusline_dst):
             # It's a regular file (not symlink) - remove it to create symlink
             # But first check if it's the same as workspace/statusline.sh (by content/inode)
             try:
@@ -880,7 +877,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     # Anthropic-compatible /v1/messages endpoint.
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
-    env["ANTHROPIC_MODEL"] = "nvidia"
+    env["ANTHROPIC_MODEL"] = "anyapi"
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
@@ -893,7 +890,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     # Set up statusline.sh symlink so Claude Code uses our custom status line
     setup_statusline_symlink()
 
-    print("\n🚀 Launching Claude Code with selected NVIDIA model...")
+    print("\n🚀 Launching Claude Code with selected anyAPI model...")
     print("   (This will open an interactive Claude Code session)")
 
     try:
@@ -909,20 +906,20 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
 def print_usage_notes(dangerously_skip_permissions=False):
     """Print usage notes and relevant environment variables."""
     print("=" * 60)
-    print("  NVIDIA → Claude Code Bridge Script")
+    print("  AnyAPI → Claude Code Bridge Script")
     print("=" * 60)
     print()
     print("📋  SCRIPT PURPOSE:")
-    print("   This script bridges NVIDIA NIM models with the Claude Code CLI.")
-    print("   It fetches available NVIDIA chat models, lets you select one,")
-    print("   runs a local litellm proxy (Anthropic→OpenAI translation),")
-    print("   then launches Claude Code configured to use that NVIDIA model.")
+    print("   This script bridges anyAPI models with the Claude Code CLI.")
+    print("   It fetches available anyAPI chat models, lets you select one,")
+    print("   runs a local litellm proxy (anyAPI→Anthropic translation),")
+    print("   then launches Claude Code configured to use that anyAPI model.")
     print()
     print("🔑  API KEY SETUP:")
-    print("   • Set NVIDIA_API_KEY environment variable export")
-    print("     NVIDIA_API_KEY='nvapi-...'")
+    print("   • Set ANYAPI_API_KEY environment variable export")
+    print("     ANYAPI_API_KEY='sk-...'")
     print("   • Or run the script once - it will prompt and cache the key")
-    print("     to ~/.nvidia_api_key_cache for future runs.")
+    print("     to ~/.anyapi_api_key_cache for future runs.")
     print()
     if dangerously_skip_permissions:
         print("⚡  DANGEROUSLY SKIP PERMISSIONS: --dangerously-skip-permissions")
@@ -932,18 +929,11 @@ def print_usage_notes(dangerously_skip_permissions=False):
         print("⚡  PERMISSIONS: Claude Code will show permission prompts")
         print("   (Use --dangerously-skip-permissions to skip these)")
     print()
-    print("🔑  API KEY MANAGEMENT:")
-    print("   • Set NVIDIA_API_KEY environment variable export")
-    print("     NVIDIA_API_KEY='nvapi-...'")
-    print("   • Or run the script once - it will prompt and cache the key")
-    print("     to ~/.nvidia_api_key_cache for future runs.")
-    print("   • Use --clear-api-key to clear the cached key and prompt again")
-    print()
     print("🌐  HOW IT WORKS:")
     print("   Claude Code speaks the Anthropic Messages API (/v1/messages).")
-    print("   NVIDIA exposes an OpenAI-compatible API (/v1/chat/completions).")
+    print("   anyAPI exposes its own API endpoint.")
     print("   A local litellm proxy translates between them so conversation")
-    print("   and tool calls work against the NVIDIA model.")
+    print("   and tool calls work against the anyAPI model.")
     print()
     print("   • ANTHROPIC_BASE_URL=http://127.0.0.1:<port>  (litellm proxy)")
     print("   • ANTHROPIC_AUTH_TOKEN=sk-claude-bridge  (proxy master key)")
@@ -960,7 +950,7 @@ def print_usage_notes(dangerously_skip_permissions=False):
 # ─── Main ────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Bridge NVIDIA NIM models with the Claude Code CLI"
+        description="Bridge anyAPI models with the Claude Code CLI"
     )
     parser.add_argument(
         "--dangerously-skip-permissions",
@@ -972,7 +962,7 @@ def main():
         "--clear-api-key",
         action="store_true",
         default=False,
-        help="Clear the cached NVIDIA API key and prompt again",
+        help="Clear the cached API key and prompt again",
     )
     args = parser.parse_args()
 
@@ -984,25 +974,22 @@ def main():
 
     api_key = get_api_key(clear=args.clear_api_key)
 
-    print("\n🔄 Fetching model list from NVIDIA NIM API...")
+    print("\n🔄 Fetching model list from anyAPI...")
     all_raw_models = fetch_models(api_key)
 
     standard, free, combined = categorize_models(all_raw_models)
     selected_model = display_and_select(standard, free, combined)
 
-    if not check_model_access(selected_model, api_key):
-        print("\n⚠️  The selected model is not accessible with your API key.")
-        print("    Please run the script again and pick a different model.")
-        print("    (Some NVIDIA models are restricted to certain accounts.)")
-        sys.exit(1)
-
+    # Generate config and start the proxy FIRST, then validate the connection
+    # through the proxy. (check_model_access requires a live proxy, so it can't
+    # run before start_proxy().)
     generate_litellm_config(selected_model, api_key)
     proc = start_proxy()
 
     try:
         if not test_proxy_connection(selected_model):
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
-            print("   Check ~/.claude_nvidia/proxy.log for details.")
+            print("   Check ~/.claude_anyapi/proxy.log for details.")
             print("   You may still attempt to launch manually.")
         launch_claude_with_model(selected_model, args.dangerously_skip_permissions)
     finally:

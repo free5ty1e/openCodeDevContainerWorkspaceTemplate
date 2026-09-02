@@ -12,10 +12,11 @@ import urllib.request
 import urllib.error
 
 # ─── Configuration ───────────────────────────────────────────────────────
-OPENCODE_API_URL = "https://api.opencode.com/v1/models"
-OPENCODE_CHAT_URL = "https://api.opencode.com/v1/chat/completions"
+OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+OPENCODE_API_URL = f"{OPENCODE_ZEN_BASE_URL}/models"
+OPENCODE_CHAT_URL = f"{OPENCODE_ZEN_BASE_URL}/chat/completions"
 CACHE_FILE = os.path.expanduser("~/.opencode_api_key_cache")
-PROXY_PORT = 4499
+PROXY_PORT = 4501
 PROXY_MASTER_KEY = "sk-opencode-bridge"
 CONFIG_DIR = os.path.expanduser("~/.claude_opencode")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "litellm_proxy.yaml")
@@ -198,18 +199,7 @@ def ensure_litellm():
     venv_python = "/workspace/.venv/bin/python3" if venv_exists else None
     venv_litellm = "/workspace/.venv/bin/litellm" if venv_exists else None
 
-    # 3. Try to install litellm[proxy] into workspace venv (if venv exists)
-    if venv_exists and venv_python and os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
-        print("  📦 Ensuring litellm[proxy] in workspace venv...")
-        subprocess.run(
-            [venv_python, "-m", "pip", "install", "-q", "litellm[proxy]"],
-            capture_output=True, timeout=120,
-        )
-        if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
-            print("  ✅ litellm[proxy] installed in workspace venv")
-            return True
-
-    # 4. Try installing litellm[proxy] system-wide with --break-system-packages
+    # 3. Try installing litellm[proxy] system-wide with --break-system-packages
     print("  📦 Ensuring litellm[proxy] system-wide...")
     subprocess.run(
         ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
@@ -219,17 +209,7 @@ def ensure_litellm():
         print("  ✅ litellm[proxy] installed system-wide")
         return True
 
-    # 5. Fall back to base litellm install system-wide with --break-system-packages
-    print("  📦 Ensuring litellm base package system-wide...")
-    subprocess.run(
-        ["pip", "install", "--break-system-packages", "-q", "litellm"],
-        capture_output=True, timeout=180,
-    )
-    if shutil.which("litellm"):
-        print("  ✅ litellm installed system-wide (base)")
-        return True
-
-    # 6. Try pip install --user as alternative
+    # 4. Fall back to pip install --user as alternative
     print("  📦 Trying pip install --user...")
     subprocess.run(
         ["pip", "install", "--user", "-q", "litellm[proxy]"],
@@ -258,12 +238,23 @@ def ensure_prerequisites():
 
 
 # ─── Step 2: Prompt for API key if not cached ───────────────────────────
-def get_api_key():
-    """Return a valid OpenAPI API key, prompting if needed and caching it."""
-    OPEND_API_KEY = os.environ.get("OPENCODE_API_KEY")
+def get_api_key(clear=False):
+    """Return a valid OpenCode Zen API key, prompting if needed and caching it.
+    If `clear` is True, the cached key is removed and the user is prompted again.
+    If the user provides an empty key, anonymous mode is used (no Authorization header).
+    """
+    # Handle clear flag
+    if clear and os.path.exists(CACHE_FILE):
+        try:
+            os.remove(CACHE_FILE)
+            print(f"🗑️  Cleared cached OpenCode API key at {CACHE_FILE}.")
+        except OSError:
+            print(f"⚠️  Failed to delete cached OpenCode API key at {CACHE_FILE}.")
+
+    OPENCODE_API_KEY = os.environ.get("OPENCODE_ZEN_API_KEY") or os.environ.get("OPENCODE_API_KEY")
 
     if OPENCODE_API_KEY:
-        print("✅ OpenCode API key found in environment.")
+        print("✅ OpenCode Zen API key found in environment.")
         return OPENCODE_API_KEY
 
     if os.path.exists(CACHE_FILE):
@@ -279,15 +270,13 @@ def get_api_key():
 
     print("🔑 OpenCode API key not found.")
     try:
-        api_key = input("   Please enter your OpenCode API key: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n❌ No API key provided. Exiting.")
-        sys.exit(1)
-
+        api_key = input("   Please enter your OpenCode API key (or press Enter for anonymous): ").strip()
+    except EOFError:
+        print("⚠️  No API key provided – proceeding in anonymous mode.")
+        return ""
     if not api_key:
-        print("❌ No API key provided. Exiting.")
-        sys.exit(1)
-
+        print("⚠️  No API key provided – proceeding in anonymous mode.")
+        return ""
     try:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, "w") as f:
@@ -301,22 +290,67 @@ def get_api_key():
 
 
 # ─── Step 3: Fetch models from OpenCode ────────────────────────────────────
+# Fallback model list used when the live /models endpoint is unreachable
+# (e.g. Cloudflare HTTP 1010 from some devcontainers). Seeded from the
+# OpenCode Zen free/anonymous generative lineup. "big-pickle" is the flagship
+# free model; free-tier models are sorted to the bottom on display.
+# Models tagged with owned_by="community" are treated as free tier.
+OPENCODE_FALLBACK_MODELS = [
+    "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+    "claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-5", "claude-sonnet-4-6",
+    "claude-sonnet-4-5", "claude-sonnet-4", "claude-haiku-4-5",
+    "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite",
+    "gemini-3.5-flash", "gemini-3.1-pro", "gemini-3-flash",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro",
+    "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano",
+    "gpt-5.3-codex-spark", "gpt-5.3-codex", "gpt-5.2", "gpt-5.2-codex",
+    "gpt-5.1", "gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5.1-codex-mini",
+    "gpt-5", "gpt-5-codex", "gpt-5-nano",
+    "grok-build-0.1", "grok-4.6",
+]
+
+# Free / community models on OpenCode Zen (sorted to the bottom of the list).
+OPENCODE_FREE_MODELS = {"big-pickle"}
+
+
 def http_get_json(url, api_key):
-    req = urllib.request.Request(
-        url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-    )
+    """GET JSON from the OpenCode Zen API.
+
+    If api_key is empty (anonymous mode), no Authorization header is sent.
+    """
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
 
 def fetch_models(api_key):
-    """Fetch the list of available chat models from OpenCode API."""
+    """Fetch the list of available chat models from the OpenCode API.
+
+    On success, normalizes to OpenAI-style [{"id": ..., "owned_by": ...}].
+    If the live endpoint is unreachable (HTTP 403 / Cloudflare 1010, common
+    from a shared devcontainer IP), falls back to the bundled free/anonymous
+    model list so the script remains usable offline.
+    """
     try:
         data = http_get_json(OPENCODE_API_URL, api_key)
-        return data.get("data", [])
+        raw = data.get("data", [])
+        models = [{"id": m.get("id", ""), "owned_by": m.get("owned_by", "")} for m in raw if m.get("id")]
+        if models:
+            print("   ✅ Model list fetched from OpenCode API.")
+            return models
+        raise RuntimeError("Empty model list from API")
     except Exception as e:
-        print(f"❌ Failed to retrieve models: {e}")
-        sys.exit(1)
+        print(f"   ⚠️  Could not reach OpenCode API ({str(e)[:80]}).")
+        print("   Using bundled free/anonymous model list so you can still proceed.")
+        all_ids = OPENCODE_FALLBACK_MODELS + sorted(OPENCODE_FREE_MODELS)
+        # All fallback models are community/free since this list is specifically
+        # for free/anonymous access when the live API is blocked (e.g. Cloudflare 1010).
+        # Previously only big-pickle was tagged as community, but all fallback models
+        # should be free tier and sorted to the bottom of the selector.
+        return [{"id": m, "owned_by": "community"} for m in all_ids]
 
 
 # ─── Step 4: Categorize, filter, and sort models ────────────────────────
@@ -453,22 +487,26 @@ def generate_litellm_config(selected_model, api_key):
     """Write a litellm PROXY config mapping the model to OpenCode's API.
 
     Claude Code speaks the Anthropic Messages API (/v1/messages), but OpenCode
-    only exposes its own API endpoint. litellm's proxy translates between the two,
-    so Claude Code's conversation and tool calls work against the OpenCode model.
+    exposes an OpenAI-compatible API at https://opencode.ai/zen/v1. Use the
+    `openai/` provider prefix with that custom api_base — the `opencode/`
+    prefix is NOT a valid litellm provider and breaks /v1/messages routing.
+    If api_key is empty (anonymous mode), omit it from the config.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    params = {
+        "model": f"openai/{selected_model}",
+        "api_base": OPENCODE_ZEN_BASE_URL,
+    }
+    if api_key:
+        params["api_key"] = api_key
     config = {
         "model_list": [
             {
                 "model_name": "opencode",
-                "litellm_params": {
-                    "model": f"opencode/{selected_model}",
-                    "api_key": api_key,
-                    "api_base": "https://api.opencode.com/v1",
-                },
+                "litellm_params": params,
             }
         ],
-        "general_settings": {"master_key": PROXY_MASTER_KEY},
+        "general_settings": {"master_key": PROXY_MASTER_KEY, "store_model_in_db": False},
         "litellm_settings": {"drop_params": True},
     }
     with open(CONFIG_FILE, "w") as f:
@@ -875,7 +913,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     # Anthropic-compatible /v1/messages endpoint.
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
-    env["ANTHROPIC_MODEL"] = "nvidia"
+    env["ANTHROPIC_MODEL"] = "opencode"
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
@@ -956,6 +994,12 @@ def main():
         default=False,
         help="Skip Claude Code permission prompts (safe in devcontainer environments)",
     )
+    parser.add_argument(
+        "--clear-api-key",
+        action="store_true",
+        default=False,
+        help="Clear the cached OpenCode API key and prompt again",
+    )
     args = parser.parse_args()
 
     print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
@@ -964,7 +1008,8 @@ def main():
         print("❌ Prerequisites check failed. Exiting.")
         sys.exit(1)
 
-    api_key = get_api_key()
+    # Get API key exactly once. --clear-api-key removes the cached key first.
+    api_key = get_api_key(clear=args.clear_api_key)
 
     print("\n🔄 Fetching model list from OpenCode API...")
     all_raw_models = fetch_models(api_key)
@@ -972,19 +1017,16 @@ def main():
     standard, free, combined = categorize_models(all_raw_models)
     selected_model = display_and_select(standard, free, combined)
 
-    if not check_model_access(selected_model, api_key):
-        print("\n⚠️  The selected model is not accessible with your API key.")
-        print("    Please run the script again and pick a different model.")
-        print("    (Some OpenCode models are restricted to certain accounts.)")
-        sys.exit(1)
-
+    # Generate config and start the proxy FIRST, then validate the connection
+    # through the proxy. (check_model_access requires a live proxy, so it can't
+    # run before start_proxy().)
     generate_litellm_config(selected_model, api_key)
     proc = start_proxy()
 
     try:
         if not test_proxy_connection(selected_model):
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
-            print("   Check ~/.claude_nvidia/proxy.log for details.")
+            print("   Check ~/.claude_opencode/proxy.log for details.")
             print("   You may still attempt to launch manually.")
         launch_claude_with_model(selected_model, args.dangerously_skip_permissions)
     finally:
