@@ -465,7 +465,7 @@ def generate_litellm_config(selected_model, api_key):
     config = {
         "model_list": [
             {
-                "model_name": "nvidia",
+                "model_name": selected_model,
                 "litellm_params": {
                     "model": f"nvidia_nim/{selected_model}",
                     "api_key": api_key,
@@ -656,7 +656,7 @@ def test_proxy_connection(selected_model):
     """Quick validation via the proxy to verify the model responds."""
     print(f"\n🧪 Testing selected model through proxy ({selected_model})...")
     payload = {
-        "model": "nvidia",
+        "model": selected_model,
         "max_tokens": 50,
         "messages": [{"role": "user", "content": "Hello! Please respond with a simple greeting."}],
     }
@@ -880,7 +880,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     # Anthropic-compatible /v1/messages endpoint.
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
-    env["ANTHROPIC_MODEL"] = "nvidia"
+    env["ANTHROPIC_MODEL"] = selected_model
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
@@ -990,16 +990,14 @@ def main():
     standard, free, combined = categorize_models(all_raw_models)
     selected_model = display_and_select(standard, free, combined)
 
-    if not check_model_access(selected_model, api_key):
-        print("\n⚠️  The selected model is not accessible with your API key.")
-        print("    Please run the script again and pick a different model.")
-        print("    (Some NVIDIA models are restricted to certain accounts.)")
-        sys.exit(1)
-
+    # Generate config and start the proxy FIRST, then validate the connection
+    # through the proxy. (check_model_access requires a live proxy, so it can't
+    # run before start_proxy().)
     generate_litellm_config(selected_model, api_key)
     proc = start_proxy()
 
     try:
+        # Test proxy connection (also validates model access via proxy)
         if not test_proxy_connection(selected_model):
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
             print("   Check ~/.claude_nvidia/proxy.log for details.")

@@ -467,7 +467,7 @@ def generate_litellm_config(selected_model, api_key):
     config = {
         "model_list": [
             {
-                "model_name": "google",
+                "model_name": selected_model,
                 "litellm_params": {
                     "model": f"gemini/{selected_model}",
                     "api_key": api_key,
@@ -657,7 +657,7 @@ def test_proxy_connection(selected_model):
     """Quick validation via the proxy to verify the model responds."""
     print(f"\n🧪 Testing selected model through proxy ({selected_model})...")
     payload = {
-        "model": "google",
+        "model": selected_model,
         "max_tokens": 50,
         "messages": [{"role": "user", "content": "Hello! Please respond with a simple greeting."}],
     }
@@ -881,7 +881,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     # Anthropic-compatible /v1/messages endpoint.
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
-    env["ANTHROPIC_MODEL"] = "gemini"
+    env["ANTHROPIC_MODEL"] = selected_model
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
