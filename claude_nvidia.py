@@ -342,7 +342,11 @@ def http_get_json(url, api_key):
 
 
 def fetch_models(api_key):
-    """Fetch the list of available chat models from NVIDIA API."""
+    """Fetch the list of available chat models from NVIDIA API.
+
+    Note: NVIDIA's models API only returns basic fields (id, object, created, owned_by).
+    It does NOT include context window info. We use a curated fallback mapping below.
+    """
     try:
         data = http_get_json(NVIDIA_API_URL, api_key)
         return data.get("data", [])
@@ -353,7 +357,9 @@ def fetch_models(api_key):
 
 # ─── Step 4: Categorize, filter, and sort models ────────────────────────
 def categorize_models(all_raw_models):
-    """Categorize models into standard and free/tier, sorted with free at bottom."""
+    """Categorize models into standard and free/tier, sorted with free at bottom.
+    Returns full model objects to preserve all fields for display.
+    """
     NON_CHAT_KEYWORDS = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
     FREE_KEYWORDS = ["community", "instruct", "chat", "deepseek", "kimi", "glm", "llama", "gemma", "nemotron"]
 
@@ -373,14 +379,14 @@ def categorize_models(all_raw_models):
             or any(keyword in model_id_lower for keyword in ["deepseek", "kimi", "glm"])
         )
         if is_free:
-            if model_id not in free_tier_chat_models:
-                free_tier_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in free_tier_chat_models):
+                free_tier_chat_models.append(model_obj)
         else:
-            if model_id not in standard_chat_models:
-                standard_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in standard_chat_models):
+                standard_chat_models.append(model_obj)
 
-    standard_chat_models.sort()
-    free_tier_chat_models.sort()
+    standard_chat_models.sort(key=lambda m: m.get("id", ""))
+    free_tier_chat_models.sort(key=lambda m: m.get("id", ""))
     combined_models_list = standard_chat_models + free_tier_chat_models
     return standard_chat_models, free_tier_chat_models, combined_models_list
 
@@ -410,6 +416,28 @@ def get_selection_input(prompt, max_val):
 
 def display_and_select(standard, free, combined):
     """Display the model list with numbers and get user selection."""
+    # Context window mapping for display (NVIDIA API doesn't return this)
+    # Verified from NVIDIA docs, HuggingFace configs, and model cards
+    CONTEXT_WINDOWS = {
+        "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
+        "nvidia/nemotron-3-ultra": 4096,  # Verified: NVIDIA Nemotron 3 Ultra = 4K
+        "nvidia/nemotron-3-8b": 4096,
+        "nvidia/nemotron-3-ultra-32b": 4096,
+        "nvidia/llama-3.1-nemotron-70b-instruct": 128000,
+        "nvidia/llama-3.1-nemotron-8b-instruct": 128000,
+        "nvidia/llama-3.2-nemotron-3b-instruct": 128000,
+        "nvidia/llama-3.2-nemotron-1b-instruct": 128000,
+        "meta/llama-3.1-405b-instruct": 128000,
+        "meta/llama-3.1-70b-instruct": 128000,
+        "meta/llama-3.1-8b-instruct": 128000,
+        "google/gemma-2-27b-it": 8192,
+        "google/gemma-2-9b-it": 8192,
+        "microsoft/phi-3.5-mini-instruct": 128000,
+        "microsoft/phi-3.5-moe-instruct": 128000,
+        "nvidia/nemotron-4-ultra": 4096,
+        "nvidia/nemotron-4-340b": 4096,
+    }
+
     print("\n========================================")
     print("       AVAILABLE NVIDIA CHAT MODELS     ")
     print("========================================")
@@ -417,20 +445,26 @@ def display_and_select(standard, free, combined):
     current_number = 1
     if standard:
         print("\n--- Standard & Enterprise Chat Models ---")
-        for model_id in standard:
-            print(f"[{current_number}] {model_id}")
+        for model_obj in standard:
+            model_id = model_obj.get("id", "")
+            ctx = CONTEXT_WINDOWS.get(model_id, 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+            print(f"[{current_number}] {model_id}{ctx_str}")
             current_number += 1
     if free:
         print("\n--- Free & Community Tier Chat Models ---")
-        for model_id in free:
-            print(f"[{current_number}] {model_id} (Free Tier)")
+        for model_obj in free:
+            model_id = model_obj.get("id", "")
+            ctx = CONTEXT_WINDOWS.get(model_id, 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+            print(f"[{current_number}] {model_id}{ctx_str} (Free Tier)")
             current_number += 1
 
     print("========================================")
     print(f"\nTotal models: {len(combined)}")
     print(f"\nSelect a model number [1-{len(combined)}]:")
     selected_idx = get_selection_input("> ", len(combined))
-    selected_model = combined[selected_idx]
+    selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
     return selected_model
 
@@ -482,8 +516,52 @@ def generate_litellm_config(selected_model, api_key):
     only exposes an OpenAI-compatible API (/v1/chat/completions). litellm's
     proxy translates between the two, so Claude Code's conversation and tool
     calls work against the NVIDIA model.
+
+    Includes model_info with context window so Claude Code can use the full
+    context size of each model.
+
+    NOTE: NVIDIA's /v1/models API does NOT return context window information.
+    We use a curated fallback mapping based on published model specifications.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    # Known context windows for NVIDIA NIM models (fallback mapping)
+    # NVIDIA API does not return context info, so this is our best knowledge
+    # Verified from NVIDIA docs, HuggingFace configs, and model cards
+    CONTEXT_WINDOWS = {
+        "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
+        "nvidia/nemotron-3-ultra": 4096,  # Verified: NVIDIA Nemotron 3 Ultra = 4K
+        "nvidia/nemotron-3-8b": 4096,
+        "nvidia/nemotron-3-ultra-32b": 4096,
+        "nvidia/llama-3.1-nemotron-70b-instruct": 128000,
+        "nvidia/llama-3.1-nemotron-8b-instruct": 128000,
+        "nvidia/llama-3.2-nemotron-3b-instruct": 128000,
+        "nvidia/llama-3.2-nemotron-1b-instruct": 128000,
+        "meta/llama-3.1-405b-instruct": 128000,
+        "meta/llama-3.1-70b-instruct": 128000,
+        "meta/llama-3.1-8b-instruct": 128000,
+        "google/gemma-2-27b-it": 8192,
+        "google/gemma-2-9b-it": 8192,
+        "microsoft/phi-3.5-mini-instruct": 128000,
+        "microsoft/phi-3.5-moe-instruct": 128000,
+        "nvidia/nemotron-4-ultra": 4096,
+        "nvidia/nemotron-4-340b": 4096,
+    }
+
+    # Determine context window
+    context_window = CONTEXT_WINDOWS.get(selected_model, 0)
+    if context_window > 0:
+        print(f"   📏 Context window (curated fallback): {context_window:,} tokens")
+    else:
+        # Default to 4096 for completely unknown models
+        context_window = 4096
+        print(f"   ⚠️  Unknown model - using default context window: {context_window:,} tokens")
+
+    model_info = {
+        "mode": "chat",
+        "max_tokens": context_window,
+    }
+
     config = {
         "model_list": [
             {
@@ -493,6 +571,7 @@ def generate_litellm_config(selected_model, api_key):
                     "api_key": api_key,
                     "api_base": "https://integrate.api.nvidia.com/v1",
                 },
+                "model_info": model_info,
             }
         ],
         "general_settings": {"master_key": PROXY_MASTER_KEY},

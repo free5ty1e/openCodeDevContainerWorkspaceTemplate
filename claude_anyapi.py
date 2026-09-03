@@ -333,16 +333,20 @@ def fetch_models(api_key):
     """Fetch the list of available models from the anyAPI provider.
 
     The provider is expected to return a JSON response with a top-level
-    "models" array, where each model has at least an "id" field and
-    optionally an "owned_by" field.  Free/community models should have
-    "owned_by": "community" or the id should contain "free".
+    "models" array (or "data" like OpenAI), where each model has at least
+    an "id" field and optionally "owned_by" and context window fields
+    (e.g., "input_token_limit", "max_tokens", "context_length", etc.).
+
+    Free/community models should have "owned_by": "community" or the id
+    should contain "free".
 
     All models are returned in a combined list with free-tier models
     sorted to the bottom (mirroring the behaviour of the NVIDIA/OpenCode/Google scripts).
     """
     try:
         data = http_get_json(ANYAPI_MODELS_ENDPOINT, api_key)
-        raw = data.get("models", [])
+        # Support both "models" and "data" top-level keys
+        raw = data.get("models", data.get("data", []))
         models = []
         for m in raw:
             model_id = m.get("id", "")
@@ -360,7 +364,20 @@ def fetch_models(api_key):
                 "community" in owned_by
                 or "free" in model_id_lower
             )
-            models.append({"id": model_id, "owned_by": owned_by, "is_free": is_free})
+
+            # Try to extract context window from the API response
+            # Common field names across providers:
+            context_window = (
+                m.get("input_token_limit")
+                or m.get("inputTokenLimit")
+                or m.get("max_tokens")
+                or m.get("maxTokens")
+                or m.get("context_length")
+                or m.get("contextLength")
+                or 0
+            )
+
+            models.append({"id": model_id, "owned_by": owned_by, "is_free": is_free, "context_window": context_window})
         return models
     except Exception as e:
         print(f"❌ Failed to retrieve models: {e}")
@@ -372,6 +389,7 @@ def categorize_models(all_raw_models):
     """Categorize models into standard and free/tier, sorted with free at bottom.
 
     Free models are sorted and separated at the bottom of the selector list.
+    Returns full model objects (with context_window) for display.
     """
     NON_CHAT_KEYWORDS = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
     FREE_KEYWORDS = ["community", "free"]
@@ -394,14 +412,14 @@ def categorize_models(all_raw_models):
             or "free" in model_id_lower
         )
         if is_free:
-            if model_id not in free_tier_chat_models:
-                free_tier_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in free_tier_chat_models):
+                free_tier_chat_models.append(model_obj)
         else:
-            if model_id not in standard_chat_models:
-                standard_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in standard_chat_models):
+                standard_chat_models.append(model_obj)
 
-    standard_chat_models.sort()
-    free_tier_chat_models.sort()
+    standard_chat_models.sort(key=lambda m: m.get("id", ""))
+    free_tier_chat_models.sort(key=lambda m: m.get("id", ""))
     combined_models_list = standard_chat_models + free_tier_chat_models
     return standard_chat_models, free_tier_chat_models, combined_models_list
 
@@ -438,20 +456,26 @@ def display_and_select(standard, free, combined):
     current_number = 1
     if standard:
         print("\n--- Standard Chat Models ---")
-        for model_id in standard:
-            print(f"[{current_number}] {model_id}")
+        for model_obj in standard:
+            model_id = model_obj.get("id", "")
+            ctx = model_obj.get("context_window", 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+            print(f"[{current_number}] {model_id}{ctx_str}")
             current_number += 1
     if free:
         print("\n--- Free & Community Tier ---")
-        for model_id in free:
-            print(f"[{current_number}] {model_id} (Free Tier)")
+        for model_obj in free:
+            model_id = model_obj.get("id", "")
+            ctx = model_obj.get("context_window", 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+            print(f"[{current_number}] {model_id}{ctx_str} (Free Tier)")
             current_number += 1
 
     print("========================================")
     print(f"\nTotal models: {len(combined)}")
     print(f"\nSelect a model number [1-{len(combined)}]:")
     selected_idx = get_selection_input("> ", len(combined))
-    selected_model = combined[selected_idx]
+    selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
     return selected_model
 
@@ -477,19 +501,49 @@ def generate_litellm_config(selected_model, api_key):
     provider prefix with the anyAPI custom api_base — `anyapi_` is NOT a
     valid litellm provider prefix and breaks /v1/messages routing.
     If api_key is empty (anonymous mode), omit it from the config.
+
+    Includes model_info with context window so Claude Code can use the full
+    context size of each model. Context window should be dynamically fetched
+    from the provider's models API (see fetch_models()).
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    # Re-fetch models to get the context window for the selected model
+    # (In production, you might want to pass the model data through to avoid
+    # a second API call, but this ensures we have the latest info)
+    models = fetch_models(api_key)
+    selected_model_data = next((m for m in models if m["id"] == selected_model), None)
+
+    if selected_model_data and selected_model_data.get("context_window", 0) > 0:
+        context_window = selected_model_data["context_window"]
+        print(f"   📏 Context window from API: {context_window:,} tokens")
+    else:
+        # Fallback: provider-specific mapping goes here
+        # CUSTOMIZE THIS FOR YOUR PROVIDER
+        CONTEXT_WINDOWS = {
+            # Example: "model-name": 1000000,
+        }
+        context_window = CONTEXT_WINDOWS.get(selected_model, 4096)
+        print(f"   ⚠️  Using fallback context window: {context_window:,} tokens")
+
+    model_info = {
+        "mode": "chat",
+        "max_tokens": context_window,
+    }
+
     params = {
         "model": f"openai/{selected_model}",
         "api_base": ANYAPI_BASE_URL,
     }
     if api_key:
         params["api_key"] = api_key
+
     config = {
         "model_list": [
             {
                 "model_name": selected_model,
                 "litellm_params": params,
+                "model_info": model_info,
             }
         ],
         "general_settings": {"master_key": PROXY_MASTER_KEY, "store_model_in_db": False},

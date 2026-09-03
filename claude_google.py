@@ -330,8 +330,10 @@ def fetch_models(api_key):
     """Fetch the list of available models from the Google Gemini API.
 
     Response shape: {"models": [{"name": "models/gemini-1.5-flash",
-    "supportedGenerationMethods": ["generateContent", ...], ...}]}.
-    We normalize to OpenAI-style {"id": "gemini-1.5-flash"} dicts.
+    "supportedGenerationMethods": ["generateContent", ...],
+    "inputTokenLimit": 1048576,
+    "outputTokenLimit": 8192, ...}]}.
+    We normalize to OpenAI-style {"id": "gemini-1.5-flash", "input_token_limit": ...} dicts.
     """
     try:
         data = http_get_json(GOOGLE_API_URL, api_key)
@@ -346,7 +348,16 @@ def fetch_models(api_key):
             # Strip the "models/" prefix for a clean id
             model_id = name.split("/", 1)[-1] if "/" in name else name
             if model_id:
-                models.append({"id": model_id, "owned_by": "google"})
+                # Get context window from the API response
+                input_token_limit = m.get("inputTokenLimit", 0)
+                output_token_limit = m.get("outputTokenLimit", 0)
+                # Use input token limit as the context window (total context)
+                context_window = input_token_limit if input_token_limit > 0 else output_token_limit
+                models.append({
+                    "id": model_id,
+                    "owned_by": "google",
+                    "context_window": context_window
+                })
         return models
     except Exception as e:
         print(f"❌ Failed to retrieve models: {e}")
@@ -359,6 +370,7 @@ def categorize_models(all_raw_models):
 
     Free models (with "free" in title) are sorted and separated at the bottom
     of the selector list.
+    Returns lists of full model objects (with context_window) for display.
     """
     NON_CHAT_KEYWORDS = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
     FREE_KEYWORDS = ["community", "free"]
@@ -380,14 +392,15 @@ def categorize_models(all_raw_models):
             or "free" in model_id_lower
         )
         if is_free:
-            if model_id not in free_tier_chat_models:
-                free_tier_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in free_tier_chat_models):
+                free_tier_chat_models.append(model_obj)
         else:
-            if model_id not in standard_chat_models:
-                standard_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in standard_chat_models):
+                standard_chat_models.append(model_obj)
 
-    standard_chat_models.sort()
-    free_tier_chat_models.sort()
+    # Sort by model id
+    standard_chat_models.sort(key=lambda m: m.get("id", ""))
+    free_tier_chat_models.sort(key=lambda m: m.get("id", ""))
     combined_models_list = standard_chat_models + free_tier_chat_models
     return standard_chat_models, free_tier_chat_models, combined_models_list
 
@@ -424,20 +437,26 @@ def display_and_select(standard, free, combined):
     current_number = 1
     if standard:
         print("\n--- Standard Google AI Models ---")
-        for model_id in standard:
-            print(f"[{current_number}] {model_id}")
+        for model_obj in standard:
+            model_id = model_obj.get("id", "")
+            ctx = model_obj.get("context_window", 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else ""
+            print(f"[{current_number}] {model_id}{ctx_str}")
             current_number += 1
     if free:
         print("\n--- Free & Community Tier ---")
-        for model_id in free:
-            print(f"[{current_number}] {model_id} (Free Tier)")
+        for model_obj in free:
+            model_id = model_obj.get("id", "")
+            ctx = model_obj.get("context_window", 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else ""
+            print(f"[{current_number}] {model_id}{ctx_str} (Free Tier)")
             current_number += 1
 
     print("========================================")
     print(f"\nTotal models: {len(combined)}")
     print(f"\nSelect a model number [1-{len(combined)}]:")
     selected_idx = get_selection_input("> ", len(combined))
-    selected_model = combined[selected_idx]
+    selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
     return selected_model
 
@@ -462,8 +481,48 @@ def generate_litellm_config(selected_model, api_key):
     is NOT a valid provider and causes `/v1/messages` to fail with
     "No connected db". Use `gemini/` so litellm can resolve the provider and
     authenticate via the api_key.
+
+    Includes model_info with context window so Claude Code can use the full
+    context size of each model. Context window is dynamically fetched from
+    the Google models API (inputTokenLimit).
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    # Re-fetch models to get the context window for the selected model
+    # (we could also pass it through, but re-fetching ensures we have the latest)
+    models = fetch_models(api_key)
+    selected_model_data = next((m for m in models if m["id"] == selected_model), None)
+
+    if selected_model_data and selected_model_data.get("context_window", 0) > 0:
+        context_window = selected_model_data["context_window"]
+        print(f"   📏 Context window from API: {context_window:,} tokens")
+    else:
+        # Fallback to known values if API didn't return context info
+        CONTEXT_WINDOWS = {
+            "gemini-1.5-pro": 2000000,
+            "gemini-1.5-pro-001": 2000000,
+            "gemini-1.5-pro-002": 2000000,
+            "gemini-1.5-flash": 1000000,
+            "gemini-1.5-flash-001": 1000000,
+            "gemini-1.5-flash-002": 1000000,
+            "gemini-1.5-flash-8b": 1000000,
+            "gemini-2.0-flash": 1000000,
+            "gemini-2.0-flash-lite": 1000000,
+            "gemini-2.0-pro": 2000000,
+            "gemini-2.5-pro": 2000000,
+            "gemini-2.5-flash": 1000000,
+            "gemini-1.0-pro": 32768,
+            "gemini-1.0-pro-vision": 16384,
+            "gemini-1.0-pro-001": 32768,
+        }
+        context_window = CONTEXT_WINDOWS.get(selected_model, 1000000)
+        print(f"   ⚠️  Using fallback context window: {context_window:,} tokens")
+
+    model_info = {
+        "mode": "chat",
+        "max_tokens": context_window,
+    }
+
     config = {
         "model_list": [
             {
@@ -472,6 +531,7 @@ def generate_litellm_config(selected_model, api_key):
                     "model": f"gemini/{selected_model}",
                     "api_key": api_key,
                 },
+                "model_info": model_info,
             }
         ],
         "general_settings": {"master_key": PROXY_MASTER_KEY, "store_model_in_db": False},
