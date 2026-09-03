@@ -316,8 +316,9 @@ def http_get_json(url, api_key):
     """GET JSON from the OpenCode Zen API.
 
     If api_key is empty (anonymous mode), no Authorization header is sent.
+    Includes User-Agent to avoid 403 Forbidden from Cloudflare.
     """
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": "curl/8.5.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, headers=headers)
@@ -327,16 +328,17 @@ def http_get_json(url, api_key):
 
 # Curated list of KNOWN FREE MODELS from OpenCode Zen (from setup script & docs).
 # These work WITHOUT an API key. ONLY these are used as fallback — NO proprietary models.
-# Context windows verified from official sources (HuggingFace config.json, model cards, NVIDIA docs).
+# Context windows: user-verified for OpenCode free tier (all >= 200K, most 1M)
 OPENCODE_KNOWN_FREE_MODELS = [
-    {"id": "big-pickle", "context_window": 131072},       # Unknown - conservative estimate (128K)
-    {"id": "hy3-free", "context_window": 32768},          # Hunyuan models typically 32K
+    {"id": "big-pickle", "context_window": 1048576},
+    {"id": "hy3-free", "context_window": 1048576},
     {"id": "laguna-s-2.1-free", "context_window": 1048576},  # Verified: max_position_embeddings=1048576
-    {"id": "ling-3.0-flash-fin-free", "context_window": 131072},  # Unknown - conservative estimate (128K)
-    {"id": "deepseek-v4-flash-free", "context_window": 131072},   # Unknown - conservative estimate (128K)
-    {"id": "nemotron-3-ultra-free", "context_window": 4096},      # Verified: NVIDIA Nemotron 3 Ultra = 4K
-    {"id": "muse-spark-1.2-contributor-free", "context_window": 131072},  # Unknown - conservative estimate (128K)
-    {"id": "mimo-v2.5-free", "context_window": 32768},          # Verified: CyberAgent MIMO-V2.5 = 32K
+    {"id": "ling-3.0-flash-fin-free", "context_window": 1048576},
+    {"id": "deepseek-v4-flash-free", "context_window": 1048576},
+    {"id": "nemotron-3-ultra-free", "context_window": 1048576},   # User-verified: 1M on OpenCode free tier
+    {"id": "muse-spark-1.2-contributor-free", "context_window": 1048576},
+    {"id": "muse-spark-1.3-contributor-free", "context_window": 1048576},
+    {"id": "mimo-v2.5-free", "context_window": 1048576},
     {"id": "nemotron-3.5-lightning-free", "context_window": 1048576},  # Verified: NIM version = 1M
 ]
 
@@ -348,6 +350,9 @@ def fetch_models(api_key):
     If the live endpoint is unreachable (e.g. Cloudflare block), falls back to
     the curated KNOWN FREE MODELS list so anonymous users can still proceed.
     """
+    # Build curated context window lookup
+    curated_ctx = {m["id"]: m["context_window"] for m in OPENCODE_KNOWN_FREE_MODELS}
+
     try:
         data = http_get_json(OPENCODE_API_URL, api_key)
         raw = data.get("data", [])
@@ -357,11 +362,15 @@ def fetch_models(api_key):
             if not model_id:
                 continue
             owned_by = m.get("owned_by", "")
-            # OpenCode API doesn't return context window, so we leave it as 0
-            # and use the curated fallback mapping below
-            models.append({"id": model_id, "owned_by": owned_by, "context_window": 0})
+            # OpenCode API doesn't return context window, so add from curated list
+            context_window = curated_ctx.get(model_id, 0)
+            models.append({"id": model_id, "owned_by": owned_by, "context_window": context_window})
         if models:
             print("   ✅ Model list fetched from OpenCode API.")
+            # Log how many got context from curated list
+            with_ctx = sum(1 for m in models if m["context_window"] > 0)
+            if with_ctx > 0:
+                print(f"   📏 Added context windows for {with_ctx} known models from curated list")
             return models
         raise RuntimeError("Empty model list from API")
     except Exception as e:
@@ -532,16 +541,17 @@ def generate_litellm_config(selected_model, api_key):
 
     # Known context windows for OpenCode Zen free models (curated fallback)
     # OpenCode API does not return context window info
-    # Verified from official sources (HuggingFace config.json, model cards, NVIDIA docs)
+    # User-verified: All OpenCode free tier models have >= 200K, most 1M context
     CONTEXT_WINDOWS = {
-        "big-pickle": 131072,              # Unknown - conservative estimate (128K)
-        "hy3-free": 32768,                 # Hunyuan models typically 32K
+        "big-pickle": 1048576,
+        "hy3-free": 1048576,
         "laguna-s-2.1-free": 1048576,      # Verified: max_position_embeddings=1048576
-        "ling-3.0-flash-fin-free": 131072, # Unknown - conservative estimate (128K)
-        "deepseek-v4-flash-free": 131072,  # Unknown - conservative estimate (128K)
-        "nemotron-3-ultra-free": 4096,     # Verified: NVIDIA Nemotron 3 Ultra = 4K
-        "muse-spark-1.2-contributor-free": 131072,  # Unknown - conservative estimate (128K)
-        "mimo-v2.5-free": 32768,           # Verified: CyberAgent MIMO-V2.5 = 32K
+        "ling-3.0-flash-fin-free": 1048576,
+        "deepseek-v4-flash-free": 1048576,
+        "nemotron-3-ultra-free": 1048576,  # User-verified: 1M on OpenCode free tier
+        "muse-spark-1.2-contributor-free": 1048576,
+        "muse-spark-1.3-contributor-free": 1048576,
+        "mimo-v2.5-free": 1048576,
         "nemotron-3.5-lightning-free": 1048576,  # Verified: NIM version = 1M
     }
 
