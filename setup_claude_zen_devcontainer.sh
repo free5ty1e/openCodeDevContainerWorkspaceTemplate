@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
+# !!!!!!!!WARNING-DEPRECATED!!!!!!!!!! in favor of claude_opencode_zen.py
+# 
 # setup_claude_zen_devcontainer.sh
 #
 # Sets up claude-code-zen-proxy so Claude Code CLI can run through OpenCode Zen

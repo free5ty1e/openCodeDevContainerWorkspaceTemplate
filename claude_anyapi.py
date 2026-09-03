@@ -17,6 +17,8 @@ ANYAPI_BASE_URL = "https://api.anyapi.example/v1"
 ANYAPI_MODELS_ENDPOINT = f"{ANYAPI_BASE_URL}/models"
 ANYAPI_CHAT_ENDPOINT_TEMPLATE = f"{ANYAPI_BASE_URL}/models/{{model}}:chat"
 CACHE_FILE = os.path.expanduser("~/.anyapi_api_key_cache")
+MODEL_CACHE_FILE = os.path.expanduser("~/.claude_anyapi_last_model")
+CONTEXT_CACHE_FILE = os.path.expanduser("~/.claude_anyapi_last_context")
 PROXY_PORT = 4502
 PROXY_MASTER_KEY = "sk-anyapi-bridge"
 CONFIG_DIR = os.path.expanduser("~/.claude_anyapi")
@@ -424,6 +426,49 @@ def categorize_models(all_raw_models):
     return standard_chat_models, free_tier_chat_models, combined_models_list
 
 
+def load_last_model():
+    """Load the last selected model from cache."""
+    if os.path.exists(MODEL_CACHE_FILE):
+        try:
+            with open(MODEL_CACHE_FILE, "r") as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return None
+
+
+def save_last_model(model_id):
+    """Save the selected model to cache."""
+    try:
+        os.makedirs(os.path.dirname(MODEL_CACHE_FILE), exist_ok=True)
+        with open(MODEL_CACHE_FILE, "w") as f:
+            f.write(model_id)
+    except OSError:
+        pass
+
+
+def load_last_context():
+    """Load the last context window from cache."""
+    if os.path.exists(CONTEXT_CACHE_FILE):
+        try:
+            with open(CONTEXT_CACHE_FILE, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_last_context(context_window):
+    """Save the context window to cache."""
+    try:
+        os.makedirs(os.path.dirname(CONTEXT_CACHE_FILE), exist_ok=True)
+        with open(CONTEXT_CACHE_FILE, "w") as f:
+            f.write(str(context_window))
+    except OSError:
+        pass
+
+
 # ─── Step 5: Display model list and handle selection ─────────────────────
 def get_selection_input(prompt, max_val):
     """Get user selection input, handling EOF gracefully."""
@@ -473,11 +518,79 @@ def display_and_select(standard, free, combined):
 
     print("========================================")
     print(f"\nTotal models: {len(combined)}")
+
+    # Check for last used model
+    last_model = load_last_model()
+    if last_model:
+        # Find the index of last_model
+        last_idx = None
+        for i, m in enumerate(combined):
+            if m.get("id") == last_model:
+                last_idx = i + 1  # 1-based
+                break
+        if last_idx:
+            print(f"Last used model: [{last_idx}] {last_model}")
+
     print(f"\nSelect a model number [1-{len(combined)}]:")
     selected_idx = get_selection_input("> ", len(combined))
     selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
-    return selected_model
+
+    # Save last model
+    save_last_model(selected_model)
+
+    return selected_model, combined[selected_idx]
+
+
+def get_context_window(selected_model, model_data):
+    """Prompt user for context window with pre-populated default."""
+    # Get default from model data or cache
+    model_ctx = model_data.get("context_window", 0)
+    cached_ctx = load_last_context()
+
+    # Priority: cached context > model data context > default 200000
+    if cached_ctx and cached_ctx > 0:
+        default_ctx = cached_ctx
+        source = "cached"
+    elif model_ctx and model_ctx > 0:
+        default_ctx = model_ctx
+        source = "model default"
+    else:
+        default_ctx = 200000
+        source = "fallback"
+
+    print(f"\n📏 Context Window Configuration")
+    print(f"   Model default: {model_ctx:,} tokens" if model_ctx > 0 else "   Model default: unknown")
+    print(f"   Last used: {cached_ctx:,} tokens" if cached_ctx and cached_ctx > 0 else "   Last used: none")
+    print(f"   Using: {default_ctx:,} tokens ({source})")
+
+    try:
+        user_input = input(f"\nContext window in tokens [{default_ctx:,}]: ").strip()
+    except EOFError:
+        print(f"\n   Using default: {default_ctx:,} tokens")
+        return default_ctx
+    except KeyboardInterrupt:
+        print("\n👋 Cancelled by user.")
+        sys.exit(0)
+
+    if not user_input:
+        context_window = default_ctx
+        print(f"   ✅ Using {context_window:,} tokens")
+    else:
+        try:
+            context_window = int(user_input.replace(",", "").replace("_", ""))
+            if context_window <= 0:
+                print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
+                context_window = default_ctx
+            else:
+                print(f"   ✅ Using custom context window: {context_window:,} tokens")
+        except ValueError:
+            print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
+            context_window = default_ctx
+
+    # Save for next run
+    save_last_context(context_window)
+    return context_window
 
 
 def check_model_access(selected_model, api_key):
@@ -493,7 +606,7 @@ def check_model_access(selected_model, api_key):
 
 
 # ─── Step 6: Generate litellm proxy config ───────────────────────────────
-def generate_litellm_config(selected_model, api_key):
+def generate_litellm_config(selected_model, api_key, context_window=None):
     """Write a litellm PROXY config mapping the model to the anyAPI provider.
 
     Claude Code speaks the Anthropic Messages API (/v1/messages), but the
@@ -508,23 +621,27 @@ def generate_litellm_config(selected_model, api_key):
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
-    # Re-fetch models to get the context window for the selected model
-    # (In production, you might want to pass the model data through to avoid
-    # a second API call, but this ensures we have the latest info)
-    models = fetch_models(api_key)
-    selected_model_data = next((m for m in models if m["id"] == selected_model), None)
+    # Use user-provided context window, or fall back to API/fetch
+    if context_window is None or context_window <= 0:
+        # Re-fetch models to get the context window for the selected model
+        # (In production, you might want to pass the model data through to avoid
+        # a second API call, but this ensures we have the latest info)
+        models = fetch_models(api_key)
+        selected_model_data = next((m for m in models if m["id"] == selected_model), None)
 
-    if selected_model_data and selected_model_data.get("context_window", 0) > 0:
-        context_window = selected_model_data["context_window"]
-        print(f"   📏 Context window from API: {context_window:,} tokens")
+        if selected_model_data and selected_model_data.get("context_window", 0) > 0:
+            context_window = selected_model_data["context_window"]
+            print(f"   📏 Context window from API: {context_window:,} tokens")
+        else:
+            # Fallback: provider-specific mapping goes here
+            # CUSTOMIZE THIS FOR YOUR PROVIDER
+            CONTEXT_WINDOWS = {
+                # Example: "model-name": 1000000,
+            }
+            context_window = CONTEXT_WINDOWS.get(selected_model, 4096)
+            print(f"   ⚠️  Using fallback context window: {context_window:,} tokens")
     else:
-        # Fallback: provider-specific mapping goes here
-        # CUSTOMIZE THIS FOR YOUR PROVIDER
-        CONTEXT_WINDOWS = {
-            # Example: "model-name": 1000000,
-        }
-        context_window = CONTEXT_WINDOWS.get(selected_model, 4096)
-        print(f"   ⚠️  Using fallback context window: {context_window:,} tokens")
+        print(f"   📏 Context window (user-specified): {context_window:,} tokens")
 
     model_info = {
         "mode": "chat",
@@ -1054,12 +1171,15 @@ def main():
     all_raw_models = fetch_models(api_key)
 
     standard, free, combined = categorize_models(all_raw_models)
-    selected_model = display_and_select(standard, free, combined)
+    selected_model, model_data = display_and_select(standard, free, combined)
+
+    # Prompt for context window
+    context_window = get_context_window(selected_model, model_data)
 
     # Generate config and start the proxy FIRST, then validate the connection
     # through the proxy. (check_model_access requires a live proxy, so it can't
     # run before start_proxy().)
-    generate_litellm_config(selected_model, api_key)
+    generate_litellm_config(selected_model, api_key, context_window)
     proc = start_proxy()
 
     try:

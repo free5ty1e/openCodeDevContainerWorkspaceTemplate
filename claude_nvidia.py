@@ -15,6 +15,8 @@ import urllib.error
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/models"
 NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 CACHE_FILE = os.path.expanduser("~/.nvidia_api_key_cache")
+MODEL_CACHE_FILE = os.path.expanduser("~/.claude_nvidia_last_model")
+CONTEXT_CACHE_FILE = os.path.expanduser("~/.claude_nvidia_last_context")
 PROXY_PORT = 4499  # NVIDIA (default) — overridable via CLAUDE_BRIDGE_PORT
 PROXY_PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT", PROXY_PORT))
 PROXY_MASTER_KEY = "sk-claude-bridge"
@@ -391,6 +393,49 @@ def categorize_models(all_raw_models):
     return standard_chat_models, free_tier_chat_models, combined_models_list
 
 
+def load_last_model():
+    """Load the last selected model from cache."""
+    if os.path.exists(MODEL_CACHE_FILE):
+        try:
+            with open(MODEL_CACHE_FILE, "r") as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return None
+
+
+def save_last_model(model_id):
+    """Save the selected model to cache."""
+    try:
+        os.makedirs(os.path.dirname(MODEL_CACHE_FILE), exist_ok=True)
+        with open(MODEL_CACHE_FILE, "w") as f:
+            f.write(model_id)
+    except OSError:
+        pass
+
+
+def load_last_context():
+    """Load the last context window from cache."""
+    if os.path.exists(CONTEXT_CACHE_FILE):
+        try:
+            with open(CONTEXT_CACHE_FILE, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_last_context(context_window):
+    """Save the context window to cache."""
+    try:
+        os.makedirs(os.path.dirname(CONTEXT_CACHE_FILE), exist_ok=True)
+        with open(CONTEXT_CACHE_FILE, "w") as f:
+            f.write(str(context_window))
+    except OSError:
+        pass
+
+
 # ─── Step 5: Display model list and handle selection ─────────────────────
 def get_selection_input(prompt, max_val):
     """Get user selection input, handling EOF gracefully."""
@@ -417,12 +462,13 @@ def get_selection_input(prompt, max_val):
 def display_and_select(standard, free, combined):
     """Display the model list with numbers and get user selection."""
     # Context window mapping for display (NVIDIA API doesn't return this)
-    # Verified from NVIDIA docs, HuggingFace configs, and model cards
+    # NVIDIA NIM models generally have 128K+ context. Use 200K as safe default for NIM models.
+    # Verified: nemotron-3.5-lightning-30b-a3b = 1M
     CONTEXT_WINDOWS = {
         "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
-        "nvidia/nemotron-3-ultra": 4096,  # Verified: NVIDIA Nemotron 3 Ultra = 4K
-        "nvidia/nemotron-3-8b": 4096,
-        "nvidia/nemotron-3-ultra-32b": 4096,
+        "nvidia/nemotron-3-ultra": 200000,  # NIM models typically 200K+
+        "nvidia/nemotron-3-8b": 200000,
+        "nvidia/nemotron-3-ultra-32b": 200000,
         "nvidia/llama-3.1-nemotron-70b-instruct": 128000,
         "nvidia/llama-3.1-nemotron-8b-instruct": 128000,
         "nvidia/llama-3.2-nemotron-3b-instruct": 128000,
@@ -434,8 +480,8 @@ def display_and_select(standard, free, combined):
         "google/gemma-2-9b-it": 8192,
         "microsoft/phi-3.5-mini-instruct": 128000,
         "microsoft/phi-3.5-moe-instruct": 128000,
-        "nvidia/nemotron-4-ultra": 4096,
-        "nvidia/nemotron-4-340b": 4096,
+        "nvidia/nemotron-4-ultra": 200000,
+        "nvidia/nemotron-4-340b": 200000,
     }
 
     print("\n========================================")
@@ -462,11 +508,102 @@ def display_and_select(standard, free, combined):
 
     print("========================================")
     print(f"\nTotal models: {len(combined)}")
+
+    # Check for last used model
+    last_model = load_last_model()
+    if last_model:
+        # Find the index of last_model
+        last_idx = None
+        for i, m in enumerate(combined):
+            if m.get("id") == last_model:
+                last_idx = i + 1  # 1-based
+                break
+        if last_idx:
+            print(f"Last used model: [{last_idx}] {last_model}")
+
     print(f"\nSelect a model number [1-{len(combined)}]:")
     selected_idx = get_selection_input("> ", len(combined))
     selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
-    return selected_model
+
+    # Save last model
+    save_last_model(selected_model)
+
+    return selected_model, combined[selected_idx]
+
+
+def get_context_window(selected_model, model_data):
+    """Prompt user for context window with pre-populated default."""
+    # Get default from model data or cache
+    model_ctx = model_data.get("context_window", 0)
+    # Fallback to CONTEXT_WINDOWS if not in model_data
+    if model_ctx == 0:
+        CONTEXT_WINDOWS = {
+            "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,
+            "nvidia/nemotron-3-ultra": 200000,
+            "nvidia/nemotron-3-8b": 200000,
+            "nvidia/nemotron-3-ultra-32b": 200000,
+            "nvidia/llama-3.1-nemotron-70b-instruct": 128000,
+            "nvidia/llama-3.1-nemotron-8b-instruct": 128000,
+            "nvidia/llama-3.2-nemotron-3b-instruct": 128000,
+            "nvidia/llama-3.2-nemotron-1b-instruct": 128000,
+            "meta/llama-3.1-405b-instruct": 128000,
+            "meta/llama-3.1-70b-instruct": 128000,
+            "meta/llama-3.1-8b-instruct": 128000,
+            "google/gemma-2-27b-it": 8192,
+            "google/gemma-2-9b-it": 8192,
+            "microsoft/phi-3.5-mini-instruct": 128000,
+            "microsoft/phi-3.5-moe-instruct": 128000,
+            "nvidia/nemotron-4-ultra": 200000,
+            "nvidia/nemotron-4-340b": 200000,
+        }
+        model_ctx = CONTEXT_WINDOWS.get(selected_model, 0)
+
+    cached_ctx = load_last_context()
+
+    # Priority: cached context > model data context > default 200000
+    if cached_ctx and cached_ctx > 0:
+        default_ctx = cached_ctx
+        source = "cached"
+    elif model_ctx and model_ctx > 0:
+        default_ctx = model_ctx
+        source = "model default"
+    else:
+        default_ctx = 200000
+        source = "fallback"
+
+    print(f"\n📏 Context Window Configuration")
+    print(f"   Model default: {model_ctx:,} tokens" if model_ctx > 0 else "   Model default: unknown")
+    print(f"   Last used: {cached_ctx:,} tokens" if cached_ctx and cached_ctx > 0 else "   Last used: none")
+    print(f"   Using: {default_ctx:,} tokens ({source})")
+
+    try:
+        user_input = input(f"\nContext window in tokens [{default_ctx:,}]: ").strip()
+    except EOFError:
+        print(f"\n   Using default: {default_ctx:,} tokens")
+        return default_ctx
+    except KeyboardInterrupt:
+        print("\n👋 Cancelled by user.")
+        sys.exit(0)
+
+    if not user_input:
+        context_window = default_ctx
+        print(f"   ✅ Using {context_window:,} tokens")
+    else:
+        try:
+            context_window = int(user_input.replace(",", "").replace("_", ""))
+            if context_window <= 0:
+                print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
+                context_window = default_ctx
+            else:
+                print(f"   ✅ Using custom context window: {context_window:,} tokens")
+        except ValueError:
+            print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
+            context_window = default_ctx
+
+    # Save for next run
+    save_last_context(context_window)
+    return context_window
 
 
 def check_model_access(selected_model, api_key):
@@ -509,7 +646,7 @@ def check_model_access(selected_model, api_key):
 
 
 # ─── Step 6: Generate litellm proxy config ───────────────────────────────
-def generate_litellm_config(selected_model, api_key):
+def generate_litellm_config(selected_model, api_key, context_window=None):
     """Write a litellm PROXY config mapping the model to NVIDIA's OpenAI API.
 
     Claude Code speaks the Anthropic Messages API (/v1/messages), but NVIDIA
@@ -525,37 +662,40 @@ def generate_litellm_config(selected_model, api_key):
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
-    # Known context windows for NVIDIA NIM models (fallback mapping)
-    # NVIDIA API does not return context info, so this is our best knowledge
-    # Verified from NVIDIA docs, HuggingFace configs, and model cards
-    CONTEXT_WINDOWS = {
-        "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
-        "nvidia/nemotron-3-ultra": 4096,  # Verified: NVIDIA Nemotron 3 Ultra = 4K
-        "nvidia/nemotron-3-8b": 4096,
-        "nvidia/nemotron-3-ultra-32b": 4096,
-        "nvidia/llama-3.1-nemotron-70b-instruct": 128000,
-        "nvidia/llama-3.1-nemotron-8b-instruct": 128000,
-        "nvidia/llama-3.2-nemotron-3b-instruct": 128000,
-        "nvidia/llama-3.2-nemotron-1b-instruct": 128000,
-        "meta/llama-3.1-405b-instruct": 128000,
-        "meta/llama-3.1-70b-instruct": 128000,
-        "meta/llama-3.1-8b-instruct": 128000,
-        "google/gemma-2-27b-it": 8192,
-        "google/gemma-2-9b-it": 8192,
-        "microsoft/phi-3.5-mini-instruct": 128000,
-        "microsoft/phi-3.5-moe-instruct": 128000,
-        "nvidia/nemotron-4-ultra": 4096,
-        "nvidia/nemotron-4-340b": 4096,
-    }
-
-    # Determine context window
-    context_window = CONTEXT_WINDOWS.get(selected_model, 0)
-    if context_window > 0:
-        print(f"   📏 Context window (curated fallback): {context_window:,} tokens")
+    # Use user-provided context window, or fall back to curated mapping
+    if context_window is None or context_window <= 0:
+        # Known context windows for NVIDIA NIM models (fallback mapping)
+        # NVIDIA API does not return context info, so this is our best knowledge
+        # NVIDIA NIM models generally have 128K+ context. Use 200K as safe default for NIM models.
+        # Verified: nemotron-3.5-lightning-30b-a3b = 1M
+        CONTEXT_WINDOWS = {
+            "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
+            "nvidia/nemotron-3-ultra": 200000,  # NIM models typically 200K+
+            "nvidia/nemotron-3-8b": 200000,
+            "nvidia/nemotron-3-ultra-32b": 200000,
+            "nvidia/llama-3.1-nemotron-70b-instruct": 128000,
+            "nvidia/llama-3.1-nemotron-8b-instruct": 128000,
+            "nvidia/llama-3.2-nemotron-3b-instruct": 128000,
+            "nvidia/llama-3.2-nemotron-1b-instruct": 128000,
+            "meta/llama-3.1-405b-instruct": 128000,
+            "meta/llama-3.1-70b-instruct": 128000,
+            "meta/llama-3.1-8b-instruct": 128000,
+            "google/gemma-2-27b-it": 8192,
+            "google/gemma-2-9b-it": 8192,
+            "microsoft/phi-3.5-mini-instruct": 128000,
+            "microsoft/phi-3.5-moe-instruct": 128000,
+            "nvidia/nemotron-4-ultra": 200000,
+            "nvidia/nemotron-4-340b": 200000,
+        }
+        context_window = CONTEXT_WINDOWS.get(selected_model, 0)
+        if context_window > 0:
+            print(f"   📏 Context window (curated fallback): {context_window:,} tokens")
+        else:
+            # Default to 4096 for completely unknown models
+            context_window = 4096
+            print(f"   ⚠️  Unknown model - using default context window: {context_window:,} tokens")
     else:
-        # Default to 4096 for completely unknown models
-        context_window = 4096
-        print(f"   ⚠️  Unknown model - using default context window: {context_window:,} tokens")
+        print(f"   📏 Context window (user-specified): {context_window:,} tokens")
 
     model_info = {
         "mode": "chat",
@@ -1089,12 +1229,15 @@ def main():
     all_raw_models = fetch_models(api_key)
 
     standard, free, combined = categorize_models(all_raw_models)
-    selected_model = display_and_select(standard, free, combined)
+    selected_model, model_data = display_and_select(standard, free, combined)
+
+    # Prompt for context window
+    context_window = get_context_window(selected_model, model_data)
 
     # Generate config and start the proxy FIRST, then validate the connection
     # through the proxy. (check_model_access requires a live proxy, so it can't
     # run before start_proxy().)
-    generate_litellm_config(selected_model, api_key)
+    generate_litellm_config(selected_model, api_key, context_window)
     proc = start_proxy()
 
     try:
