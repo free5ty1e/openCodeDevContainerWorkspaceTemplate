@@ -325,11 +325,27 @@ def http_get_json(url, api_key):
         return json.loads(resp.read().decode())
 
 
+# Curated list of KNOWN FREE MODELS from OpenCode Zen (from setup script & docs).
+# These work WITHOUT an API key. ONLY these are used as fallback — NO proprietary models.
+OPENCODE_KNOWN_FREE_MODELS = [
+    "big-pickle",
+    "hy3-free",
+    "laguna-s-2.1-free",
+    "ling-3.0-flash-fin-free",
+    "deepseek-v4-flash-free",
+    "nemotron-3-ultra-free",
+    "muse-spark-1.2-contributor-free",
+    "mimo-v2.5-free",
+    "nemotron-3.5-lightning-free",
+]
+
+
 def fetch_models(api_key):
     """Fetch the list of available chat models from the OpenCode API.
 
     On success, normalizes to OpenAI-style [{"id": ..., "owned_by": ...}].
-    If the live endpoint is unreachable, exits with error (no hardcoded fallback).
+    If the live endpoint is unreachable (e.g. Cloudflare block), falls back to
+    the curated KNOWN FREE MODELS list so anonymous users can still proceed.
     """
     try:
         data = http_get_json(OPENCODE_API_URL, api_key)
@@ -340,9 +356,10 @@ def fetch_models(api_key):
             return models
         raise RuntimeError("Empty model list from API")
     except Exception as e:
-        print(f"   ❌ Could not reach OpenCode API ({str(e)[:120]}).")
-        print("   Please check your network connection or provide a valid OPENCODE_API_KEY.")
-        sys.exit(1)
+        print(f"   ⚠️  Could not reach OpenCode API ({str(e)[:100]}).")
+        print("   Falling back to curated list of known free models (no API key needed).")
+        # Return curated free models with owned_by="community" so they sort to free tier
+        return [{"id": m, "owned_by": "community"} for m in OPENCODE_KNOWN_FREE_MODELS]
 
 
 # ─── Step 4: Categorize, filter, and sort models ────────────────────────
