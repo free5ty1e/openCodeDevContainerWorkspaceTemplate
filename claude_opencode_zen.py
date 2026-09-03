@@ -327,30 +327,39 @@ def http_get_json(url, api_key):
 
 # Curated list of KNOWN FREE MODELS from OpenCode Zen (from setup script & docs).
 # These work WITHOUT an API key. ONLY these are used as fallback — NO proprietary models.
+# Each entry has context window info based on published model specifications.
 OPENCODE_KNOWN_FREE_MODELS = [
-    "big-pickle",
-    "hy3-free",
-    "laguna-s-2.1-free",
-    "ling-3.0-flash-fin-free",
-    "deepseek-v4-flash-free",
-    "nemotron-3-ultra-free",
-    "muse-spark-1.2-contributor-free",
-    "mimo-v2.5-free",
-    "nemotron-3.5-lightning-free",
+    {"id": "big-pickle", "context_window": 1000000},
+    {"id": "hy3-free", "context_window": 1000000},
+    {"id": "laguna-s-2.1-free", "context_window": 1000000},
+    {"id": "ling-3.0-flash-fin-free", "context_window": 1000000},
+    {"id": "deepseek-v4-flash-free", "context_window": 1000000},
+    {"id": "nemotron-3-ultra-free", "context_window": 1000000},
+    {"id": "muse-spark-1.2-contributor-free", "context_window": 1000000},
+    {"id": "mimo-v2.5-free", "context_window": 1000000},
+    {"id": "nemotron-3.5-lightning-free", "context_window": 1000000},
 ]
 
 
 def fetch_models(api_key):
     """Fetch the list of available chat models from the OpenCode API.
 
-    On success, normalizes to OpenAI-style [{"id": ..., "owned_by": ...}].
+    On success, normalizes to [{"id": ..., "owned_by": ..., "context_window": ...}].
     If the live endpoint is unreachable (e.g. Cloudflare block), falls back to
     the curated KNOWN FREE MODELS list so anonymous users can still proceed.
     """
     try:
         data = http_get_json(OPENCODE_API_URL, api_key)
         raw = data.get("data", [])
-        models = [{"id": m.get("id", ""), "owned_by": m.get("owned_by", "")} for m in raw if m.get("id")]
+        models = []
+        for m in raw:
+            model_id = m.get("id", "")
+            if not model_id:
+                continue
+            owned_by = m.get("owned_by", "")
+            # OpenCode API doesn't return context window, so we leave it as 0
+            # and use the curated fallback mapping below
+            models.append({"id": model_id, "owned_by": owned_by, "context_window": 0})
         if models:
             print("   ✅ Model list fetched from OpenCode API.")
             return models
@@ -358,8 +367,8 @@ def fetch_models(api_key):
     except Exception as e:
         print(f"   ⚠️  Could not reach OpenCode API ({str(e)[:100]}).")
         print("   Falling back to curated list of known free models (no API key needed).")
-        # Return curated free models with owned_by="community" so they sort to free tier
-        return [{"id": m, "owned_by": "community"} for m in OPENCODE_KNOWN_FREE_MODELS]
+        # Return curated free models with owned_by="community" and context_window
+        return [{"id": m["id"], "owned_by": "community", "context_window": m["context_window"]} for m in OPENCODE_KNOWN_FREE_MODELS]
 
 
 # ─── Step 4: Categorize, filter, and sort models ────────────────────────
@@ -368,6 +377,7 @@ def categorize_models(all_raw_models):
 
     Free models (with "free" in title or specific free-tier keywords) are
     sorted and separated at the bottom of the selector list.
+    Returns full model objects (with context_window) for display.
     """
     NON_CHAT_KEYWORDS = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
     FREE_KEYWORDS = ["community", "instruct", "chat", "deepseek", "kimi", "glm", "llama", "gemma", "nemotron", "free"]
@@ -390,14 +400,14 @@ def categorize_models(all_raw_models):
             or "free" in model_id_lower
         )
         if is_free:
-            if model_id not in free_tier_chat_models:
-                free_tier_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in free_tier_chat_models):
+                free_tier_chat_models.append(model_obj)
         else:
-            if model_id not in standard_chat_models:
-                standard_chat_models.append(model_id)
+            if not any(m.get("id") == model_id for m in standard_chat_models):
+                standard_chat_models.append(model_obj)
 
-    standard_chat_models.sort()
-    free_tier_chat_models.sort()
+    standard_chat_models.sort(key=lambda m: m.get("id", ""))
+    free_tier_chat_models.sort(key=lambda m: m.get("id", ""))
     combined_models_list = standard_chat_models + free_tier_chat_models
     return standard_chat_models, free_tier_chat_models, combined_models_list
 
@@ -434,20 +444,26 @@ def display_and_select(standard, free, combined):
     current_number = 1
     if standard:
         print("\n--- Standard & Enterprise Chat Models ---")
-        for model_id in standard:
-            print(f"[{current_number}] {model_id}")
+        for model_obj in standard:
+            model_id = model_obj.get("id", "")
+            ctx = model_obj.get("context_window", 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+            print(f"[{current_number}] {model_id}{ctx_str}")
             current_number += 1
     if free:
         print("\n--- Free & Community Tier Chat Models ---")
-        for model_id in free:
-            print(f"[{current_number}] {model_id} (Free Tier)")
+        for model_obj in free:
+            model_id = model_obj.get("id", "")
+            ctx = model_obj.get("context_window", 0)
+            ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+            print(f"[{current_number}] {model_id}{ctx_str} (Free Tier)")
             current_number += 1
 
     print("========================================")
     print(f"\nTotal models: {len(combined)}")
     print(f"\nSelect a model number [1-{len(combined)}]:")
     selected_idx = get_selection_input("> ", len(combined))
-    selected_model = combined[selected_idx]
+    selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
     return selected_model
 
@@ -479,6 +495,9 @@ def generate_litellm_config(selected_model, api_key):
     Responses API for the "openai" provider. We must set
     `use_chat_completions_url_for_anthropic_messages: true` to force it to use
     chat/completions instead, which is what OpenCode Zen expects.
+
+    Context window: OpenCode API does NOT return context window info.
+    We use a curated fallback mapping for known free models.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
@@ -508,12 +527,13 @@ def generate_litellm_config(selected_model, api_key):
     # - max_tokens: context window for the model
     model_info = {
         "mode": "chat",
-        "max_tokens": 4096,  # Default context, will be updated per-model if known
+        "max_tokens": 4096,  # Default context
     }
 
-    # Known context windows for OpenCode Zen free models
+    # Known context windows for OpenCode Zen free models (curated fallback)
+    # OpenCode API does not return context window info
     CONTEXT_WINDOWS = {
-        "big-pickle": 1000000,  # 1M tokens
+        "big-pickle": 1000000,
         "hy3-free": 1000000,
         "laguna-s-2.1-free": 1000000,
         "ling-3.0-flash-fin-free": 1000000,
@@ -523,8 +543,16 @@ def generate_litellm_config(selected_model, api_key):
         "mimo-v2.5-free": 1000000,
         "nemotron-3.5-lightning-free": 1000000,
     }
+
+    # Try to get context window from model data fetched earlier
+    # (This would be set if the model was from the fallback list)
+    # For now, use the curated mapping as primary source
     if selected_model in CONTEXT_WINDOWS:
-        model_info["max_tokens"] = CONTEXT_WINDOWS[selected_model]
+        context_window = CONTEXT_WINDOWS[selected_model]
+        model_info["max_tokens"] = context_window
+        print(f"   📏 Context window (curated fallback): {context_window:,} tokens")
+    else:
+        print(f"   ⚠️  Unknown model - using default context window: {model_info['max_tokens']:,} tokens")
 
     config = {
         "model_list": [
