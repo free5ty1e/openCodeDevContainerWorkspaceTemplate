@@ -84,6 +84,28 @@ def _claude_version_ok():
 
 
 def ensure_claude_cli():
+    """Check for updates to Claude CLI and optionally upgrade."""
+    # Get current version
+    rc, out = _run(["claude", "--version"], label="cli-version")
+    if rc == 0:
+        current_version = out.strip()
+        print(f"   Current claude CLI version: {current_version}")
+    # Prompt for upgrade (handle EOF gracefully – default to 'n')
+    try:
+        resp = input("   Check for Claude CLI upgrade? (y/N): ").strip().lower()
+    except EOFError:
+        resp = "n"
+    if resp == "y":
+        print("   Upgrading claude CLI via npm...")
+        _run(["npm", "install", "-g", "@anthropic-ai/claude-code@latest"], label="cli-upgrade")
+        # Re-verify
+        rc2, out2 = _run(["claude", "--version"], label="cli-version-after")
+        if rc2 == 0:
+            print(f"   New claude CLI version: {out2.strip()}")
+    # Continue with existing logic (return True if already okay)
+    if _claude_version_ok():
+        return True
+    # If not ok, fall through to install (original install logic follows)
     """Install the claude CLI via npm if not already present, fixing native binary."""
     # First check node availability with verbose logging
     print("  🔍 Checking node.js availability...")
@@ -878,7 +900,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
     env["ANTHROPIC_MODEL"] = selected_model
-    env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = selected_model
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     # Don't let claude try to discover/switch to a gateway model.
@@ -937,7 +959,7 @@ def print_usage_notes(dangerously_skip_permissions=False):
     print()
     print("   • ANTHROPIC_BASE_URL=http://127.0.0.1:<port>  (litellm proxy)")
     print("   • ANTHROPIC_AUTH_TOKEN=sk-claude-bridge  (proxy master key)")
-    print("   • ANTHROPIC_MODEL=nvidia  (model alias on the proxy)")
+    print("   • ANTHROPIC_MODEL=<selected_model>  (actual model ID from your provider)")
     print()
     print("📦  PREREQUISITES (automatically checked/installed):")
     print("   • Python3 with 'litellm[proxy]' package")

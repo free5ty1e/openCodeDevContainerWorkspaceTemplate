@@ -882,7 +882,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
     env["ANTHROPIC_MODEL"] = selected_model
-    env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = selected_model
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     # Don't let claude try to discover/switch to a gateway model.
@@ -941,7 +941,7 @@ def print_usage_notes(dangerously_skip_permissions=False):
     print()
     print("   • ANTHROPIC_BASE_URL=http://127.0.0.1:<port>  (litellm proxy)")
     print("   • ANTHROPIC_AUTH_TOKEN=sk-claude-bridge  (proxy master key)")
-    print("   • ANTHROPIC_MODEL=nvidia  (model alias on the proxy)")
+    print("   • ANTHROPIC_MODEL=<selected_model>  (actual model ID, e.g. gemini-1.5-flash)")
     print()
     print("📦  PREREQUISITES (automatically checked/installed):")
     print("   • Python3 with 'litellm[proxy]' package")

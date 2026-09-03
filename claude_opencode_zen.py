@@ -83,6 +83,28 @@ def _claude_version_ok():
 
 
 def ensure_claude_cli():
+    """Check for updates to Claude CLI and optionally upgrade."""
+    # Get current version
+    rc, out = _run(["claude", "--version"], label="cli-version")
+    if rc == 0:
+        current_version = out.strip()
+        print(f"   Current claude CLI version: {current_version}")
+    # Prompt for upgrade (handle EOF gracefully – default to 'n')
+    try:
+        resp = input("   Check for Claude CLI upgrade? (y/N): ").strip().lower()
+    except EOFError:
+        resp = "n"
+    if resp == "y":
+        print("   Upgrading claude CLI via npm...")
+        _run(["npm", "install", "-g", "@anthropic-ai/claude-code@latest"], label="cli-upgrade")
+        # Re-verify
+        rc2, out2 = _run(["claude", "--version"], label="cli-version-after")
+        if rc2 == 0:
+            print(f"   New claude CLI version: {out2.strip()}")
+    # Continue with existing logic (return True if already okay)
+    if _claude_version_ok():
+        return True
+    # If not ok, fall through to install (original install logic follows)
     """Install the claude CLI via npm if not already present, fixing native binary."""
     # First check node availability with verbose logging
     print("  🔍 Checking node.js availability...")
@@ -290,29 +312,6 @@ def get_api_key(clear=False):
 
 
 # ─── Step 3: Fetch models from OpenCode ────────────────────────────────────
-# Fallback model list used when the live /models endpoint is unreachable
-# (e.g. Cloudflare HTTP 1010 from some devcontainers). Seeded from the
-# OpenCode Zen free/anonymous generative lineup. "big-pickle" is the flagship
-# free model; free-tier models are sorted to the bottom on display.
-# Models tagged with owned_by="community" are treated as free tier.
-OPENCODE_FALLBACK_MODELS = [
-    "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
-    "claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-5", "claude-sonnet-4-6",
-    "claude-sonnet-4-5", "claude-sonnet-4", "claude-haiku-4-5",
-    "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite",
-    "gemini-3.5-flash", "gemini-3.1-pro", "gemini-3-flash",
-    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro",
-    "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano",
-    "gpt-5.3-codex-spark", "gpt-5.3-codex", "gpt-5.2", "gpt-5.2-codex",
-    "gpt-5.1", "gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5.1-codex-mini",
-    "gpt-5", "gpt-5-codex", "gpt-5-nano",
-    "grok-build-0.1", "grok-4.6",
-]
-
-# Free / community models on OpenCode Zen (sorted to the bottom of the list).
-OPENCODE_FREE_MODELS = {"big-pickle"}
-
-
 def http_get_json(url, api_key):
     """GET JSON from the OpenCode Zen API.
 
@@ -330,9 +329,7 @@ def fetch_models(api_key):
     """Fetch the list of available chat models from the OpenCode API.
 
     On success, normalizes to OpenAI-style [{"id": ..., "owned_by": ...}].
-    If the live endpoint is unreachable (HTTP 403 / Cloudflare 1010, common
-    from a shared devcontainer IP), falls back to the bundled free/anonymous
-    model list so the script remains usable offline.
+    If the live endpoint is unreachable, exits with error (no hardcoded fallback).
     """
     try:
         data = http_get_json(OPENCODE_API_URL, api_key)
@@ -343,14 +340,9 @@ def fetch_models(api_key):
             return models
         raise RuntimeError("Empty model list from API")
     except Exception as e:
-        print(f"   ⚠️  Could not reach OpenCode API ({str(e)[:80]}).")
-        print("   Using bundled free/anonymous model list so you can still proceed.")
-        all_ids = OPENCODE_FALLBACK_MODELS + sorted(OPENCODE_FREE_MODELS)
-        # All fallback models are community/free since this list is specifically
-        # for free/anonymous access when the live API is blocked (e.g. Cloudflare 1010).
-        # Previously only big-pickle was tagged as community, but all fallback models
-        # should be free tier and sorted to the bottom of the selector.
-        return [{"id": m, "owned_by": "community"} for m in all_ids]
+        print(f"   ❌ Could not reach OpenCode API ({str(e)[:120]}).")
+        print("   Please check your network connection or provide a valid OPENCODE_API_KEY.")
+        sys.exit(1)
 
 
 # ─── Step 4: Categorize, filter, and sort models ────────────────────────
@@ -444,42 +436,12 @@ def display_and_select(standard, free, combined):
 
 
 def check_model_access(selected_model, api_key):
-    """Verify the selected model is usable with the given API key.
-
-    Some OpenCode models are not accessible to every account (they return
-    404 'Function not found for account'). This catches that early so the
-    user can pick a different model instead of failing inside Claude Code.
-    Returns True if the model responds, False otherwise.
+    """Check model access using the litellm proxy test step.
+    This validates that the selected model works via the local proxy.
+    Any 200 response from the proxy counts as "accessible".
     """
     print(f"   🔍 Checking access to {selected_model}...")
-    payload = {
-        "model": selected_model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 5,
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        OPENCODE_CHAT_URL,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            if resp.status == 200:
-                print(f"   ✅ Model accessible and responding.")
-                return True
-            print(f"   ⚠️  Model returned status {resp.status}. May still work.")
-            return False
-    except urllib.error.HTTPError as e:
-        print(f"   ❌ Model NOT accessible (status {e.code}).")
-        print(f"      {e.read().decode()[:300]}")
-        return False
-    except Exception as e:
-        print(f"   ⚠️  Access check error: {type(e).__name__}: {str(e)[:120]}")
-        return False
+    return test_proxy_connection(selected_model)
 
 
 # ─── Step 6: Generate litellm proxy config ───────────────────────────────
@@ -914,7 +876,7 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % PROXY_PORT
     env["ANTHROPIC_AUTH_TOKEN"] = PROXY_MASTER_KEY
     env["ANTHROPIC_MODEL"] = selected_model
-    env["CLAUDE_CODE_SUBAGENT_MODEL"] = "nvidia"
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = selected_model
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     # Don't let claude try to discover/switch to a gateway model.
@@ -973,7 +935,7 @@ def print_usage_notes(dangerously_skip_permissions=False):
     print()
     print("   • ANTHROPIC_BASE_URL=http://127.0.0.1:<port>  (litellm proxy)")
     print("   • ANTHROPIC_AUTH_TOKEN=sk-claude-bridge  (proxy master key)")
-    print("   • ANTHROPIC_MODEL=nvidia  (model alias on the proxy)")
+    print("   • ANTHROPIC_MODEL=<selected_model>  (actual model ID, e.g. big-pickle)")
     print()
     print("📦  PREREQUISITES (automatically checked/installed):")
     print("   • Python3 with 'litellm[proxy]' package")
