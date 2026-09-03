@@ -469,24 +469,76 @@ def generate_litellm_config(selected_model, api_key):
     exposes an OpenAI-compatible API at https://opencode.ai/zen/v1. Use the
     `openai/` provider prefix with that custom api_base — the `opencode/`
     prefix is NOT a valid litellm provider and breaks /v1/messages routing.
-    If api_key is empty (anonymous mode), omit it from the config.
+
+    For free models (no API key), we must omit the Authorization header entirely.
+    litellm requires an api_key but we can override with extra_headers to send
+    an empty Authorization header. Free models are identified by the "-free" suffix
+    or being "big-pickle".
+
+    IMPORTANT: By default, litellm routes Anthropic /v1/messages to OpenAI's
+    Responses API for the "openai" provider. We must set
+    `use_chat_completions_url_for_anthropic_messages: true` to force it to use
+    chat/completions instead, which is what OpenCode Zen expects.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    # Determine if this is a free model that doesn't need auth
+    is_free_model = (
+        selected_model == "big-pickle"
+        or selected_model.endswith("-free")
+        or (api_key is None or api_key == "")
+    )
+
     params = {
         "model": f"openai/{selected_model}",
         "api_base": OPENCODE_ZEN_BASE_URL,
     }
-    if api_key:
+
+    if is_free_model:
+        # For free models: provide dummy api_key (litellm requires it) but
+        # override Authorization header to empty string so no auth is sent
+        params["api_key"] = "dummy"  # litellm requires this field
+        params["extra_headers"] = {"Authorization": ""}
+    elif api_key:
+        # For paid models with valid API key
         params["api_key"] = api_key
+
+    # Add model_info to configure the model correctly:
+    # - mode: "chat" forces chat/completions instead of responses API
+    # - max_tokens: context window for the model
+    model_info = {
+        "mode": "chat",
+        "max_tokens": 4096,  # Default context, will be updated per-model if known
+    }
+
+    # Known context windows for OpenCode Zen free models
+    CONTEXT_WINDOWS = {
+        "big-pickle": 1000000,  # 1M tokens
+        "hy3-free": 1000000,
+        "laguna-s-2.1-free": 1000000,
+        "ling-3.0-flash-fin-free": 1000000,
+        "deepseek-v4-flash-free": 1000000,
+        "nemotron-3-ultra-free": 1000000,
+        "muse-spark-1.2-contributor-free": 1000000,
+        "mimo-v2.5-free": 1000000,
+        "nemotron-3.5-lightning-free": 1000000,
+    }
+    if selected_model in CONTEXT_WINDOWS:
+        model_info["max_tokens"] = CONTEXT_WINDOWS[selected_model]
+
     config = {
         "model_list": [
             {
                 "model_name": selected_model,
                 "litellm_params": params,
+                "model_info": model_info,
             }
         ],
         "general_settings": {"master_key": PROXY_MASTER_KEY, "store_model_in_db": False},
-        "litellm_settings": {"drop_params": True},
+        "litellm_settings": {
+            "drop_params": True,
+            "use_chat_completions_url_for_anthropic_messages": True,
+        },
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
