@@ -51,12 +51,13 @@ vals="$(printf '%s' "$input" | jq -r '
     ((.context_window.current_usage // {}) | .cache_creation_input_tokens // 0),
     (.cost.total_cost_usd // 0),
     ((.rate_limits.five_hour_window // .rate_limits.five_hour // null) | if . then (.used_percentage // "") else "" end),
-    ((.rate_limits.seven_day_window // .rate_limits.seven_day // null) | if . then (.used_percentage // "") else "" end)
+    ((.rate_limits.seven_day_window // .rate_limits.seven_day // null) | if . then (.used_percentage // "") else "" end),
+    (.provider // "n/a")
   ] | @tsv
 ' 2>/dev/null)"
 
 IFS=$'\t' read -r model effort thinking style fast exceeds repo dir ver \
-  inTok outTok winSize used remain cacheRead cacheWrite cost rate5h rate7d <<< "$vals"
+  inTok outTok winSize used remain cacheRead cacheWrite cost rate5h rate7d provider <<< "$vals"
 
 # ---- Git branch + dirty count (non-blocking, stderr swallowed) ---------------
 branch=""
@@ -77,7 +78,9 @@ fi
 home="${HOME:-}"
 shortdir="${dir/#$home/~}"
 [ -z "$shortdir" ] && shortdir="$dir"
-if [ -n "$shortdir" ]; then
+if [ "$shortdir" = "/" ]; then
+  shortdir="/"
+elif [ -n "$shortdir" ]; then
   shortdir="$(basename "$(dirname "$shortdir")")/$(basename "$shortdir")"
 fi
 
@@ -144,7 +147,9 @@ if [ "$MODE" = full ]; then
   seg "🌿 " "${branch}${dirty:+ ±$dirty}"
   seg "📁 " "$shortdir"
   seg "🤖 " "$model"
+  seg "🌐 " "$provider"
   seg "🎚️ " "$effort"
+  seg "📏 " "$(format_k "$winSize")"
   [ "$thinking" = true ] && seg "💭 " "on" || seg "💭 " "off"
   [ "$style" != "default" ] && [ -n "$style" ] && seg "🎨 " "$style"
   [ "$fast" = true ] && seg "⚡ " "fast"
@@ -158,6 +163,7 @@ if [ "$MODE" = full ]; then
   if [ "${cacheRead:-0}" -gt 0 ] || [ "${cacheWrite:-0}" -gt 0 ]; then
     seg2 "💾 " "$(cache_hit)%"
   fi
+  [ -n "$remain" ] && seg2 "📊 rem " "${remain}%"
   awk "BEGIN{exit !($cost > 0)}" 2>/dev/null && seg2 "💰 " "$(printf '$%.2f' "$cost")"
   [ -n "$rate5h" ] && seg2 "⏳5h " "${rate5h}%"
   [ -n "$rate7d" ] && seg2 "⏳7d " "${rate7d}%"
