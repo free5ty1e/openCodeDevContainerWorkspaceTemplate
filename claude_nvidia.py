@@ -440,7 +440,8 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
     """
     Interactive arrow-key selector for terminal.
     Returns (selected_index, selected_option).
-    Uses ANSI escape codes for navigation - redraws entire menu on each keypress.
+    Supports UP/DOWN/Home/End/PageUp/PageDown navigation.
+    Uses cursor save/restore for stable positioning.
     """
     import termios
     import tty
@@ -465,13 +466,17 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
                         return 'UP'
                     elif ch3 == 'B':
                         return 'DOWN'
-                    elif ch3 == 'C':
-                        return 'RIGHT'
-                    elif ch3 == 'D':
-                        return 'LEFT'
+                    elif ch3 == '~':  # Page Down
+                        return 'PAGE_DOWN'
+                    elif ch3 == '~':  # Home
+                        return 'HOME'
+                    elif ch3 == '~':  # End
+                        return 'END'
             elif ch == '\r' or ch == '\n':
                 return 'ENTER'
-            elif ch == '\x03':  # Ctrl+C
+            elif ch == '\x1b':  # Also handle ESC alone
+                return 'ESCAPE'
+            elif ch == '\x1b':  # Ctrl+C
                 raise KeyboardInterrupt
             elif ch == '\x04':  # Ctrl+D
                 raise EOFError
@@ -479,35 +484,64 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-    def render_menu(selected_idx):
-        """Render the menu with current selection highlighted.
-        Uses cursor save/restore to avoid position drift."""
+    # Determine terminal height
+    try:
+        import os
+        term_rows = int(os.popen('stty size').read().split()[1])
+    except:
+        term_rows = 20  # fallback
+
+    def render_menu(selected_idx, top_idx=0):
+        """
+        Render menu with stable cursor positioning.
+        top_idx = first visible option index
+        selected_idx = currently highlighted option index
+        """
+        # Calculate visible range
+        visible_count = min(term_rows - 4, len(options))  # leave room for prompt/border
+        start = max(0, top_idx)
+        end = min(len(options), top_idx + visible_count)
+
         # Save cursor position
         print('\033[s', end='')
-        # Move to first option line (after prompt)
-        print(f'\033[{len(options)}A', end='')
-        # Clear from cursor to end of screen
+        # Move to first option line
+        print(f'\033[{visible_count + 2}A', end='')  # Move up past prompt/help
+        # Clear from cursor to end
         print('\033[J', end='')
-        # Print all options
-        for i, opt in enumerate(options):
+        # Print visible options
+        for i in range(start, end):
             if i == selected_idx:
-                print(f'\033[94m\033[1m→ {opt}\033[0m')
+                print(f'\033[94m\033[1m→ {options[i]}\033[0m')
             else:
-                print(f'  {opt}')
+                print(f'  {options[i]}')
+        # Print remaining options if any
+        if end < len(options):
+            print(f'  ... ({len(options) - end} more)')
         # Restore cursor position
         print('\033[u', end='')
         sys.stdout.flush()
 
     print(prompt)
-    # Initial render - just print all options
-    for i, opt in enumerate(options):
+    # Calculate visible count based on terminal height
+    try:
+        import os
+        term_rows = int(os.popen('stty size').read().split()[1])
+    except:
+        term_rows = 20  # fallback
+    visible_count = min(term_rows - 4, len(options))  # leave room for prompt/border
+
+    # Initial render - show first visible options
+    visible_start = start_idx
+    visible_end = min(len(options), start_idx + visible_count)
+    for i in range(visible_start, visible_end):
         if i == start_idx:
-            print(f'\033[94m\033[1m→ {opt}\033[0m')
+            print(f'\033[94m\033[1m→ {options[i]}\033[0m')
         else:
-            print(f'  {opt}')
+            print(f'  {options[i]}')
     sys.stdout.flush()
 
     current_idx = start_idx
+    top_idx = start_idx  # first visible option index
 
     try:
         while True:
@@ -515,11 +549,37 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
             if key == 'UP':
                 if current_idx > 0:
                     current_idx -= 1
-                    render_menu(current_idx)
+                    # Adjust top_idx if we scrolled past top
+                    if current_idx < top_idx:
+                        top_idx = current_idx
+                    render_menu(current_idx, top_idx)
             elif key == 'DOWN':
                 if current_idx < len(options) - 1:
                     current_idx += 1
-                    render_menu(current_idx)
+                    # Adjust top_idx if we scrolled past bottom
+                    if current_idx >= top_idx + visible_count:
+                        top_idx = current_idx - visible_count + 1
+                    render_menu(current_idx, top_idx)
+            elif key == 'PAGE_DOWN':
+                # Page down: move selection down by one page
+                page_size = visible_count - 2  # leave room
+                current_idx = min(len(options) - 1, current_idx + page_size)
+                top_idx = min(current_idx, len(options) - visible_count)
+                render_menu(current_idx, top_idx)
+            elif key == 'PAGE_UP':
+                # Page up: move selection up by one page
+                page_size = visible_count - 2
+                current_idx = max(0, current_idx - page_size)
+                top_idx = min(current_idx, len(options) - visible_count)
+                render_menu(current_idx, top_idx)
+            elif key == 'HOME':
+                current_idx = 0
+                top_idx = 0
+                render_menu(current_idx, top_idx)
+            elif key == 'END':
+                current_idx = len(options) - 1
+                top_idx = max(0, len(options) - visible_count)
+                render_menu(current_idx, top_idx)
             elif key == 'ENTER':
                 # Move cursor past menu to end
                 print(f'\033[{len(options) - current_idx}B', end='')
