@@ -332,16 +332,16 @@ def http_get_json(url, api_key):
 # These work WITHOUT an API key. ONLY these are used as fallback — NO proprietary models.
 # Context windows: user-verified for OpenCode free tier (all >= 200K, most 1M)
 OPENCODE_KNOWN_FREE_MODELS = [
-    {"id": "big-pickle", "context_window": 1048576},
-    {"id": "hy3-free", "context_window": 1048576},
+    {"id": "big-pickle", "context_window": 200000},
+    {"id": "hy3-free", "context_window": 200000},
     {"id": "laguna-s-2.1-free", "context_window": 1048576},  # Verified: max_position_embeddings=1048576
-    {"id": "ling-3.0-flash-fin-free", "context_window": 1048576},
-    {"id": "deepseek-v4-flash-free", "context_window": 1048576},
+    {"id": "ling-3.0-flash-fin-free", "context_window": 200000},
+    {"id": "deepseek-v4-flash-free", "context_window": 200000},
     {"id": "nemotron-3-ultra-free", "context_window": 1048576},   # User-verified: 1M on OpenCode free tier
-    {"id": "muse-spark-1.2-contributor-free", "context_window": 1048576},
-    {"id": "muse-spark-1.3-contributor-free", "context_window": 1048576},
-    {"id": "mimo-v2.5-free", "context_window": 1048576},
-    {"id": "nemotron-3.5-lightning-free", "context_window": 1048576},  # Verified: NIM version = 1M
+    {"id": "muse-spark-1.2-contributor-free", "context_window": 200000},
+    {"id": "muse-spark-1.3-contributor-free", "context_window": 200000},
+    {"id": "mimo-v2.5-free", "context_window": 200000},
+    {"id": "nemotron-3.5-lightning-free", "context_window": 200000},  # Verified: NIM version = 1M
 ]
 
 
@@ -466,6 +466,141 @@ def save_last_context(context_window):
         pass
 
 
+def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
+    """
+    Interactive arrow-key selector for terminal.
+    Returns (selected_index, selected_option).
+    Uses ANSI escape codes with cursor save/restore for stable positioning.
+    """
+    import termios
+    import tty
+    import sys
+
+    if not options:
+        return None, None
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def get_key():
+        """Read a single keypress."""
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':  # Escape sequence
+                ch2 = sys.stdin.read(1)
+                if ch2 == '[':
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == 'A':
+                        return 'UP'
+                    elif ch3 == 'B':
+                        return 'DOWN'
+                    elif ch3 == 'C':
+                        return 'RIGHT'
+                    elif ch3 == 'D':
+                        return 'LEFT'
+            elif ch == '\r' or ch == '\n':
+                return 'ENTER'
+            elif ch == '\x03':  # Ctrl+C
+                raise KeyboardInterrupt
+            elif ch == '\x04':  # Ctrl+D
+                raise EOFError
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def render_menu(selected_idx):
+        """Render the menu with current selection highlighted.
+        Uses cursor save/restore to avoid position drift."""
+        # Save cursor position
+        print('\033[s', end='')
+        # Move to first option line (after prompt)
+        print(f'\033[{len(options)}A', end='')
+        # Clear from cursor to end of screen
+        print('\033[J', end='')
+        # Print all options
+        for i, opt in enumerate(options):
+            if i == selected_idx:
+                print(f'\033[94m\033[1m→ {opt}\033[0m')
+            else:
+                print(f'  {opt}')
+        # Restore cursor position
+        print('\033[u', end='')
+        sys.stdout.flush()
+
+    print(prompt)
+    # Initial render - just print all options
+    for i, opt in enumerate(options):
+        if i == start_idx:
+            print(f'\033[94m\033[1m→ {opt}\033[0m')
+        else:
+            print(f'  {opt}')
+    sys.stdout.flush()
+
+    current_idx = start_idx
+
+    try:
+        while True:
+            key = get_key()
+            if key == 'UP':
+                if current_idx > 0:
+                    current_idx -= 1
+                    render_menu(current_idx)
+            elif key == 'DOWN':
+                if current_idx < len(options) - 1:
+                    current_idx += 1
+                    render_menu(current_idx)
+            elif key == 'ENTER':
+                # Move cursor past menu to end
+                print(f'\033[{len(options) - current_idx}B', end='')
+                print()  # New line after selection
+                return current_idx, options[current_idx]
+    except (KeyboardInterrupt, EOFError):
+        # Move cursor past menu
+        print(f'\033[{len(options) - current_idx}B', end='')
+        print('\n\033[0m')  # Reset colors
+        sys.exit(0)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    current_idx = start_idx
+
+    try:
+        while True:
+            key = get_key()
+            if key == 'UP':
+                if current_idx > 0:
+                    # Move selection up
+                    print('\033[B\033[2K', end='')  # Move down, clear line
+                    print(f'  {options[current_idx]}')  # Unhighlight old
+                    current_idx -= 1
+                    print('\033[A\033[2K', end='')  # Move up, clear line
+                    print(f'\033[94m\033[1m→ {options[current_idx]}\033[0m')  # Highlight new
+                    print('\033[A', end='')  # Move up for next iteration
+                    sys.stdout.flush()
+            elif key == 'DOWN':
+                if current_idx < len(options) - 1:
+                    # Move selection down
+                    print('\033[2K', end='')  # Clear line
+                    print(f'  {options[current_idx]}')  # Unhighlight old
+                    current_idx += 1
+                    print('\033[A\033[2K', end='')  # Move up, clear line
+                    print(f'\033[94m\033[1m→ {options[current_idx]}\033[0m')  # Highlight new
+                    print('\033[A', end='')  # Move up for next iteration
+                    sys.stdout.flush()
+            elif key == 'ENTER':
+                # Clear remaining lines below
+                for i in range(current_idx + 1, len(options)):
+                    print('\033[B\033[2K', end='')
+                print()  # New line after selection
+                return current_idx, options[current_idx]
+    except (KeyboardInterrupt, EOFError):
+        print('\n\033[0m')  # Reset colors
+        sys.exit(0)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 # ─── Step 5: Display model list and handle selection ─────────────────────
 def get_selection_input(prompt, max_val):
     """Get user selection input, handling EOF gracefully."""
@@ -523,13 +658,20 @@ def display_and_select(standard, free, combined):
         last_idx = None
         for i, m in enumerate(combined):
             if m.get("id") == last_model:
-                last_idx = i + 1  # 1-based
+                last_idx = i  # 0-based for arrow selector
                 break
-        if last_idx:
-            print(f"Last used model: [{last_idx}] {last_model}")
 
-    print(f"\nSelect a model number [1-{len(combined)}]:")
-    selected_idx = get_selection_input("> ", len(combined))
+    # Build display options with context info
+    display_options = []
+    for m in combined:
+        model_id = m.get("id", "")
+        ctx = m.get("context_window", 0)
+        ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
+        display_options.append(f"{model_id}{ctx_str}")
+
+    # Use arrow key selector
+    print("\nUse ↑/↓ arrows to navigate, Enter to select:")
+    selected_idx, _ = arrow_key_selector(display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0)
     selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
 
@@ -668,6 +810,7 @@ def generate_litellm_config(selected_model, api_key, context_window=None):
     model_info = {
         "mode": "chat",
         "max_tokens": context_window,
+        "max_input_tokens": context_window,
     }
 
     config = {
@@ -1076,7 +1219,7 @@ def setup_statusline_symlink():
         print(f"⚠️  workspace statusline.sh not found at {workspace_statusline}")
 
 
-def launch_claude_with_model(selected_model, dangerously_skip_permissions=False):
+def launch_claude_with_model(selected_model, context_window, dangerously_skip_permissions=False):
     """Configure environment to use the litellm proxy and launch Claude Code."""
     # Build claude command with optional --dangerously-skip-permissions flag
     claude_cmd = ["claude"]
@@ -1092,6 +1235,8 @@ def launch_claude_with_model(selected_model, dangerously_skip_permissions=False)
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = selected_model
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_MODEL_CALLS"] = "1"
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
+    # Set max context tokens for the model (from user selection)
+    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_window)
     # Don't let claude try to discover/switch to a gateway model.
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"
 
@@ -1206,7 +1351,7 @@ def main():
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
             print("   Check ~/.claude_opencode/proxy.log for details.")
             print("   You may still attempt to launch manually.")
-        launch_claude_with_model(selected_model, args.dangerously_skip_permissions)
+        launch_claude_with_model(selected_model, context_window, args.dangerously_skip_permissions)
     finally:
         # Stop the proxy after Claude Code exits.
         stop_running_proxy()
