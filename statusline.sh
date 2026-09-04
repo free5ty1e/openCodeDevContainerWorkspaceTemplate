@@ -30,7 +30,10 @@ fi
 MODE="${ZEN_STATUSLINE_MODE:-full}"
 case "$MODE" in compact|one|1|single) MODE=compact ;; *) MODE=full ;; esac
 
-# ---- Single jq pass -> tab-separated, null-safe values -----------------------
+# ---- Single jq pass -> SOH-delimited, null-safe values ------------------------
+# We use \x01 (SOH) as the delimiter instead of tab because bash `read`
+# collapses consecutive tab delimiters, which breaks field alignment when
+# empty values (like repo/dir) appear next to each other.
 vals="$(printf '%s' "$input" | jq -r '
   [
     (.model.display_name // ""),
@@ -45,6 +48,7 @@ vals="$(printf '%s' "$input" | jq -r '
     (.context_window.total_input_tokens // 0),
     (.context_window.total_output_tokens // 0),
     (.context_window.context_window_size // 0),
+    ((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0)),
     (.context_window.used_percentage // ""),
     (.context_window.remaining_percentage // ""),
     ((.context_window.current_usage // {}) | .cache_read_input_tokens // 0),
@@ -53,11 +57,11 @@ vals="$(printf '%s' "$input" | jq -r '
     ((.rate_limits.five_hour_window // .rate_limits.five_hour // null) | if . then (.used_percentage // "") else "" end),
     ((.rate_limits.seven_day_window // .rate_limits.seven_day // null) | if . then (.used_percentage // "") else "" end),
     (.provider // "n/a")
-  ] | @tsv
+  ] | join("")
 ' 2>/dev/null)"
 
-IFS=$'\t' read -r model effort thinking style fast exceeds repo dir ver \
-  inTok outTok winSize used remain cacheRead cacheWrite cost rate5h rate7d provider <<< "$vals"
+IFS=$'\x01' read -r model effort thinking style fast exceeds repo dir ver \
+  inTok outTok winSize totalUsed used remain cacheRead cacheWrite cost rate5h rate7d provider <<< "$vals"
 
 # ---- Git branch + dirty count (non-blocking, stderr swallowed) ---------------
 branch=""
@@ -131,9 +135,18 @@ GR=$'\033[32m'; RE=$'\033[31m'
 SEP="${DIM} • ${R}"
 
 # ---- Context segment (shared by both modes) ----------------------------------
+# Format: 10k [    ] 5% of 200k   (tokens [bar] pct% of window)
 ctx_seg() {
   if [ -n "$used" ] && [ "$used" != "0" ] && [ "$used" != "0.0" ]; then
-    printf '%s' "📊 [$(ctx_bar "$used")] $(ctx_color "$used")${used}%${R}"
+    local tokens_str=""
+    if [ "${totalUsed:-0}" -gt 0 ] 2>/dev/null; then
+      tokens_str="$(format_k "$totalUsed")"
+    fi
+    local win_str=""
+    if [ "${winSize:-0}" -gt 0 ] 2>/dev/null; then
+      win_str="$(format_k "$winSize")"
+    fi
+    printf '%s' "${tokens_str:+$tokens_str }📊 [$(ctx_bar "$used")] $(ctx_color "$used")${used}%${R}${win_str:+ of $win_str}"
   else
     printf '%s' "📊 n/a"
   fi
