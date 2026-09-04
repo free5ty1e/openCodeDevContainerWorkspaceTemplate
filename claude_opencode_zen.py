@@ -18,7 +18,38 @@ OPENCODE_CHAT_URL = f"{OPENCODE_ZEN_BASE_URL}/chat/completions"
 CACHE_FILE = os.path.expanduser("~/.opencode_api_key_cache")
 MODEL_CACHE_FILE = os.path.expanduser("~/.claude_opencode_last_model")
 CONTEXT_CACHE_FILE = os.path.expanduser("~/.claude_opencode_last_context")
+FAVORITES_CACHE_FILE = os.path.expanduser("~/.claude_opencode_favorites")
+CONTEXT_WINDOW_CACHE_DIR = os.path.expanduser("~/.claude_opencode_context_windows")
+PROVIDER_INDICATOR = "opencode"  # For statusline to identify provider
+AUTO_COMPACTION_THRESHOLD = 91  # Auto-compaction when usage >= this percentage
 PROXY_PORT = 4501
+PROXY_MASTER_KEY = "sk-opencode-bridge"
+CONFIG_DIR = os.path.expanduser("~/.claude_opencode")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "litellm_proxy.yaml")
+LOG_FILE = os.path.join(CONFIG_DIR, "proxy.log")
+PID_FILE = os.path.join(CONFIG_DIR, "proxy.pid")
+
+# Ensure prompt_toolkit is available for the favorites menu system
+try:
+    from prompt_toolkit import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, HSplit
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.styles import Style
+    PROMPT_TOOLKIT_AVAILABLE = True
+except ImportError:
+    print("  📦 Installing prompt_toolkit for favorites menu...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "prompt_toolkit"], check=False)
+    try:
+        from prompt_toolkit import Application, KeyBindings, Layout, HSplit
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.layout.containers import Window
+        from prompt_toolkit.styles import Style
+        PROMPT_TOOLKIT_AVAILABLE = True
+    except ImportError:
+        print("  ⚠️  prompt_toolkit not available - using basic selection")
+        PROMPT_TOOLKIT_AVAILABLE = False
 PROXY_MASTER_KEY = "sk-opencode-bridge"
 CONFIG_DIR = os.path.expanduser("~/.claude_opencode")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "litellm_proxy.yaml")
@@ -466,526 +497,487 @@ def save_last_context(context_window):
         pass
 
 
+# ─── Model-specific context window cache (for remembering per-model context) ────────────────────────────────────────
+def load_model_context(model_id):
+    """Load the last context window for a specific model from cache."""
+    cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.txt")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
 
-# Curses menu support - Python's curses module for proper CLI TUI menus
-import curses
 
-def _curses_menu_select(options, prompt="Select an option:", start_idx=0):
-    """
-    Proper curses-based menu selection using Python's curses module.
-    This is the standard, proven approach for CLI TUI interfaces.
-    Handles all navigation keys with proper scrolling and
-    highlighted item always visible.
-    Returns (selected_index, selected_option) or (None, None) on cancel.
-    """
-    def _menu_inner(stdscr):
-        curses.curs_set(0)  # Hide cursor
-        sh, sw = stdscr.getmaxyx()
-        current = start_idx if (start_idx is not None and start_idx >= 0) else 0
-        top = start_idx if (start_idx is not None and start_idx >= 0) else 0
-        vis = sh - 4  # visible count
-        items_len = len(options)
-        
-        if items_len == 0:
-            return None, None
-        
-        while True:
-            stdscr.clear()
-            try:
-                stdscr.addstr(0, 0, prompt[:sw-1])
-            except curses.error:
-                pass
-            
-            # Draw visible items with proper scrolling
-            for i in range(vis):
-                y = i + 2
-                if top + i < items_len:
-                    if top + i == current:
-                        try:
-                            stdscr.attron(curses.A_REVERSE)
-                            stdscr.addstr(y, 2, options[top+i])
-                            stdscr.attroff(curses.A_REVERSE)
-                        except curses.error:
-                            pass
-                    else:
-                        try:
-                            stdscr.addstr(y, 2, options[top+i])
-                        except curses.error:
-                            pass
-            
-            # Scroll indicators
-            if top > 0:
-                try:
-                    stdscr.addstr(1, 0, f"^ {top} above")
-                except curses.error:
-                    pass
-            if top + vis < items_len:
-                try:
-                    stdscr.addstr(sh-1, 0, f"^ {items_len - top - vis} below")
-                except curses.error:
-                    pass
-            
-            stdscr.refresh()
-            
-            key = stdscr.getch()
-            
-            if key in [10, ord("\n")]:  # Enter
-                return current, options[current]
-            elif key == curses.KEY_UP and current > 0:
-                current -= 1
-                if current < top:
-                    top = current
-            elif key == curses.KEY_DOWN and current < items_len - 1:
-                current += 1
-                if current >= top + vis:
-                    top = current - vis + 1
-            elif key == curses.KEY_HOME:
-                current = 0
-                top = 0
-            elif key == curses.KEY_END:
-                current = items_len - 1
-                top = max(0, items_len - vis)
-            elif key == 27:  # ESC/cancel
-                return None, None
-    
-    return _menu_inner
-def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
-    """
-    Interactive arrow-key selector for terminal.
-    Returns (selected_index, selected_option).
-    Supports UP/DOWN/Home/End/PageUp/PageDown navigation.
-    Uses cursor save/restore for stable positioning.
-    Highlighted item always remains visible.
-    """
-    import termios
-    import tty
-    import sys
+def save_model_context(model_id, context_window):
+    """Save the context window for a specific model to cache."""
+    try:
+        os.makedirs(CONTEXT_WINDOW_CACHE_DIR, exist_ok=True)
+        cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.txt")
+        with open(cache_file, "w") as f:
+            f.write(str(context_window))
+    except OSError:
+        pass
 
+
+# ─── Favorites cache ───────────────────────────────────────────────────────────────────────────────────────────────
+def load_favorites():
+    """Load the set of favorite model IDs from cache."""
+    if os.path.exists(FAVORITES_CACHE_FILE):
+        try:
+            with open(FAVORITES_CACHE_FILE, "r") as f:
+                content = f.read().strip()
+                if content:
+                    return set(content.split("\n"))
+        except OSError:
+            pass
+    return set()
+
+
+def save_favorites(favorites_set):
+    """Save the set of favorite model IDs to cache."""
+    try:
+        os.makedirs(os.path.dirname(FAVORITES_CACHE_FILE), exist_ok=True)
+        with open(FAVORITES_CACHE_FILE, "w") as f:
+            f.write("\n".join(sorted(favorites_set)))
+    except OSError:
+        pass
+
+
+# Favorites selector using prompt_toolkit for a robust TUI with proper arrow-key
+# navigation, SPACE to toggle favorites, and Enter to confirm.
+# Returns the updated set of favorite model IDs.
+def favorites_selector(models, current_favorites):
+    """Present a favorites toggle list and return updated favorites set.
+
+    Shows each model with its current favorite status (★ if favorited).
+    models: list of model ID strings (not dicts).
+    Users can toggle favorites with SPACE, navigate with arrows, and confirm with Enter.
+    """
+    if not models:
+        return current_favorites
+
+    terminal_height = _terminal_height()
+    visible_count = max(3, min(terminal_height - 4, len(models)))
+    # Clamp start_idx to valid range
+    start_idx = 0
+
+    current = [start_idx]  # use list for closure mutability
+    result = [None, None, None]  # use list for closure mutability: [0]=idx, [1]=model, [2]=favorites
+
+    # Build display: favorite status indicator + model ID with context
+    def get_formatted_options():
+        """Return formatted text for the list, recalculated on each render."""
+        top = get_top_idx()
+        fragments = []
+
+        # Prompt + instructions
+        fragments.append(("class:prompt", "Toggle favorites • SPACE to toggle • Enter to confirm • Esc to cancel\n"))
+
+        items_above = top
+        items_below = len(models) - (top + visible_count)
+
+        for i in range(top, min(top + visible_count, len(models))):
+            if i == current[0]:
+                # Currently highlighted item
+                model_id = models[i]
+                is_fav = model_id in current_favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:current", f"  {prefix}{model_id}\n"))
+            else:
+                model_id = models[i]
+                is_fav = model_id in current_favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:normal", f"    {prefix}{model_id}\n"))
+
+        if items_above > 0 or items_below > 0:
+            hint_parts = []
+            if items_above > 0:
+                hint_parts.append(f"{items_above} above")
+            if items_below > 0:
+                hint_parts.append(f"{items_below} below")
+            fragments.append(("class:hint", "  " + " ".join(hint_parts) + "\n"))
+
+        return fragments
+
+    def get_top_idx():
+        """Calculate the top visible index so current selection is always visible."""
+        top = current[0] - (current[0] % visible_count)
+        top = max(0, min(top, max(0, len(models) - visible_count)))
+        if current[0] < top:
+            top = current[0]
+        elif current[0] >= top + visible_count:
+            top = current[0] - visible_count + 1
+        return top
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        if current[0] > 0:
+            current[0] -= 1
+
+    @kb.add("down")
+    def _(event):
+        if current[0] < len(models) - 1:
+            current[0] += 1
+
+    @kb.add("space")
+    def _(event):
+        """Toggle favorite status of the current model."""
+        model_id = models[current[0]].get("id", "")
+        if model_id in current_favorites:
+            current_favorites.discard(model_id)
+        else:
+            current_favorites.add(model_id)
+        # Re-render by just continuing - the display will update
+
+    @kb.add("enter")
+    def _(event):
+        result[0] = current[0]
+        event.app.exit()
+
+    @kb.add("escape")
+    def _(event):
+        result[0] = None  # Cancel without saving
+        event.app.exit()
+
+    control = FormattedTextControl(get_formatted_options)
+    window = Window(
+        content=control,
+        height=max(visible_count + 4, 8),
+        always_hide_cursor=True,
+    )
+
+    style = Style.from_dict({
+        "current": "reverse",        # highlighted (selected) item
+        "normal": "",
+        "hint": "italic #888888",     # dim instructions / scroll hints
+        "prompt": "bold",
+    })
+
+    app = Application(
+        layout=Layout(HSplit([window])),
+        key_bindings=kb,
+        full_screen=False,
+        style=style,
+        mouse_support=False,
+    )
+
+    app.run()
+
+    if result[0] is not None:
+        # User confirmed - save favorites
+        save_favorites(current_favorites)
+        return current_favorites
+    return current_favorites  # Canceled - return unchanged
+
+
+# Interactive menu selector using prompt_toolkit (already a dependency of
+# the launch scripts). Provides a robust, tested TUI with proper scrolling:
+#   • UP/DOWN arrows move the highlight one line; the selected item is always
+#     kept visible by auto-scrolling the viewport.
+#   • PageUp / PageDown move by a page.
+#   • Home / End jump to first/last.
+#   • Enter selects; Esc (or Ctrl-C / Ctrl-D) cancels.
+# prompt_toolkit handles terminal resize and escape sequences internally,
+# avoiding the hand-rolled ANSI / termios code that caused scrolling bugs.
+from prompt_toolkit import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, HSplit
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.styles import Style
+
+
+def _terminal_height():
+    """Return usable terminal height, clamped to a sane minimum."""
+    try:
+        import shutil
+        rows = shutil.get_terminal_size().lines
+        if rows and rows > 4:
+            return rows
+    except Exception:
+        pass
+    return 24
+
+
+def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorites=None):
+    """
+    Interactive arrow-key selector using prompt_toolkit.
+
+    Returns (selected_index, selected_option, updated_favorites) or (None, None, None) on cancel.
+    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, ENTER, ESC, and SPACE to toggle favorites.
+    The highlighted item is always kept visible via auto-scrolling.
+    Favorites are shown with ★ prefix; SPACE toggles favorite status.
+    """
     if not options:
-        return None, None
+        return None, None, None
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    # If not running in a terminal, fall back to input-based selection
+    if not hasattr(sys.stdin, 'isatty') or not sys.stdin.isatty():
+        print("⚠️  Not running in a terminal - using number selection instead")
+        selected = get_selection_input(prompt, len(options))
+        return selected, options[selected - 1] if selected else (None, None, favorites)
 
-    def get_key():
-        """Read a single keypress."""
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == chr(27):  # Escape sequence
-                ch2 = sys.stdin.read(1)
-                if ch2 == "[":
-                    ch3 = sys.stdin.read(1)
-                    if ch3 == "A":
-                        return "UP"
-                    elif ch3 == "B":
-                        return "DOWN"
-                    elif ch3 == "H":
-                        return "HOME"
-                    elif ch3 == "F":
-                        return "END"
-                    elif ch3 == "5":
-                        ch4 = sys.stdin.read(1)
-                        if ch4 == "~":
-                            return "PAGE_UP"
-                        return "PAGE_UP"
-                    elif ch3 == "6":
-                        ch4 = sys.stdin.read(1)
-                        if ch4 == "~":
-                            return "PAGE_DOWN"
-                        return "PAGE_DOWN"
-                elif ch2 == "O":
-                    ch3 = sys.stdin.read(1)
-                    return ch3
-            elif ch == chr(13) or ch == chr(10):
-                return "ENTER"
-            elif ch == chr(3):  # Ctrl+C
-                raise KeyboardInterrupt
-            elif ch == chr(4):  # Ctrl+D
-                raise EOFError
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    terminal_height = _terminal_height()
+    visible_count = max(3, min(terminal_height - 4, len(options)))
+    # Clamp start_idx to valid range
+    start_idx = max(0, min(start_idx, len(options) - 1))
+    current = [start_idx]  # use list for closure mutability
+    result = [None, None, None]  # use list for closure mutability: [0]=idx, [1]=model, [2]=favorites
 
-    def render_menu(selected_idx, top_idx, visible_count):
+    # Ensure favorites is a set
+    if favorites is None:
+        favorites = set()
+
+    def get_top_idx():
+        """Calculate the top visible index so current selection is always visible."""
+        top = current[0] - (current[0] % visible_count)
+        top = max(0, min(top, max(0, len(options) - visible_count)))
+        if current[0] < top:
+            top = current[0]
+        elif current[0] >= top + visible_count:
+            top = current[0] - visible_count + 1
+        return top
+
+    def get_formatted_options():
+        """Return formatted text for the list, recalculated on each render.
+
+        Returns a list of (style, text) tuples — the format expected by
+        FormattedTextControl. Each line ends with a newline so the control
+        renders multi-line content correctly.
         """
-        Render menu with stable cursor positioning.
-        IMPORTANT: Uses the top_idx passed from the main loop.
-        The main loop is responsible for keeping current visible.
-        """
-        # Calculate visible range using the top_idx passed from main loop
-        # The main loop ensures top_idx <= selected_idx < top_idx + visible_count
-        start = top_idx
-        end = min(len(options), top_idx + visible_count)
+        top = get_top_idx()
+        fragments = []
 
-        # Save cursor position
-        print(chr(27) + "s", end="")
-        # Move to first option line (after prompt/help area)
-        print(chr(27) + f"[{visible_count + 2}A", end="")
-        # Clear from cursor to end of screen
-        print(chr(27) + "[J", end="")
-        # Print visible options
-        for i in range(start, end):
-            if i == selected_idx:
-                print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+        # Prompt + instructions
+        fragments.append(("class:prompt", prompt + "\n"))
+        fragments.append(("class:hint", "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump • Enter select • SPACE toggle favorite • Esc cancel\n"))
+
+        items_above = top
+        items_below = len(options) - (top + visible_count)
+
+        for i in range(top, min(top + visible_count, len(options))):
+            if i == current[0]:
+                # Currently highlighted item
+                model_id = options[i]
+                is_fav = model_id in favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:current", f"  {prefix}{model_id}\n"))
             else:
-                print(f"  {options[i]}")
-        # Print remaining options if any
-        if end < len(options):
-            print(f"  ... ({len(options) - end} more)")
-        # Restore cursor position
-        print(chr(27) + "u", end="")
-        sys.stdout.flush()
+                model_id = options[i]
+                is_fav = model_id in favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:normal", f"    {prefix}{model_id}\n"))
 
-    # Determine terminal height
-    try:
-        term_rows = int(os.popen("stty size").read().split()[1])
-    except:
-        term_rows = 20  # fallback
-    visible_count = min(term_rows - 4, len(options))  # leave room for prompt/border
+        if items_above > 0 or items_below > 0:
+            hint_parts = []
+            if items_above > 0:
+                hint_parts.append(f"{items_above} above")
+            if items_below > 0:
+                hint_parts.append(f"{items_below} below")
+            fragments.append(("class:hint", "  " + " ".join(hint_parts) + "\n"))
 
-    print(prompt)
-    # Initial render - show first visible options
-    visible_start = start_idx
-    visible_end = min(len(options), start_idx + visible_count)
-    for i in range(visible_start, visible_end):
-        if i == start_idx:
-            print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+        return fragments
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        if current[0] > 0:
+            current[0] -= 1
+
+    @kb.add("down")
+    def _(event):
+        if current[0] < len(options) - 1:
+            current[0] += 1
+
+    @kb.add("space")
+    def _(event):
+        """Toggle favorite status of the current model."""
+        model_id = options[current[0]]
+        if model_id in favorites:
+            favorites.discard(model_id)
         else:
-            print(f"  {options[i]}")
-    sys.stdout.flush()
+            favorites.add(model_id)
 
-    current_idx = start_idx
-    top_idx = start_idx  # first visible option index
+    @kb.add("pageup")
+    def _(event):
+        page = min(visible_count - 1, len(options))
+        current[0] = max(0, current[0] - page)
 
-    try:
-        while True:
-            key = get_key()
-            if key == "UP":
-                if current_idx > 0:
-                    current_idx -= 1
-                    # Keep selection visible: adjust top_idx if needed
-                    # Rule: we want top_idx <= current_idx < top_idx + visible_count
-                    if current_idx < top_idx:
-                        top_idx = current_idx
-                    # Also ensure we don't scroll past the very top
-                    top_idx = max(0, top_idx)
-                    render_menu(current_idx, top_idx, visible_count)
-            elif key == "DOWN":
-                if current_idx < len(options) - 1:
-                    current_idx += 1
-                    # Keep selection visible: adjust top_idx if needed
-                    # Rule: we want top_idx <= current_idx < top_idx + visible_count
-                    if current_idx >= top_idx + visible_count:
-                        top_idx = current_idx - visible_count + 1
-                    # Also ensure we don't scroll past the very bottom
-                    top_idx = min(top_idx, max(0, len(options) - visible_count))
-                    render_menu(current_idx, top_idx, visible_count)
-            elif key == "PAGE_DOWN":
-                # Page down: move selection down by one page
-                page_size = visible_count - 2  # leave room
-                current_idx = min(len(options) - 1, current_idx + page_size)
-                # Keep selection visible
-                if current_idx >= top_idx + visible_count:
-                    top_idx = current_idx - visible_count + 1
-                top_idx = max(0, top_idx)
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "PAGE_UP":
-                # Page up: move selection up by one page
-                page_size = visible_count - 2
-                current_idx = max(0, current_idx - page_size)
-                # Keep selection visible
-                top_idx = min(current_idx, len(options) - visible_count)
-                top_idx = max(0, top_idx)
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "HOME":
-                current_idx = 0
-                top_idx = 0
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "END":
-                current_idx = len(options) - 1
-                top_idx = max(0, len(options) - visible_count)
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "ENTER":
-                # Move cursor past menu to end
-                print(chr(27) + f"[{len(options) - current_idx}B", end="")
-                print()  # New line after selection
-                return current_idx, options[current_idx]
-    except (KeyboardInterrupt, EOFError):
-        # Move cursor past menu
-        print(chr(27) + f"[{len(options) - current_idx}B", end="")
-        print(chr(10) + chr(27) + "[0m")  # Reset colors
-        sys.exit(0)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    @kb.add("pagedown")
+    def _(event):
+        page = min(visible_count - 1, len(options))
+        current[0] = min(len(options) - 1, current[0] + page)
 
-    def get_key():
-        """Read a single keypress."""
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == chr(27):  # Escape sequence
-                ch2 = sys.stdin.read(1)
-                if ch2 == "[":
-                    ch3 = sys.stdin.read(1)
-                    if ch3 == "A":
-                        return "UP"
-                    elif ch3 == "B":
-                        return "DOWN"
-                    elif ch3 == "H":
-                        return "HOME"
-                    elif ch3 == "F":
-                        return "END"
-                    elif ch3 == "5":
-                        ch4 = sys.stdin.read(1)
-                        if ch4 == "~":
-                            return "PAGE_UP"
-                        return "PAGE_UP"
-                    elif ch3 == "6":
-                        ch4 = sys.stdin.read(1)
-                        if ch4 == "~":
-                            return "PAGE_DOWN"
-                        return "PAGE_DOWN"
-                elif ch2 == "O":
-                    ch3 = sys.stdin.read(1)
-                    return ch3
-            elif ch == chr(13) or ch == chr(10):
-                return "ENTER"
-            elif ch == chr(3):  # Ctrl+C
-                raise KeyboardInterrupt
-            elif ch == chr(4):  # Ctrl+D
-                raise EOFError
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    @kb.add("home")
+    def _(event):
+        current[0] = 0
 
-    def render_menu(selected_idx, top_idx, visible_count):
+    @kb.add("end")
+    def _(event):
+        current[0] = len(options) - 1
+
+    @kb.add("enter")
+    def _(event):
+        result[0] = current[0]
+        # Save favorites when selecting
+        result[2] = favorites
+        event.app.exit()
+
+    @kb.add("escape")
+    def _(event):
+        result[0] = None  # Cancel without saving
+        result[2] = None  # No favorites change
+        event.app.exit()
+
+    control = FormattedTextControl(get_formatted_options)
+    window = Window(
+        content=control,
+        height=max(visible_count + 4, 8),
+        always_hide_cursor=True,
+    )
+
+    style = Style.from_dict({
+        "current": "reverse",        # highlighted (selected) item
+        "normal": "",
+        "hint": "italic #888888",     # dim instructions / scroll hints
+        "prompt": "bold",
+    })
+
+    app = Application(
+        layout=Layout(HSplit([window])),
+        key_bindings=kb,
+        full_screen=False,
+        style=style,
+        mouse_support=False,
+    )
+
+    app.run()
+
+    if result[0] is not None:
+        return result[0], options[result[0]], result[2]
+    return None, None, None
+    visible_count = max(3, min(terminal_height - 4, len(options)))
+    # Clamp start_idx to valid range
+    start_idx = max(0, min(start_idx, len(options) - 1))
+    current = [start_idx]  # use list for closure mutability
+    result = [None, None, None]  # use list for closure mutability: [0]=idx, [1]=model, [2]=favorites
+
+    def get_top_idx():
+        """Calculate the top visible index so current selection is always visible."""
+        top = current[0] - (current[0] % visible_count)
+        top = max(0, min(top, max(0, len(options) - visible_count)))
+        if current[0] < top:
+            top = current[0]
+        elif current[0] >= top + visible_count:
+            top = current[0] - visible_count + 1
+        return top
+
+    def get_formatted_options():
+        """Return formatted text for the list, recalculated on each render.
+
+        Returns a list of (style, text) tuples — the format expected by
+        FormattedTextControl. Each line ends with a newline so the control
+        renders multi-line content correctly.
         """
-        Render menu with stable cursor positioning.
-        Ensures selected_idx is always visible within [top_idx, top_idx + visible_count).
-        Uses cursor save/restore to avoid position drift.
-        """
-        # Calculate visible range - ensure selected_idx is always visible
-        ideal_top = max(0, min(selected_idx - visible_count // 2, selected_idx))
-        max_top = max(0, len(options) - visible_count)
-        top_idx = max(0, min(ideal_top, max_top))
+        top = get_top_idx()
+        fragments = []
 
-        # Calculate visible range
-        start = top_idx
-        end = min(len(options), top_idx + visible_count)
+        # Prompt + instructions
+        fragments.append(("class:prompt", prompt + "\n"))
+        fragments.append(("class:hint", "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump • Enter select • Esc cancel\n"))
 
-        # Save cursor position
-        print(chr(27) + "s", end="")
-        # Move to first option line (after prompt/help area)
-        print(chr(27) + f"[{visible_count + 2}A", end="")
-        # Clear from cursor to end of screen
-        print(chr(27) + "[J", end="")
-        # Print visible options
-        for i in range(start, end):
-            if i == selected_idx:
-                print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+        items_above = top
+        items_below = len(options) - (top + visible_count)
+
+        for i in range(top, min(top + visible_count, len(options))):
+            if i == current[0]:
+                fragments.append(("class:current", f"  → {options[i]}\n"))
             else:
-                print(f"  {options[i]}")
-        # Print remaining options if any
-        if end < len(options):
-            print(f"  ... ({len(options) - end} more)")
-        # Restore cursor position
-        print(chr(27) + "u", end="")
-        sys.stdout.flush()
+                fragments.append(("class:normal", f"    {options[i]}\n"))
 
-    # Determine terminal height
-    try:
-        term_rows = int(os.popen("stty size").read().split()[1])
-    except:
-        term_rows = 20  # fallback
-    visible_count = min(term_rows - 4, len(options))  # leave room for prompt/border
+        if items_above > 0 or items_below > 0:
+            hint_parts = []
+            if items_above > 0:
+                hint_parts.append(f"{items_above} above")
+            if items_below > 0:
+                hint_parts.append(f"{items_below} below")
+            fragments.append(("class:hint", "  " + " ".join(hint_parts) + "\n"))
 
-    print(prompt)
-    # Initial render - show first visible options
-    visible_start = start_idx
-    visible_end = min(len(options), start_idx + visible_count)
-    for i in range(visible_start, visible_end):
-        if i == start_idx:
-            print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
-        else:
-            print(f"  {options[i]}")
-    sys.stdout.flush()
+        return fragments
 
-    current_idx = start_idx
-    top_idx = start_idx  # first visible option index
+    kb = KeyBindings()
 
-    try:
-        while True:
-            key = get_key()
-            if key == "UP":
-                if current_idx > 0:
-                    current_idx -= 1
-                    # Keep selection visible
-                    if current_idx < top_idx:
-                        top_idx = current_idx
-                    top_idx = max(0, top_idx)
-                    render_menu(current_idx, top_idx, visible_count)
-            elif key == "DOWN":
-                if current_idx < len(options) - 1:
-                    current_idx += 1
-                    # Keep selection visible
-                    if current_idx >= top_idx + visible_count:
-                        top_idx = current_idx - visible_count + 1
-                    top_idx = min(top_idx, max(0, len(options) - visible_count))
-                    render_menu(current_idx, top_idx, visible_count)
-            elif key == "PAGE_DOWN":
-                # Page down: move selection down by one page
-                page_size = visible_count - 2  # leave room
-                current_idx = min(len(options) - 1, current_idx + page_size)
-                top_idx = min(current_idx, len(options) - visible_count)
-                top_idx = max(0, top_idx)
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "PAGE_UP":
-                # Page up: move selection up by one page
-                page_size = visible_count - 2
-                current_idx = max(0, current_idx - page_size)
-                top_idx = min(current_idx, len(options) - visible_count)
-                top_idx = max(0, top_idx)
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "HOME":
-                current_idx = 0
-                top_idx = 0
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "END":
-                current_idx = len(options) - 1
-                top_idx = max(0, len(options) - visible_count)
-                render_menu(current_idx, top_idx, visible_count)
-            elif key == "ENTER":
-                # Move cursor past menu to end
-                print(chr(27) + f"[{len(options) - current_idx}B", end="")
-                print()  # New line after selection
-                return current_idx, options[current_idx]
-    except (KeyboardInterrupt, EOFError):
-        # Move cursor past menu
-        print(chr(27) + f"[{len(options) - current_idx}B", end="")
-        print(chr(10) + chr(27) + "[0m")  # Reset colors
-        sys.exit(0)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    @kb.add("up")
+    def _(event):
+        if current[0] > 0:
+            current[0] -= 1
 
-    def get_key():
-        """Read a single keypress."""
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == '\x1b':  # Escape sequence
-                ch2 = sys.stdin.read(1)
-                if ch2 == '[':
-                    ch3 = sys.stdin.read(1)
-                    if ch3 == 'A':
-                        return 'UP'
-                    elif ch3 == 'B':
-                        return 'DOWN'
-                    elif ch3 == 'C':
-                        return 'RIGHT'
-                    elif ch3 == 'D':
-                        return 'LEFT'
-            elif ch == '\r' or ch == '\n':
-                return 'ENTER'
-            elif ch == '\x03':  # Ctrl+C
-                raise KeyboardInterrupt
-            elif ch == '\x04':  # Ctrl+D
-                raise EOFError
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    @kb.add("down")
+    def _(event):
+        if current[0] < len(options) - 1:
+            current[0] += 1
 
-    def render_menu(selected_idx):
-        """Render the menu with current selection highlighted.
-        Uses cursor save/restore to avoid position drift."""
-        # Save cursor position
-        print('\033[s', end='')
-        # Move to first option line (after prompt)
-        print(f'\033[{len(options)}A', end='')
-        # Clear from cursor to end of screen
-        print('\033[J', end='')
-        # Print all options
-        for i, opt in enumerate(options):
-            if i == selected_idx:
-                print(f'\033[94m\033[1m→ {opt}\033[0m')
-            else:
-                print(f'  {opt}')
-        # Restore cursor position
-        print('\033[u', end='')
-        sys.stdout.flush()
+    @kb.add("pageup")
+    def _(event):
+        page = min(visible_count - 1, len(options))
+        current[0] = max(0, current[0] - page)
 
-    print(prompt)
-    # Initial render - just print all options
-    for i, opt in enumerate(options):
-        if i == start_idx:
-            print(f'\033[94m\033[1m→ {opt}\033[0m')
-        else:
-            print(f'  {opt}')
-    sys.stdout.flush()
+    @kb.add("pagedown")
+    def _(event):
+        page = min(visible_count - 1, len(options))
+        current[0] = min(len(options) - 1, current[0] + page)
 
-    current_idx = start_idx
+    @kb.add("home")
+    def _(event):
+        current[0] = 0
 
-    try:
-        while True:
-            key = get_key()
-            if key == 'UP':
-                if current_idx > 0:
-                    current_idx -= 1
-                    render_menu(current_idx)
-            elif key == 'DOWN':
-                if current_idx < len(options) - 1:
-                    current_idx += 1
-                    render_menu(current_idx)
-            elif key == 'ENTER':
-                # Move cursor past menu to end
-                print(f'\033[{len(options) - current_idx}B', end='')
-                print()  # New line after selection
-                return current_idx, options[current_idx]
-    except (KeyboardInterrupt, EOFError):
-        # Move cursor past menu
-        print(f'\033[{len(options) - current_idx}B', end='')
-        print('\n\033[0m')  # Reset colors
-        sys.exit(0)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    @kb.add("end")
+    def _(event):
+        current[0] = len(options) - 1
 
-    current_idx = start_idx
+    @kb.add("enter")
+    def _(event):
+        result[0] = current[0]
+        event.app.exit()
 
-    try:
-        while True:
-            key = get_key()
-            if key == 'UP':
-                if current_idx > 0:
-                    # Move selection up
-                    print('\033[B\033[2K', end='')  # Move down, clear line
-                    print(f'  {options[current_idx]}')  # Unhighlight old
-                    current_idx -= 1
-                    print('\033[A\033[2K', end='')  # Move up, clear line
-                    print(f'\033[94m\033[1m→ {options[current_idx]}\033[0m')  # Highlight new
-                    print('\033[A', end='')  # Move up for next iteration
-                    sys.stdout.flush()
-            elif key == 'DOWN':
-                if current_idx < len(options) - 1:
-                    # Move selection down
-                    print('\033[2K', end='')  # Clear line
-                    print(f'  {options[current_idx]}')  # Unhighlight old
-                    current_idx += 1
-                    print('\033[A\033[2K', end='')  # Move up, clear line
-                    print(f'\033[94m\033[1m→ {options[current_idx]}\033[0m')  # Highlight new
-                    print('\033[A', end='')  # Move up for next iteration
-                    sys.stdout.flush()
-            elif key == 'ENTER':
-                # Clear remaining lines below
-                for i in range(current_idx + 1, len(options)):
-                    print('\033[B\033[2K', end='')
-                print()  # New line after selection
-                return current_idx, options[current_idx]
-    except (KeyboardInterrupt, EOFError):
-        print('\n\033[0m')  # Reset colors
-        sys.exit(0)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    @kb.add("escape")
+    def _(event):
+        result[0] = None
+        event.app.exit()
 
+    control = FormattedTextControl(get_formatted_options)
+    window = Window(
+        content=control,
+        height=max(visible_count + 4, 8),
+        always_hide_cursor=True,
+    )
+
+    style = Style.from_dict({
+        "current": "reverse",        # highlighted (selected) item
+        "normal": "",
+        "hint": "italic #888888",     # dim instructions / scroll hints
+        "prompt": "bold",
+    })
+
+    app = Application(
+        layout=Layout(HSplit([window])),
+        key_bindings=kb,
+        full_screen=False,
+        style=style,
+        mouse_support=False,
+    )
+
+    app.run()
+
+    if result[0] is not None:
+        return result[0], options[result[0]]
+    return None, None
 
 # ─── Step 5: Display model list and handle selection ─────────────────────
 def get_selection_input(prompt, max_val):
@@ -1039,9 +1031,9 @@ def display_and_select(standard, free, combined):
 
     # Check for last used model
     last_model = load_last_model()
+    last_idx = None
     if last_model:
         # Find the index of last_model
-        last_idx = None
         for i, m in enumerate(combined):
             if m.get("id") == last_model:
                 last_idx = i  # 0-based for arrow selector
@@ -1055,67 +1047,115 @@ def display_and_select(standard, free, combined):
         ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
         display_options.append(f"{model_id}{ctx_str}")
 
+    # Load favorites before selection
+    current_favorites = load_favorites()
+
     # Use arrow key selector
     print("\nUse ↑/↓ arrows to navigate, Enter to select:")
-    selected_idx, _ = arrow_key_selector(display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0)
+    selected_idx, selected_model, current_favorites = arrow_key_selector(
+        display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
+    )
+    if selected_idx is None:
+        print("\n👋 No model selected. Exiting.")
+        sys.exit(0)
     selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
+
+    # Load current favorites and offer to toggle
+    current_favorites = load_favorites()
+    print(f"\n   Current favorites: {len(current_favorites)} models")
+    if current_favorites:
+        print(f"   Favorite models: {', '.join(sorted(current_favorites))}")
+
+    # Offer favorites toggle - only if there are models to show favorites for
+    if len(combined) > 0:
+        print(f"\n⭐ Toggle favorite status for models (SPACE to toggle, Enter to confirm):")
+        # Build a display list for favorites: just model IDs
+        fav_display = [m.get("id", "") for m in combined]
+        current_favorites = favorites_selector(fav_display, current_favorites)
+        # Re-identify the selected model
+        selected_model = combined[selected_idx].get("id", "")
 
     # Save last model
     save_last_model(selected_model)
 
-    return selected_model, combined[selected_idx]
+    # Save favorites
+    save_favorites(current_favorites)
+
+    # Get model data for the selected model
+    model_data = combined[selected_idx] if selected_idx is not None and selected_idx < len(combined) else {}
+
+    return selected_model, model_data
 
 
 def get_context_window(selected_model, model_data):
-    """Prompt user for context window with pre-populated default."""
-    # Get default from model data or cache
+    """Prompt user for context window with a menu-based selection.
+
+    The menu shows:
+    - Detected Context Window (from model data)
+    - Last Used Context Window (from cache, model-specific)
+    - Enter Custom Context Window (input prompt)
+
+    Each model remembers its last used context window independently.
+    """
+    # Get context values
     model_ctx = model_data.get("context_window", 0)
-    cached_ctx = load_last_context()
+    model_cached_ctx = load_model_context(selected_model)
+    default_ctx = model_ctx if model_ctx > 0 else 200000
 
-    # Priority: cached context > model data context > default 200000
-    if cached_ctx and cached_ctx > 0:
-        default_ctx = cached_ctx
-        source = "cached"
-    elif model_ctx and model_ctx > 0:
-        default_ctx = model_ctx
-        source = "model default"
-    else:
-        default_ctx = 200000
-        source = "fallback"
+    # Build menu options
+    options = []
+    if model_ctx > 0:
+        options.append(("Detected Context Window", model_ctx, "model"))
+    if model_cached_ctx:
+        options.append(("Last Used Context Window", model_cached_ctx, "cached"))
+    options.append(("Enter Custom Context Window", default_ctx, "custom"))
 
-    print(f"\n📏 Context Window Configuration")
+    print(f"\n📏 Context Window Configuration for {selected_model}")
     print(f"   Model default: {model_ctx:,} tokens" if model_ctx > 0 else "   Model default: unknown")
-    print(f"   Last used: {cached_ctx:,} tokens" if cached_ctx and cached_ctx > 0 else "   Last used: none")
-    print(f"   Using: {default_ctx:,} tokens ({source})")
+    print(f"   Last used: {model_cached_ctx:,} tokens" if model_cached_ctx else "   Last used: none")
+
+    # Display menu number
+    for i, (label, value, src) in enumerate(options, 1):
+        src_indicator = {"model": "📦", "cached": "💾", "custom": "✏️"}[src]
+        print(f"   [{i}] {src_indicator} {label}: {value:,} tokens")
+
+    print(f"\n   [0] Cancel")
 
     try:
-        user_input = input(f"\nContext window in tokens [{default_ctx:,}]: ").strip()
-    except EOFError:
+        choice = input(f"\nSelect context window [0-{len(options)}]: ").strip()
+        if not choice:
+            choice = "1"  # Default to first option
+    except (EOFError, KeyboardInterrupt):
+        print("\n👋 Cancelled by user.")
+        return default_ctx
+
+    try:
+        choice_idx = int(choice)
+        if choice_idx == 0:
+            return default_ctx
+        elif 1 <= choice_idx <= len(options):
+            label, value, source = options[choice_idx - 1]
+            if source == "custom":
+                custom_ctx = input(f"Enter custom context window [{value:,}]: ").strip()
+                if not custom_ctx:
+                    context_window = value
+                else:
+                    context_window = int(custom_ctx.replace(",", "").replace("_", ""))
+                print(f"   ✅ Using custom: {context_window:,} tokens")
+            else:
+                context_window = value
+                print(f"   ✅ Selected: {label} = {context_window:,} tokens")
+
+            # Save to model-specific cache
+            save_model_context(selected_model, context_window)
+            return context_window
+        else:
+            print(f"   ⚠️  Invalid selection, using default: {default_ctx:,}")
+            return default_ctx
+    except (ValueError, KeyboardInterrupt):
         print(f"\n   Using default: {default_ctx:,} tokens")
         return default_ctx
-    except KeyboardInterrupt:
-        print("\n👋 Cancelled by user.")
-        sys.exit(0)
-
-    if not user_input:
-        context_window = default_ctx
-        print(f"   ✅ Using {context_window:,} tokens")
-    else:
-        try:
-            context_window = int(user_input.replace(",", "").replace("_", ""))
-            if context_window <= 0:
-                print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
-                context_window = default_ctx
-            else:
-                print(f"   ✅ Using custom context window: {context_window:,} tokens")
-        except ValueError:
-            print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
-            context_window = default_ctx
-
-    # Save for next run
-    save_last_context(context_window)
-    return context_window
 
 
 def check_model_access(selected_model, api_key):
@@ -1625,6 +1665,8 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_window)
     # Don't let claude try to discover/switch to a gateway model.
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"
+    # Enable auto-compaction when context usage reaches threshold (e.g., 91%)
+    env["CLAUDE_CODE_COMPACTION_LEVEL"] = str(AUTO_COMPACTION_THRESHOLD)
 
     # Set up Claude Code persistence so sessions survive devcontainer rebuilds
     setup_claude_persistence()
