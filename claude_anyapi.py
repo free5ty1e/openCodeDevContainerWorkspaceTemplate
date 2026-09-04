@@ -469,11 +469,96 @@ def save_last_context(context_window):
         pass
 
 
+
+# Curses menu support - Python's curses module for proper CLI TUI menus
+import curses
+
+def _curses_menu_select(options, prompt="Select an option:", start_idx=0):
+    """
+    Proper curses-based menu selection using Python's curses module.
+    This is the standard, proven approach for CLI TUI interfaces.
+    Handles all navigation keys with proper scrolling and
+    highlighted item always visible.
+    Returns (selected_index, selected_option) or (None, None) on cancel.
+    """
+    def _menu_inner(stdscr):
+        curses.curs_set(0)  # Hide cursor
+        sh, sw = stdscr.getmaxyx()
+        current = start_idx if (start_idx is not None and start_idx >= 0) else 0
+        top = start_idx if (start_idx is not None and start_idx >= 0) else 0
+        vis = sh - 4  # visible count
+        items_len = len(options)
+        
+        if items_len == 0:
+            return None, None
+        
+        while True:
+            stdscr.clear()
+            try:
+                stdscr.addstr(0, 0, prompt[:sw-1])
+            except curses.error:
+                pass
+            
+            # Draw visible items with proper scrolling
+            for i in range(vis):
+                y = i + 2
+                if top + i < items_len:
+                    if top + i == current:
+                        try:
+                            stdscr.attron(curses.A_REVERSE)
+                            stdscr.addstr(y, 2, options[top+i])
+                            stdscr.attroff(curses.A_REVERSE)
+                        except curses.error:
+                            pass
+                    else:
+                        try:
+                            stdscr.addstr(y, 2, options[top+i])
+                        except curses.error:
+                            pass
+            
+            # Scroll indicators
+            if top > 0:
+                try:
+                    stdscr.addstr(1, 0, f"^ {top} above")
+                except curses.error:
+                    pass
+            if top + vis < items_len:
+                try:
+                    stdscr.addstr(sh-1, 0, f"^ {items_len - top - vis} below")
+                except curses.error:
+                    pass
+            
+            stdscr.refresh()
+            
+            key = stdscr.getch()
+            
+            if key in [10, ord("\n")]:  # Enter
+                return current, options[current]
+            elif key == curses.KEY_UP and current > 0:
+                current -= 1
+                if current < top:
+                    top = current
+            elif key == curses.KEY_DOWN and current < items_len - 1:
+                current += 1
+                if current >= top + vis:
+                    top = current - vis + 1
+            elif key == curses.KEY_HOME:
+                current = 0
+                top = 0
+            elif key == curses.KEY_END:
+                current = items_len - 1
+                top = max(0, items_len - vis)
+            elif key == 27:  # ESC/cancel
+                return None, None
+    
+    return _menu_inner
 def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
     """
     Interactive arrow-key selector for terminal.
     Returns (selected_index, selected_option).
-    Uses ANSI escape codes with cursor save/restore for stable positioning.
+    Supports UP/DOWN/Home/End/PageUp/PageDown navigation.
+    Uses cursor save/restore for stable positioning.
+    Highlighted item always remains visible.
     """
     import termios
     import tty
@@ -484,6 +569,307 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
+
+    def get_key():
+        """Read a single keypress."""
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == chr(27):  # Escape sequence
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "A":
+                        return "UP"
+                    elif ch3 == "B":
+                        return "DOWN"
+                    elif ch3 == "H":
+                        return "HOME"
+                    elif ch3 == "F":
+                        return "END"
+                    elif ch3 == "5":
+                        ch4 = sys.stdin.read(1)
+                        if ch4 == "~":
+                            return "PAGE_UP"
+                        return "PAGE_UP"
+                    elif ch3 == "6":
+                        ch4 = sys.stdin.read(1)
+                        if ch4 == "~":
+                            return "PAGE_DOWN"
+                        return "PAGE_DOWN"
+                elif ch2 == "O":
+                    ch3 = sys.stdin.read(1)
+                    return ch3
+            elif ch == chr(13) or ch == chr(10):
+                return "ENTER"
+            elif ch == chr(3):  # Ctrl+C
+                raise KeyboardInterrupt
+            elif ch == chr(4):  # Ctrl+D
+                raise EOFError
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def render_menu(selected_idx, top_idx, visible_count):
+        """
+        Render menu with stable cursor positioning.
+        IMPORTANT: Uses the top_idx passed from the main loop.
+        The main loop is responsible for keeping current visible.
+        """
+        # Calculate visible range using the top_idx passed from main loop
+        # The main loop ensures top_idx <= selected_idx < top_idx + visible_count
+        start = top_idx
+        end = min(len(options), top_idx + visible_count)
+
+        # Save cursor position
+        print(chr(27) + "s", end="")
+        # Move to first option line (after prompt/help area)
+        print(chr(27) + f"[{visible_count + 2}A", end="")
+        # Clear from cursor to end of screen
+        print(chr(27) + "[J", end="")
+        # Print visible options
+        for i in range(start, end):
+            if i == selected_idx:
+                print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+            else:
+                print(f"  {options[i]}")
+        # Print remaining options if any
+        if end < len(options):
+            print(f"  ... ({len(options) - end} more)")
+        # Restore cursor position
+        print(chr(27) + "u", end="")
+        sys.stdout.flush()
+
+    # Determine terminal height
+    try:
+        term_rows = int(os.popen("stty size").read().split()[1])
+    except:
+        term_rows = 20  # fallback
+    visible_count = min(term_rows - 4, len(options))  # leave room for prompt/border
+
+    print(prompt)
+    # Initial render - show first visible options
+    visible_start = start_idx
+    visible_end = min(len(options), start_idx + visible_count)
+    for i in range(visible_start, visible_end):
+        if i == start_idx:
+            print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+        else:
+            print(f"  {options[i]}")
+    sys.stdout.flush()
+
+    current_idx = start_idx
+    top_idx = start_idx  # first visible option index
+
+    try:
+        while True:
+            key = get_key()
+            if key == "UP":
+                if current_idx > 0:
+                    current_idx -= 1
+                    # Keep selection visible: adjust top_idx if needed
+                    # Rule: we want top_idx <= current_idx < top_idx + visible_count
+                    if current_idx < top_idx:
+                        top_idx = current_idx
+                    # Also ensure we don't scroll past the very top
+                    top_idx = max(0, top_idx)
+                    render_menu(current_idx, top_idx, visible_count)
+            elif key == "DOWN":
+                if current_idx < len(options) - 1:
+                    current_idx += 1
+                    # Keep selection visible: adjust top_idx if needed
+                    # Rule: we want top_idx <= current_idx < top_idx + visible_count
+                    if current_idx >= top_idx + visible_count:
+                        top_idx = current_idx - visible_count + 1
+                    # Also ensure we don't scroll past the very bottom
+                    top_idx = min(top_idx, max(0, len(options) - visible_count))
+                    render_menu(current_idx, top_idx, visible_count)
+            elif key == "PAGE_DOWN":
+                # Page down: move selection down by one page
+                page_size = visible_count - 2  # leave room
+                current_idx = min(len(options) - 1, current_idx + page_size)
+                # Keep selection visible
+                if current_idx >= top_idx + visible_count:
+                    top_idx = current_idx - visible_count + 1
+                top_idx = max(0, top_idx)
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "PAGE_UP":
+                # Page up: move selection up by one page
+                page_size = visible_count - 2
+                current_idx = max(0, current_idx - page_size)
+                # Keep selection visible
+                top_idx = min(current_idx, len(options) - visible_count)
+                top_idx = max(0, top_idx)
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "HOME":
+                current_idx = 0
+                top_idx = 0
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "END":
+                current_idx = len(options) - 1
+                top_idx = max(0, len(options) - visible_count)
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "ENTER":
+                # Move cursor past menu to end
+                print(chr(27) + f"[{len(options) - current_idx}B", end="")
+                print()  # New line after selection
+                return current_idx, options[current_idx]
+    except (KeyboardInterrupt, EOFError):
+        # Move cursor past menu
+        print(chr(27) + f"[{len(options) - current_idx}B", end="")
+        print(chr(10) + chr(27) + "[0m")  # Reset colors
+        sys.exit(0)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def get_key():
+        """Read a single keypress."""
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == chr(27):  # Escape sequence
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "A":
+                        return "UP"
+                    elif ch3 == "B":
+                        return "DOWN"
+                    elif ch3 == "H":
+                        return "HOME"
+                    elif ch3 == "F":
+                        return "END"
+                    elif ch3 == "5":
+                        ch4 = sys.stdin.read(1)
+                        if ch4 == "~":
+                            return "PAGE_UP"
+                        return "PAGE_UP"
+                    elif ch3 == "6":
+                        ch4 = sys.stdin.read(1)
+                        if ch4 == "~":
+                            return "PAGE_DOWN"
+                        return "PAGE_DOWN"
+                elif ch2 == "O":
+                    ch3 = sys.stdin.read(1)
+                    return ch3
+            elif ch == chr(13) or ch == chr(10):
+                return "ENTER"
+            elif ch == chr(3):  # Ctrl+C
+                raise KeyboardInterrupt
+            elif ch == chr(4):  # Ctrl+D
+                raise EOFError
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def render_menu(selected_idx, top_idx, visible_count):
+        """
+        Render menu with stable cursor positioning.
+        Ensures selected_idx is always visible within [top_idx, top_idx + visible_count).
+        Uses cursor save/restore to avoid position drift.
+        """
+        # Calculate visible range - ensure selected_idx is always visible
+        ideal_top = max(0, min(selected_idx - visible_count // 2, selected_idx))
+        max_top = max(0, len(options) - visible_count)
+        top_idx = max(0, min(ideal_top, max_top))
+
+        # Calculate visible range
+        start = top_idx
+        end = min(len(options), top_idx + visible_count)
+
+        # Save cursor position
+        print(chr(27) + "s", end="")
+        # Move to first option line (after prompt/help area)
+        print(chr(27) + f"[{visible_count + 2}A", end="")
+        # Clear from cursor to end of screen
+        print(chr(27) + "[J", end="")
+        # Print visible options
+        for i in range(start, end):
+            if i == selected_idx:
+                print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+            else:
+                print(f"  {options[i]}")
+        # Print remaining options if any
+        if end < len(options):
+            print(f"  ... ({len(options) - end} more)")
+        # Restore cursor position
+        print(chr(27) + "u", end="")
+        sys.stdout.flush()
+
+    # Determine terminal height
+    try:
+        term_rows = int(os.popen("stty size").read().split()[1])
+    except:
+        term_rows = 20  # fallback
+    visible_count = min(term_rows - 4, len(options))  # leave room for prompt/border
+
+    print(prompt)
+    # Initial render - show first visible options
+    visible_start = start_idx
+    visible_end = min(len(options), start_idx + visible_count)
+    for i in range(visible_start, visible_end):
+        if i == start_idx:
+            print(chr(27) + "[94m" + chr(27) + "[1m" + "→ " + options[i] + chr(27) + "[0m")
+        else:
+            print(f"  {options[i]}")
+    sys.stdout.flush()
+
+    current_idx = start_idx
+    top_idx = start_idx  # first visible option index
+
+    try:
+        while True:
+            key = get_key()
+            if key == "UP":
+                if current_idx > 0:
+                    current_idx -= 1
+                    # Keep selection visible
+                    if current_idx < top_idx:
+                        top_idx = current_idx
+                    top_idx = max(0, top_idx)
+                    render_menu(current_idx, top_idx, visible_count)
+            elif key == "DOWN":
+                if current_idx < len(options) - 1:
+                    current_idx += 1
+                    # Keep selection visible
+                    if current_idx >= top_idx + visible_count:
+                        top_idx = current_idx - visible_count + 1
+                    top_idx = min(top_idx, max(0, len(options) - visible_count))
+                    render_menu(current_idx, top_idx, visible_count)
+            elif key == "PAGE_DOWN":
+                # Page down: move selection down by one page
+                page_size = visible_count - 2  # leave room
+                current_idx = min(len(options) - 1, current_idx + page_size)
+                top_idx = min(current_idx, len(options) - visible_count)
+                top_idx = max(0, top_idx)
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "PAGE_UP":
+                # Page up: move selection up by one page
+                page_size = visible_count - 2
+                current_idx = max(0, current_idx - page_size)
+                top_idx = min(current_idx, len(options) - visible_count)
+                top_idx = max(0, top_idx)
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "HOME":
+                current_idx = 0
+                top_idx = 0
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "END":
+                current_idx = len(options) - 1
+                top_idx = max(0, len(options) - visible_count)
+                render_menu(current_idx, top_idx, visible_count)
+            elif key == "ENTER":
+                # Move cursor past menu to end
+                print(chr(27) + f"[{len(options) - current_idx}B", end="")
+                print()  # New line after selection
+                return current_idx, options[current_idx]
+    except (KeyboardInterrupt, EOFError):
+        # Move cursor past menu
+        print(chr(27) + f"[{len(options) - current_idx}B", end="")
+        print(chr(10) + chr(27) + "[0m")  # Reset colors
+        sys.exit(0)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def get_key():
         """Read a single keypress."""
