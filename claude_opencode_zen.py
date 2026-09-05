@@ -775,7 +775,7 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
         return selected, options[selected - 1] if selected else (None, None, favorites)
 
     terminal_height = _terminal_height()
-    visible_count = max(3, min(terminal_height - 4, len(options)))
+    visible_count = max(3, min(terminal_height - 6, len(options)))
     # Clamp start_idx to valid range
     start_idx = max(0, min(start_idx, len(options) - 1))
     current = [start_idx, 0]  # use list for closure mutability: [0]=idx, [1]=view (0=full, 1=favorites)
@@ -1011,7 +1011,7 @@ def get_selection_input(prompt, max_val):
             sys.exit(0)
 
 
-def display_and_select(standard, free, combined):
+def display_and_select(standard, free, combined, args=None):
     """Display the model list with numbers and get user selection."""
     print("\n========================================")
     print("       OPENCODE ZEN CHAT MODELS       ")
@@ -1060,14 +1060,35 @@ def display_and_select(standard, free, combined):
     current_favorites = load_favorites()
 
     # Use arrow key selector
-    print("\nUse ↑/↓ arrows to navigate, Enter to select:")
-    selected_idx, selected_model, current_favorites = arrow_key_selector(
-        display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
-    )
-    if selected_idx is None:
-        print("\n👋 No model selected. Exiting.")
-        sys.exit(0)
-    selected_model = combined[selected_idx].get("id", "")
+    # If --accept-all-defaults, auto-select the last used model from cache
+    if args.accept_all_defaults:
+        last_model = load_last_model()
+        if last_model:
+            # Find the index of last_model
+            for i, m in enumerate(combined):
+                if m.get("id") == last_model:
+                    selected_idx = i
+                    break
+            else:
+                selected_idx = 0  # fallback to first model
+        else:
+            print("\nUse ↑/↓ arrows to navigate, Enter to select:")
+            selected_idx, selected_model, current_favorites = arrow_key_selector(
+                display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
+            )
+        if selected_idx is None:
+            print("\n👋 No model selected. Exiting.")
+            sys.exit(0)
+        selected_model = combined[selected_idx].get("id", "")
+    else:
+        print("\nUse ↑/↓ arrows to navigate, Enter to select:")
+        selected_idx, selected_model, current_favorites = arrow_key_selector(
+            display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
+        )
+        if selected_idx is None:
+            print("\n👋 No model selected. Exiting.")
+            sys.exit(0)
+        selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
 
     # Save last model
@@ -1084,7 +1105,7 @@ def display_and_select(standard, free, combined):
     return selected_model, model_data
 
 
-def get_context_window(selected_model, model_data):
+def get_context_window(selected_model, model_data, args=None):
     """Prompt user for context window with a menu-based selection.
 
     The menu shows:
@@ -1119,7 +1140,10 @@ def get_context_window(selected_model, model_data):
     print(f"\n   [0] Cancel")
 
     try:
-        choice = input(f"\n📏 Select context window [0-{len(options)}] (ENTER = default, custom number for option {len(options)}): ").strip()
+        if args.accept_all_defaults:
+            choice = "1"  # Auto-accept detected context window default
+        else:
+            choice = input(f"\n📏 Select context window [0-{len(options)}] (ENTER = default, custom number for option {len(options)}): ").strip()
         if not choice:
             # ENTER accepts the default:
             #   – last used cached value (option 2 if available)
@@ -1782,10 +1806,10 @@ def main():
     all_raw_models = fetch_models(api_key)
 
     standard, free, combined = categorize_models(all_raw_models)
-    selected_model, model_data = display_and_select(standard, free, combined)
+    selected_model, model_data = display_and_select(standard, free, combined, args)
 
     # Prompt for context window
-    context_window = get_context_window(selected_model, model_data)
+    context_window = get_context_window(selected_model, model_data, args)
 
     # Prompt for auto-compaction threshold after context window is selected.
     # Default = cached per-model value if available, else AUTO_COMPACTION_THRESHOLD.
