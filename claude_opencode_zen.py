@@ -1792,6 +1792,36 @@ def main():
     # Prompt for context window
     context_window = get_context_window(selected_model, model_data)
 
+    # Prompt for auto-compaction level after context window is selected
+    # Label: "Auto-Compaction Threshold %"
+    try:
+        compaction_input = input(f"\n🗜️  Auto-Compaction Threshold % [0-100, default: {AUTO_COMPACTION_THRESHOLD}% (ENTER to accept, custom number to set)]: ").strip()
+        if not compaction_input:
+            context_window_compaction = AUTO_COMPACTION_THRESHOLD
+        else:
+            try:
+                compaction_val = int(compaction_input)
+                if 0 <= compaction_val <= 100:
+                    context_window_compaction = compaction_val
+                else:
+                    print(f"   ⚠️  Value must be 0-100, using default: {AUTO_COMPACTION_THRESHOLD}%")
+                    context_window_compaction = AUTO_COMPACTION_THRESHOLD
+            except ValueError:
+                print(f"   ⚠️  Invalid number, using default: {AUTO_COMPACTION_THRESHOLD}%")
+                context_window_compaction = AUTO_COMPACTION_THRESHOLD
+
+        # Cache the compaction setting
+        try:
+            current_fav = load_favorites()
+            current_fav.add(f"compaction={context_window_compaction}")
+            save_favorites(current_fav)
+        except Exception:
+            pass
+
+        print(f"   ✅ Auto-compaction set to {context_window_compaction}%")
+    except (EOFError, KeyboardInterrupt):
+        print(f"   Using default auto-compaction: {AUTO_COMPACTION_THRESHOLD}%")
+
     # Generate config and start the proxy FIRST, then validate the connection
     # through the proxy. (check_model_access requires a live proxy, so it can't
     # run before start_proxy().)
