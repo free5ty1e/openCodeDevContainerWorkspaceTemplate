@@ -180,7 +180,6 @@ if [ "$MODE" = full ]; then
   seg "🎚️ " "$effort"
   [ "$thinking" = true ] && seg "💭 " "on" || seg "💭 " "off"
   seg "🌿 " "${branch}${dirty:+ ±$dirty}"
-  # seg "📁 " "$shortdir"
   [ "$style" != "default" ] && [ -n "$style" ] && seg "🎨 " "$style"
   [ "$fast" = true ] && seg "⚡ " "fast"
   seg "📏 " "$(format_k "$winSize")"
@@ -196,10 +195,11 @@ if [ "$MODE" = full ]; then
     seg2 "💾 " "$(cache_hit)%"
   fi
   [ -n "$remain" ] && seg2 "📊 rem " "${remain}%"
+  seg2 "📁 " "$shortdir"
+  seg2 "🏷️ " "$ver"
   awk "BEGIN{exit !($cost > 0)}" 2>/dev/null && seg2 "💰 " "$(printf '$%.2f' "$cost")"
   [ -n "$rate5h" ] && seg2 "⏳5h " "${rate5h}%"
   [ -n "$rate7d" ] && seg2 "⏳7d " "${rate7d}%"
-  seg2 "🏷️ " "$ver"
   [ "$exceeds" = true ] && seg2 "⚠️ " "200k"
 
   [ -n "$L1" ] && printf '%s\n' "$L1"
