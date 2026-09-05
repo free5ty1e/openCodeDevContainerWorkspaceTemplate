@@ -140,9 +140,9 @@ def ensure_claude_cli(args=None):
         print(f"   Latest claude CLI version: {latest_version}")
     print()
 
-    # If --accept-all-defaults, auto-assume user wants to upgrade if a newer version exists
+    # If --accept-all-defaults, auto-assume user DECLINES upgrade (default NO)
     if args and args.accept_all_defaults:
-        resp = "y" if latest_version and latest_version != current_version else "n"
+        resp = "n"
     else:
         # Prompt for upgrade showing versions
         try:
