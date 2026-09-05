@@ -123,22 +123,62 @@ def ensure_claude_cli(args=None):
     if rc == 0:
         current_version = out.strip()
         print(f"   Current claude CLI version: {current_version}")
-    # If --accept-all-defaults, skip the upgrade prompt and assume user declined
-    if args and args.accept_all_defaults:
-        resp = "n"
     else:
-        # Prompt for upgrade (handle EOF gracefully – default to 'n')
+        current_version = "not installed"
+
+    # Check latest version from npm (if available)
+    latest_version = ""
+    try:
+        rc3, out3 = _run(["npm", "view", "@anthropic-ai/claude-code", "version"], label="npm-view-latest")
+        if rc3 == 0 and out3.strip():
+            latest_version = out3.strip()
+    except Exception:
+        latest_version = ""
+
+    # Display version information
+    if latest_version:
+        print(f"   Latest claude CLI version: {latest_version}")
+    print()
+
+    # If --accept-all-defaults, auto-assume user wants to upgrade if a newer version exists
+    if args and args.accept_all_defaults:
+        resp = "y" if latest_version and latest_version != current_version else "n"
+    else:
+        # Prompt for upgrade showing versions
         try:
-            resp = input("   Check for Claude CLI upgrade? (y/N): ").strip().lower()
+            resp = input(f"   Upgrade from {current_version} to {latest_version or 'latest'}? (y/N): ").strip().lower()
         except EOFError:
             resp = "n"
-    if resp == "y":
+
+    if resp == "y" and latest_version and latest_version != current_version:
         print("   Upgrading claude CLI via npm...")
-        _run(["npm", "install", "-g", "@anthropic-ai/claude-code@latest"], label="cli-upgrade")
-        # Re-verify
+        # Try npm install with --legacy-peer-deps to handle devcontainer environments
+        upgrade_cmd = ["npm", "install", "-g", "--legacy-peer-deps", "@anthropic-ai/claude-code"]
+        upgrade_rc, upgrade_out = _run(upgrade_cmd, label="cli-upgrade")
+
+        # Handle ENOTEMPTY/EPIPE errors common in devcontainers
+        if upgrade_rc != 0 and ("ENOTEMPTY" in upgrade_out or "EPIPE" in upgrade_out):
+            print("   Upgrade encountered directory issues - attempting cleanup...")
+            cleanup_cmd = ["npm", "bin", "cache", "clean", "--force"]
+            _run(cleanup_cmd, label="npm-cache-clean")
+            # Retry the upgrade
+            upgrade_rc, upgrade_out = _run(upgrade_cmd, label="cli-upgrade-retry")
+
+        # Re-verify version after upgrade attempt
         rc2, out2 = _run(["claude", "--version"], label="cli-version-after")
         if rc2 == 0:
-            print(f"   New claude CLI version: {out2.strip()}")
+            new_version = out2.strip()
+            print(f"   New claude CLI version: {new_version}")
+            # Verify the native binary is working
+            if _claude_version_ok():
+                print("   ✅ claude CLI upgraded and working.")
+            else:
+                print("   ⚠️  claude CLI upgraded but native binary may need fixing:")
+                print("      Run: node <install_dir>/install.cjs")
+        else:
+            print("   ⚠️  Upgrade failed - version check after install failed.")
+    elif resp == "y" and (not latest_version or latest_version == current_version):
+        print("   claude CLI is already up to date.")
     # Continue with existing logic (return True if already okay)
     if _claude_version_ok():
         return True
