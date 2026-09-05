@@ -1103,36 +1103,63 @@ def display_and_select(standard, free, combined, args=None):
     # Load favorites before selection
     current_favorites = load_favorites()
 
-    # Use arrow key selector
-    # If --accept-all-defaults, auto-select the last used model from cache
-    if args.accept_all_defaults:
+    # Use model selection method
+    if args and args.numeric_model_menu:
+        # TTY mode: show numbered list and prompt for number
+        print("\nUse number selection to choose a model:")
+        # Pre-populate with last used model as default
+        default_num = None
         last_model = load_last_model()
         if last_model:
-            # Find the index of last_model
             for i, m in enumerate(combined):
                 if m.get("id") == last_model:
-                    selected_idx = i
+                    default_num = i + 1  # 1-based for display
                     break
+
+        selected_idx = None
+        if default_num:
+            print(f"   (default: {default_num} - {last_model or 'last used'})")
+
+        try:
+            sel = input(f"   Enter model number (1-{len(combined)}): ").strip()
+            if sel and int(sel) > 0 and int(sel) <= len(combined):
+                selected_idx = int(sel) - 1
+            elif not sel and default_num:
+                selected_idx = default_num - 1
+        except (ValueError, KeyboardInterrupt):
+            print("\n👋 Cancelled by user.")
+            sys.exit(0)
+
+        if selected_idx is None:
+            print("\n👋 No model selected. Exiting.")
+            sys.exit(0)
+
+        selected_model = combined[selected_idx].get("id", "")
+        selected_favorites = current_favorites
+    else:
+        # If --accept-all-defaults, auto-select the last used model from cache
+        if args and args.accept_all_defaults:
+            last_model = load_last_model()
+            if last_model:
+                for i, m in enumerate(combined):
+                    if m.get("id") == last_model:
+                        selected_idx = i
+                        break
+                else:
+                    selected_idx = 0
             else:
-                selected_idx = 0  # fallback to first model
+                selected_idx = None
         else:
             print("\nUse ↑/↓ arrows to navigate, Enter to select:")
             selected_idx, selected_model, current_favorites = arrow_key_selector(
                 display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
             )
+
         if selected_idx is None:
             print("\n👋 No model selected. Exiting.")
             sys.exit(0)
         selected_model = combined[selected_idx].get("id", "")
-    else:
-        print("\nUse ↑/↓ arrows to navigate, Enter to select:")
-        selected_idx, selected_model, current_favorites = arrow_key_selector(
-            display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
-        )
-        if selected_idx is None:
-            print("\n👋 No model selected. Exiting.")
-            sys.exit(0)
-        selected_model = combined[selected_idx].get("id", "")
+        selected_favorites = current_favorites
     print(f"\n🚀 Selected Model: {selected_model}")
 
     # Save last model
@@ -1835,6 +1862,12 @@ def main():
         default=False,
         help="Auto-accept cached/default values for all prompts (quick re-launch)",
     )
+    parser.add_argument(
+        "--numeric-model-menu",
+        action="store_true",
+        default=False,
+        help="Force TTY model menu with number selection instead of arrow-key selector",
+    )
     args = parser.parse_args()
 
     print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
@@ -1889,19 +1922,32 @@ def main():
 
     # === NEW: Prompt for statusline mode after auto-compaction ===
     # Default to cached value if available, otherwise fall back to 'full'
+    # Use numeric prompt: 1 = compact (1 line), 2 = full (2 lines)
     cached_mode = load_statusline_mode()
-    default_mode = cached_mode if cached_mode in ("full", "compact") else "full"
-    if args.accept_all_defaults:
-        selected_mode = default_mode
+    if cached_mode == "compact":
+        default_num = 1
+    elif cached_mode == "full":
+        default_num = 2
+    else:
+        default_num = 2  # default to full if no cache
+
+    if args and args.accept_all_defaults:
+        selected_mode = "compact" if default_num == 1 else "full"
         print(f"   ✅ Using cached statusline mode: {selected_mode} (accept-all-defaults)")
     else:
-        mode_input = input(f"\n📏 Statusline Mode [full/2-line or compact/1-line, default: {default_mode} (ENTER to accept)]: ").strip()
-        if not mode_input:
-            selected_mode = default_mode
-        elif mode_input in ("full", "compact"):
-            selected_mode = mode_input
-        else:
-            selected_mode = default_mode
+        try:
+            mode_sel = input(f"\n📏 Statusline style [1=compact 1-line, 2=full 2-line, default: {default_num}]: ").strip()
+            if not mode_sel:
+                mode_sel = str(default_num)
+            mode_num = int(mode_sel)
+            if mode_num == 1:
+                selected_mode = "compact"
+            elif mode_num == 2:
+                selected_mode = "full"
+            else:
+                selected_mode = "full" if default_num == 2 else "compact"
+        except (ValueError, TypeError):
+            selected_mode = "full" if default_num == 2 else "compact"
     # Save the chosen mode for next time
     save_statusline_mode(selected_mode)
     # End new section
