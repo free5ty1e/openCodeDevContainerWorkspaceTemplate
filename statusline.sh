@@ -30,6 +30,15 @@ fi
 MODE="${ZEN_STATUSLINE_MODE:-full}"
 case "$MODE" in compact|one|1|single) MODE=compact ;; *) MODE=full ;; esac
 
+# Provider: prefer CLAUDE_CODE_PROVIDER env var (set by launch scripts), fall back to JSON .provider
+PROVIDER_ENV="${CLAUDE_CODE_PROVIDER:-}"
+# Use env var if set and non-empty/whitespace, otherwise use JSON value
+if [ -n "$PROVIDER_ENV" ] && [ "$PROVIDER_ENV" != " " ] && [ "$PROVIDER_ENV" != "" ]; then
+  provider="$PROVIDER_ENV"
+else
+  provider="$(.provider // \"n/a\")"
+fi
+
 # ---- Single jq pass -> SOH-delimited, null-safe values ------------------------
 # We use \x01 (SOH) as the delimiter instead of tab because bash `read`
 # collapses consecutive tab delimiters, which breaks field alignment when
@@ -187,6 +196,13 @@ if [ "$MODE" = full ]; then
   L2=""
   seg2() { [ -n "$2" ] && L2="${L2}${L2:+$SEP}$1$2"; }
   seg2 "" "$(ctx_seg)"
+  # Total session token count (input + output)
+  total_tokens=$(( inTok + outTok ))
+  total_str=""
+  if [ "$total_tokens" -gt 0 ] 2>/dev/null; then
+    total_str="$(format_k $total_tokens)"
+  fi
+  [ -n "$total_str" ] && L2="${L2}${L2:+$SEP}📊 total ${total_str}"
   seg2 "" "$(ctx_compaction_seg)"
   if [ "${inTok:-0}" -gt 0 ] || [ "${outTok:-0}" -gt 0 ]; then
     seg2 "📥📤 " "$(format_k "$inTok")/$(format_k "$outTok")"

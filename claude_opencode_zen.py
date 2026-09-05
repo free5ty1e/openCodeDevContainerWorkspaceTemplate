@@ -21,6 +21,7 @@ CONTEXT_CACHE_FILE = os.path.expanduser("~/.claude_opencode_last_context")
 FAVORITES_CACHE_FILE = os.path.expanduser("~/.claude_opencode_favorites")
 CONTEXT_WINDOW_CACHE_DIR = os.path.expanduser("~/.claude_opencode_context_windows")
 PROVIDER_INDICATOR = "opencode"  # For statusline to identify provider
+STATUSLINE_MODE_CACHE_FILE = os.path.expanduser("~/.claude_opencode_statusline_mode")
 AUTO_COMPACTION_THRESHOLD = 91  # Auto-compaction when usage >= this percentage
 PROXY_PORT = 4501
 PROXY_MASTER_KEY = "sk-opencode-bridge"
@@ -547,6 +548,30 @@ def save_model_compaction(model_id, threshold):
         pass
 
 
+# ─── Statusline mode cache (1-line "compact" vs 2-line "full") ───────────────────────────────────────────────
+def load_statusline_mode():
+    """Load the last used statusline mode ('full' or 'compact') from cache."""
+    if os.path.exists(STATUSLINE_MODE_CACHE_FILE):
+        try:
+            with open(STATUSLINE_MODE_CACHE_FILE, "r") as f:
+                val = f.read().strip().lower()
+                if val in ("full", "compact"):
+                    return val
+        except OSError:
+            pass
+    return None
+
+
+def save_statusline_mode(mode):
+    """Save the last used statusline mode ('full' or 'compact') to cache."""
+    try:
+        os.makedirs(os.path.dirname(STATUSLINE_MODE_CACHE_FILE), exist_ok=True)
+        with open(STATUSLINE_MODE_CACHE_FILE, "w") as f:
+            f.write(mode)
+    except OSError:
+        pass
+
+
 # ─── Favorites cache ───────────────────────────────────────────────────────────────────────────────────────────────
 def load_favorites():
     """Load the set of favorite model IDs from cache."""
@@ -734,7 +759,9 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
     Interactive arrow-key selector using prompt_toolkit.
 
     Returns (selected_index, selected_option, updated_favorites) or (None, None, None) on cancel.
-    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, ENTER, ESC, and SPACE to toggle favorites.
+    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, LEFT/RIGHT to toggle views,
+    ENTER, ESC, and SPACE to toggle favorites.
+    LEFT cycles to favorites-only view; RIGHT cycles back to full model list.
     The highlighted item is always kept visible via auto-scrolling.
     Favorites are shown with ★ prefix; SPACE toggles favorite status.
     """
@@ -751,49 +778,68 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
     visible_count = max(3, min(terminal_height - 4, len(options)))
     # Clamp start_idx to valid range
     start_idx = max(0, min(start_idx, len(options) - 1))
-    current = [start_idx]  # use list for closure mutability
+    current = [start_idx, 0]  # use list for closure mutability: [0]=idx, [1]=view (0=full, 1=favorites)
     result = [None, None, None]  # use list for closure mutability: [0]=idx, [1]=model, [2]=favorites
 
     # Ensure favorites is a set
     if favorites is None:
         favorites = set()
 
-    def get_top_idx():
-        """Calculate the top visible index so current selection is always visible."""
+    def build_options():
+        """Build display entries for the current view mode (reads current[1])."""
+        view_mode = current[1]
+        if view_mode == 0:
+            # Full list - all options with their original indices
+            return [{"type": "model", "id": opt, "idx": i} for i, opt in enumerate(options)]
+        else:
+            # Favorites-only view - show only favorited models
+            fav_entries = []
+            for i, opt in enumerate(options):
+                if opt in favorites:
+                    fav_entries.append({"type": "model", "id": opt, "idx": i})
+            return fav_entries
+
+    def get_formatted_options():
+        """Return formatted text for the list, recalculated on each render."""
+        opts = build_options()
+        view_mode = current[1]
         top = current[0] - (current[0] % visible_count)
-        top = max(0, min(top, max(0, len(options) - visible_count)))
+        top = max(0, min(top, max(0, len(opts) - visible_count)))
         if current[0] < top:
             top = current[0]
         elif current[0] >= top + visible_count:
             top = current[0] - visible_count + 1
-        return top
 
-    def get_formatted_options():
-        """Return formatted text for the list, recalculated on each render.
-
-        Returns a list of (style, text) tuples — the format expected by
-        FormattedTextControl. Each line ends with a newline so the control
-        renders multi-line content correctly.
-        """
-        top = get_top_idx()
         fragments = []
 
-        # Prompt + instructions
-        fragments.append(("class:prompt", prompt + "\n"))
-        fragments.append(("class:hint", "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump • Enter select • SPACE toggle favorite • Esc cancel\n"))
+        # Prompt + instructions showing current view
+        if view_mode == 0:
+            view_label = "Full List"
+        else:
+            visible_favs = len([e for e in build_options() if e is not None])
+            view_label = f"Favorites ({visible_favs} fav)"
+        fragments.append(("class:prompt", prompt + f"  ({view_label}) • "))
+
+        # Navigation and view toggle hints
+        if view_mode == 0:
+            frag_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
+        else:
+            frag_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
+        fragments.append(("class:hint", frag_text + "\n"))
 
         items_above = top
-        items_below = len(options) - (top + visible_count)
+        items_below = len(opts) - (top + visible_count)
 
-        for i in range(top, min(top + visible_count, len(options))):
+        for i in range(top, min(top + visible_count, len(opts))):
             if i == current[0]:
-                # Currently highlighted item
-                model_id = options[i]
+                entry = opts[i]
+                model_id = entry["id"]
                 is_fav = model_id in favorites
                 prefix = "★ " if is_fav else "  "
                 fragments.append(("class:current", f"  {prefix}{model_id}\n"))
             else:
-                model_id = options[i]
+                entry = opts[i]
+                model_id = entry["id"]
                 is_fav = model_id in favorites
                 prefix = "★ " if is_fav else "  "
                 fragments.append(("class:normal", f"    {prefix}{model_id}\n"))
@@ -817,27 +863,19 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
 
     @kb.add("down")
     def _(event):
-        if current[0] < len(options) - 1:
+        opts_len = len(build_options())
+        if current[0] < opts_len - 1:
             current[0] += 1
-
-    @kb.add("space")
-    def _(event):
-        """Toggle favorite status of the current model."""
-        model_id = options[current[0]]
-        if model_id in favorites:
-            favorites.discard(model_id)
-        else:
-            favorites.add(model_id)
 
     @kb.add("pageup")
     def _(event):
-        page = min(visible_count - 1, len(options))
+        page = min(visible_count - 1, len(build_options()))
         current[0] = max(0, current[0] - page)
 
     @kb.add("pagedown")
     def _(event):
-        page = min(visible_count - 1, len(options))
-        current[0] = min(len(options) - 1, current[0] + page)
+        page = min(visible_count - 1, len(build_options()))
+        current[0] = min(len(build_options()) - 1, current[0] + page)
 
     @kb.add("home")
     def _(event):
@@ -845,14 +883,40 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
 
     @kb.add("end")
     def _(event):
-        current[0] = len(options) - 1
+        opts_len = len(build_options())
+        current[0] = opts_len - 1 if opts_len > 0 else 0
+
+    @kb.add("left")
+    def _(event):
+        """Cycle to favorites-only view."""
+        if current[1] != 1:
+            current[1] = 1
+            current[0] = min(current[0], len(build_options()) - 1) if build_options() else 0
+
+    @kb.add("right")
+    def _(event):
+        """Cycle back to full model list view."""
+        if current[1] != 0:
+            current[1] = 0
+            current[0] = min(current[0], len(options) - 1)
 
     @kb.add("enter")
     def _(event):
         result[0] = current[0]
-        # Save favorites when selecting
+        # Save favorites state when selecting
         result[2] = favorites
         event.app.exit()
+
+    @kb.add("space")
+    def _(event):
+        """Toggle favorite status of the current model."""
+        opts = build_options()
+        if current[0] < len(opts):
+            model_id = opts[current[0]]["id"]
+            if model_id in favorites:
+                favorites.discard(model_id)
+            else:
+                favorites.add(model_id)
 
     @kb.add("escape")
     def _(event):
@@ -885,103 +949,21 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
     app.run()
 
     if result[0] is not None:
-        return result[0], options[result[0]], result[2]
+        # Map the selected index back to the original options list
+        selected_idx = result[0]
+        # Always return 3 values: (selected_index, selected_option, updated_favorites)
+        # If in favorites view, map back to original model index
+        if current[1] == 1:
+            # Find the selection in the favorites entries and map to original index
+            fav_entries = build_options()
+            if selected_idx < len(fav_entries):
+                orig_idx = fav_entries[selected_idx]["idx"]
+                return orig_idx, options[orig_idx] if orig_idx < len(options) else options[0], favorites
+            # Fallback if selection not in favorites
+            return 0, options[0] if options else None, favorites
+        # In full view, just return the selected index with its option and current favorites
+        return selected_idx, options[selected_idx] if selected_idx < len(options) else options[0] if options else None, favorites
     return None, None, None
-    visible_count = max(3, min(terminal_height - 4, len(options)))
-    # Clamp start_idx to valid range
-    start_idx = max(0, min(start_idx, len(options) - 1))
-    current = [start_idx]  # use list for closure mutability
-    result = [None, None, None]  # use list for closure mutability: [0]=idx, [1]=model, [2]=favorites
-
-    def get_top_idx():
-        """Calculate the top visible index so current selection is always visible."""
-        top = current[0] - (current[0] % visible_count)
-        top = max(0, min(top, max(0, len(options) - visible_count)))
-        if current[0] < top:
-            top = current[0]
-        elif current[0] >= top + visible_count:
-            top = current[0] - visible_count + 1
-        return top
-
-    def get_formatted_options():
-        """Return formatted text for the list, recalculated on each render.
-
-        Returns a list of (style, text) tuples — the format expected by
-        FormattedTextControl. Each line ends with a newline so the control
-        renders multi-line content correctly.
-        """
-        top = get_top_idx()
-        fragments = []
-
-        # Prompt + instructions
-        fragments.append(("class:prompt", prompt + "\n"))
-        fragments.append(("class:hint", "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump • Enter select • Esc cancel\n"))
-
-        items_above = top
-        items_below = len(options) - (top + visible_count)
-
-        for i in range(top, min(top + visible_count, len(options))):
-            if i == current[0]:
-                fragments.append(("class:current", f"  → {options[i]}\n"))
-            else:
-                fragments.append(("class:normal", f"    {options[i]}\n"))
-
-        if items_above > 0 or items_below > 0:
-            hint_parts = []
-            if items_above > 0:
-                hint_parts.append(f"{items_above} above")
-            if items_below > 0:
-                hint_parts.append(f"{items_below} below")
-            fragments.append(("class:hint", "  " + " ".join(hint_parts) + "\n"))
-
-        return fragments
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        if current[0] > 0:
-            current[0] -= 1
-
-    @kb.add("down")
-    def _(event):
-        if current[0] < len(options) - 1:
-            current[0] += 1
-
-    @kb.add("pageup")
-    def _(event):
-        page = min(visible_count - 1, len(options))
-        current[0] = max(0, current[0] - page)
-
-    @kb.add("pagedown")
-    def _(event):
-        page = min(visible_count - 1, len(options))
-        current[0] = min(len(options) - 1, current[0] + page)
-
-    @kb.add("home")
-    def _(event):
-        current[0] = 0
-
-    @kb.add("end")
-    def _(event):
-        current[0] = len(options) - 1
-
-    @kb.add("enter")
-    def _(event):
-        result[0] = current[0]
-        event.app.exit()
-
-    @kb.add("escape")
-    def _(event):
-        result[0] = None
-        event.app.exit()
-
-    control = FormattedTextControl(get_formatted_options)
-    window = Window(
-        content=control,
-        height=max(visible_count + 4, 8),
-        always_hide_cursor=True,
-    )
 
     style = Style.from_dict({
         "current": "reverse",        # highlighted (selected) item
@@ -1686,6 +1668,16 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
     # Use the per-model cached value if provided, else the default.
     compaction_value = compaction_threshold if compaction_threshold is not None else AUTO_COMPACTION_THRESHOLD
     env["CLAUDE_CODE_COMPACTION_LEVEL"] = str(compaction_value)
+    # Set provider env var for statusline.sh - use the provider indicator from config
+    env["CLAUDE_CODE_PROVIDER"] = "openai"
+    # Set statusline mode env var
+    # Read from cache; if not set, statusline.sh will default based on JSON payload
+    statusline_mode = load_statusline_mode()
+    if statusline_mode == "compact":
+        env["CLAUDE_CODE_STATUSLINE_MODE"] = "compact"
+    elif statusline_mode == "full":
+        env["CLAUDE_CODE_STATUSLINE_MODE"] = "full"
+    # If no cached mode, leave unset and statusline.sh will use its normal logic
 
     # Set up Claude Code persistence so sessions survive devcontainer rebuilds
     setup_claude_persistence()
@@ -1767,6 +1759,12 @@ def main():
         default=False,
         help="Clear the cached OpenCode API key and prompt again",
     )
+    parser.add_argument(
+        "--accept-all-defaults",
+        action="store_true",
+        default=False,
+        help="Auto-accept cached/default values for all prompts (quick re-launch)",
+    )
     args = parser.parse_args()
 
     print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
@@ -1793,7 +1791,10 @@ def main():
     cached_compaction = load_model_compaction(selected_model)
     default_compaction = cached_compaction if cached_compaction is not None else AUTO_COMPACTION_THRESHOLD
     try:
-        compaction_input = input(f"\n🗜️  Auto-Compaction Threshold % [0-100, default: {default_compaction}% (ENTER to accept, custom number to set)]: ").strip()
+        if args.accept_all_defaults:
+            compaction_input = ""
+        else:
+            compaction_input = input(f"\n🗜️  Auto-Compaction Threshold % [0-100, default: {default_compaction}% (ENTER to accept, custom number to set)]: ").strip()
         if not compaction_input:
             context_window_compaction = default_compaction
         else:
@@ -1815,6 +1816,29 @@ def main():
     except (EOFError, KeyboardInterrupt):
         context_window_compaction = default_compaction
         print(f"   Using default auto-compaction: {default_compaction}%")
+
+    # === NEW: Prompt for statusline mode after auto-compaction ===
+    # Default to cached value if available, otherwise fall back to 'full'
+    cached_mode = load_statusline_mode()
+    default_mode = cached_mode if cached_mode in ("full", "compact") else "full"
+    if args.accept_all_defaults:
+        selected_mode = default_mode
+        print(f"   ✅ Using cached statusline mode: {selected_mode} (accept-all-defaults)")
+    else:
+        mode_input = input(f"\n📏 Statusline Mode [full/2-line or compact/1-line, default: {default_mode} (ENTER to accept)]: ").strip()
+        if not mode_input:
+            selected_mode = default_mode
+        elif mode_input in ("full", "compact"):
+            selected_mode = mode_input
+        else:
+            selected_mode = default_mode
+    # Save the chosen mode for next time
+    save_statusline_mode(selected_mode)
+    # End new section
+
+    # Set provider env var for statusline.sh
+    # Use PROVIDER_INDICATOR or derive from API base URL
+    provider_name = PROVIDER_INDICATOR  # "opencode" by default, but could be overridden
 
     # Generate config and start the proxy FIRST, then validate the connection
     # through the proxy. (check_model_access requires a live proxy, so it can't
