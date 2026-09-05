@@ -1110,9 +1110,15 @@ def get_context_window(selected_model, model_data):
     print(f"\n   [0] Cancel")
 
     try:
-        choice = input(f"\nSelect context window [0-{len(options)}]: ").strip()
+        choice = input(f"\n📏 Select context window [0-{len(options)}] (ENTER = default, custom number for option {len(options)}): ").strip()
         if not choice:
-            choice = "1"  # Default to first option
+            # ENTER accepts the default:
+            #   – last used cached value (option 2 if available)
+            #   – otherwise the detected context window (option 1)
+            if model_cached_ctx:
+                choice = "2"  # Last Used Context Window
+            else:
+                choice = "1"  # Detected Context Window
     except (EOFError, KeyboardInterrupt):
         print("\n👋 Cancelled by user.")
         return default_ctx
