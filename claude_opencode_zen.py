@@ -1795,10 +1795,8 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
 
 
 # ─── Usage Notes ─────────────────────────────────────────────────────────
-def print_usage_notes(dangerously_skip_permissions=False):
+def print_usage_notes(dangerously_skip_permissions=False, args=None):
     """Print usage notes and relevant environment variables."""
-    print("=" * 60)
-    print("  OpenCode Zen → Claude Code Bridge Script")
     print("=" * 60)
     print()
     print("📋  SCRIPT PURPOSE:")
@@ -1821,6 +1819,12 @@ def print_usage_notes(dangerously_skip_permissions=False):
         print("⚡  PERMISSIONS: Claude Code will show permission prompts")
         print("   (Use --dangerously-skip-permissions to skip these)")
     print()
+    print("⚡  PARAMETERS:")
+    print(f"   --dangerously-skip-permissions: {'PASSED' if dangerously_skip_permissions else 'NOT passed'}")
+    print(f"   --accept-all-defaults: {'PASSED' if args and args.accept_all_defaults else 'NOT passed'}")
+    print(f"   --numeric-model-menu: {'PASSED' if args and args.numeric_model_menu else 'NOT passed'}")
+    print(f"   --clear-api-key: {'PASSED' if args and args.clear_api_key else 'NOT passed'}")
+    print()
     print("🌐  HOW IT WORKS:")
     print("   Claude Code speaks the Anthropic Messages API (/v1/messages).")
     print("   OpenCode exposes its own API endpoint.")
@@ -1837,9 +1841,7 @@ def print_usage_notes(dangerously_skip_permissions=False):
     print()
     print("=" * 60)
     print()
-
-
-# ─── Main ────────────────────────────────────────────────────────────────
+    print("📦  PREREQUISITES (automatically checked/installed):")
 def main():
     parser = argparse.ArgumentParser(
         description="Bridge OpenCode Zen models with the Claude Code CLI"
@@ -1870,7 +1872,7 @@ def main():
     )
     args = parser.parse_args()
 
-    print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
+    print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions, args=args)
 
     if not ensure_prerequisites(args):
         print("❌ Prerequisites check failed. Exiting.")
