@@ -1067,19 +1067,10 @@ def display_and_select(standard, free, combined):
     if current_favorites:
         print(f"   Favorite models: {', '.join(sorted(current_favorites))}")
 
-    # Offer favorites toggle - only if there are models to show favorites for
-    if len(combined) > 0:
-        print(f"\n⭐ Toggle favorite status for models (SPACE to toggle, Enter to confirm):")
-        # Build a display list for favorites: just model IDs
-        fav_display = [m.get("id", "") for m in combined]
-        current_favorites = favorites_selector(fav_display, current_favorites)
-        # Re-identify the selected model
-        selected_model = combined[selected_idx].get("id", "")
-
     # Save last model
     save_last_model(selected_model)
 
-    # Save favorites
+    # Save favorites (persists what was toggled with SPACE during selection)
     save_favorites(current_favorites)
 
     # Get model data for the selected model
