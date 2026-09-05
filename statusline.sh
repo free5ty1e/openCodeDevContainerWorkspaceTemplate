@@ -175,15 +175,15 @@ if [ "$MODE" = full ]; then
   L1=""
   seg() { [ -n "$2" ] && L1="${L1}${L1:+$SEP}$1$2"; }
   seg "📦 " "$repo"
-  seg "🌿 " "${branch}${dirty:+ ±$dirty}"
-  seg "📁 " "$shortdir"
-  seg "🤖 " "$model"
   seg "🌐 " "$provider"
+  seg "🤖 " "$model"
   seg "🎚️ " "$effort"
-  seg "📏 " "$(format_k "$winSize")"
   [ "$thinking" = true ] && seg "💭 " "on" || seg "💭 " "off"
+  seg "🌿 " "${branch}${dirty:+ ±$dirty}"
+  # seg "📁 " "$shortdir"
   [ "$style" != "default" ] && [ -n "$style" ] && seg "🎨 " "$style"
   [ "$fast" = true ] && seg "⚡ " "fast"
+  seg "📏 " "$(format_k "$winSize")"
 
   L2=""
   seg2() { [ -n "$2" ] && L2="${L2}${L2:+$SEP}$1$2"; }

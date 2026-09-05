@@ -522,6 +522,31 @@ def save_model_context(model_id, context_window):
         pass
 
 
+# ─── Model-specific auto-compaction threshold cache ─────────────────────────────────────────────────────────────
+def load_model_compaction(model_id):
+    """Load the last auto-compaction threshold (%) for a specific model from cache."""
+    cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.compaction.txt")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_model_compaction(model_id, threshold):
+    """Save the auto-compaction threshold (%) for a specific model to cache."""
+    try:
+        os.makedirs(CONTEXT_WINDOW_CACHE_DIR, exist_ok=True)
+        cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.compaction.txt")
+        with open(cache_file, "w") as f:
+            f.write(str(threshold))
+    except OSError:
+        pass
+
+
 # ─── Favorites cache ───────────────────────────────────────────────────────────────────────────────────────────────
 def load_favorites():
     """Load the set of favorite model IDs from cache."""
@@ -1150,38 +1175,6 @@ def get_context_window(selected_model, model_data):
         print(f"\n   Using default: {default_ctx:,} tokens")
         return default_ctx
 
-    # Prompt for auto-compaction level
-    # Use configured default; optionally cache via favorites file with "compaction:" prefix
-    try:
-        compaction_input = input(f"\n🗜️  Auto-compaction level [0-100, default: {AUTO_COMPACTION_THRESHOLD}% (ENTER to accept, custom number to set)]: ").strip()
-        if not compaction_input:
-            context_window_compaction = AUTO_COMPACTION_THRESHOLD
-        else:
-            try:
-                compaction_val = int(compaction_input)
-                if 0 <= compaction_val <= 100:
-                    context_window_compaction = compaction_val
-                else:
-                    print(f"   ⚠️  Value must be 0-100, using default: {AUTO_COMPACTION_THRESHOLD}%")
-                    context_window_compaction = AUTO_COMPACTION_THRESHOLD
-            except ValueError:
-                print(f"   ⚠️  Invalid number, using default: {AUTO_COMPACTION_THRESHOLD}%")
-                context_window_compaction = AUTO_COMPACTION_THRESHOLD
-
-        # Optionally cache the compaction setting in the favorites file
-        # (keys prefixed with "compaction:" — does not interfere with model favorites)
-        try:
-            current_fav = load_favorites()
-            # Store as string so the set isn't corrupted; callers should ignore non-model IDs
-            current_fav.add(f"compaction={context_window_compaction}")
-            save_favorites(current_fav)
-        except Exception:
-            pass
-
-        print(f"   ✅ Auto-compaction set to {context_window_compaction}%")
-    except (EOFError, KeyboardInterrupt):
-        print(f"   Using default auto-compaction: {AUTO_COMPACTION_THRESHOLD}%")
-
 def check_model_access(selected_model, api_key):
     """Check model access using the litellm proxy test step.
     This validates that the selected model works via the local proxy.
@@ -1669,7 +1662,7 @@ def setup_statusline_symlink():
         print(f"⚠️  workspace statusline.sh not found at {workspace_statusline}")
 
 
-def launch_claude_with_model(selected_model, context_window, dangerously_skip_permissions=False):
+def launch_claude_with_model(selected_model, context_window, dangerously_skip_permissions=False, compaction_threshold=None):
     """Configure environment to use the litellm proxy and launch Claude Code."""
     # Build claude command with optional --dangerously-skip-permissions flag
     claude_cmd = ["claude"]
@@ -1689,8 +1682,10 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_window)
     # Don't let claude try to discover/switch to a gateway model.
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"
-    # Enable auto-compaction when context usage reaches threshold (e.g., 91%)
-    env["CLAUDE_CODE_COMPACTION_LEVEL"] = str(AUTO_COMPACTION_THRESHOLD)
+    # Enable auto-compaction when context usage reaches the configured threshold.
+    # Use the per-model cached value if provided, else the default.
+    compaction_value = compaction_threshold if compaction_threshold is not None else AUTO_COMPACTION_THRESHOLD
+    env["CLAUDE_CODE_COMPACTION_LEVEL"] = str(compaction_value)
 
     # Set up Claude Code persistence so sessions survive devcontainer rebuilds
     setup_claude_persistence()
@@ -1792,35 +1787,34 @@ def main():
     # Prompt for context window
     context_window = get_context_window(selected_model, model_data)
 
-    # Prompt for auto-compaction level after context window is selected
-    # Label: "Auto-Compaction Threshold %"
+    # Prompt for auto-compaction threshold after context window is selected.
+    # Default = cached per-model value if available, else AUTO_COMPACTION_THRESHOLD.
+    # User can press ENTER to accept the default, or type a custom 0-100 value.
+    cached_compaction = load_model_compaction(selected_model)
+    default_compaction = cached_compaction if cached_compaction is not None else AUTO_COMPACTION_THRESHOLD
     try:
-        compaction_input = input(f"\n🗜️  Auto-Compaction Threshold % [0-100, default: {AUTO_COMPACTION_THRESHOLD}% (ENTER to accept, custom number to set)]: ").strip()
+        compaction_input = input(f"\n🗜️  Auto-Compaction Threshold % [0-100, default: {default_compaction}% (ENTER to accept, custom number to set)]: ").strip()
         if not compaction_input:
-            context_window_compaction = AUTO_COMPACTION_THRESHOLD
+            context_window_compaction = default_compaction
         else:
             try:
                 compaction_val = int(compaction_input)
                 if 0 <= compaction_val <= 100:
                     context_window_compaction = compaction_val
                 else:
-                    print(f"   ⚠️  Value must be 0-100, using default: {AUTO_COMPACTION_THRESHOLD}%")
-                    context_window_compaction = AUTO_COMPACTION_THRESHOLD
+                    print(f"   ⚠️  Value must be 0-100, using default: {default_compaction}%")
+                    context_window_compaction = default_compaction
             except ValueError:
-                print(f"   ⚠️  Invalid number, using default: {AUTO_COMPACTION_THRESHOLD}%")
-                context_window_compaction = AUTO_COMPACTION_THRESHOLD
+                print(f"   ⚠️  Invalid number, using default: {default_compaction}%")
+                context_window_compaction = default_compaction
 
-        # Cache the compaction setting
-        try:
-            current_fav = load_favorites()
-            current_fav.add(f"compaction={context_window_compaction}")
-            save_favorites(current_fav)
-        except Exception:
-            pass
+        # Cache the per-model compaction setting for next time
+        save_model_compaction(selected_model, context_window_compaction)
 
-        print(f"   ✅ Auto-compaction set to {context_window_compaction}%")
+        print(f"   ✅ Auto-Compaction Threshold set to {context_window_compaction}%")
     except (EOFError, KeyboardInterrupt):
-        print(f"   Using default auto-compaction: {AUTO_COMPACTION_THRESHOLD}%")
+        context_window_compaction = default_compaction
+        print(f"   Using default auto-compaction: {default_compaction}%")
 
     # Generate config and start the proxy FIRST, then validate the connection
     # through the proxy. (check_model_access requires a live proxy, so it can't
@@ -1833,7 +1827,7 @@ def main():
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
             print("   Check ~/.claude_opencode/proxy.log for details.")
             print("   You may still attempt to launch manually.")
-        launch_claude_with_model(selected_model, context_window, args.dangerously_skip_permissions)
+        launch_claude_with_model(selected_model, context_window, args.dangerously_skip_permissions, context_window_compaction)
     finally:
         # Stop the proxy after Claude Code exits.
         stop_running_proxy()
