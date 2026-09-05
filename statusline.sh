@@ -152,6 +152,24 @@ ctx_seg() {
   fi
 }
 
+# Auto-compaction segment: shows the configured threshold as both a percentage
+# and a token count (= context window size × threshold / 100).
+# The value comes from the CLAUDE_CODE_COMPACTION_LEVEL env var set by the
+# provider launch scripts (e.g. claude_opencode_zen.py). Guards are null-safe.
+ctx_compaction_seg() {
+  local ca="${CLAUDE_CODE_COMPACTION_LEVEL:-}"
+  case "$ca" in
+    ''|*[!0-9]*) printf '🗜️ n/a'; return ;;
+  esac
+  local win_str=""
+  if [ "${winSize:-0}" -gt 0 ] 2>/dev/null; then
+    win_str="$(format_k $(( winSize * ca / 100 )))"
+  fi
+  local toks=""
+  [ -n "$win_str" ] && toks=" / ${win_str}"
+  printf '🗜️ %s%%%s' "$ca" "$toks"
+}
+
 # ---- FULL mode: two lines ----------------------------------------------------
 if [ "$MODE" = full ]; then
   L1=""
@@ -170,6 +188,7 @@ if [ "$MODE" = full ]; then
   L2=""
   seg2() { [ -n "$2" ] && L2="${L2}${L2:+$SEP}$1$2"; }
   seg2 "" "$(ctx_seg)"
+  seg2 "" "$(ctx_compaction_seg)"
   if [ "${inTok:-0}" -gt 0 ] || [ "${outTok:-0}" -gt 0 ]; then
     seg2 "📥📤 " "$(format_k "$inTok")/$(format_k "$outTok")"
   fi
