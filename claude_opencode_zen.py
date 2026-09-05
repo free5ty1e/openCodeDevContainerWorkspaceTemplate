@@ -116,18 +116,22 @@ def _claude_version_ok():
     return has_valid_version and no_error_messages
 
 
-def ensure_claude_cli():
+def ensure_claude_cli(args=None):
     """Check for updates to Claude CLI and optionally upgrade."""
     # Get current version
     rc, out = _run(["claude", "--version"], label="cli-version")
     if rc == 0:
         current_version = out.strip()
         print(f"   Current claude CLI version: {current_version}")
-    # Prompt for upgrade (handle EOF gracefully – default to 'n')
-    try:
-        resp = input("   Check for Claude CLI upgrade? (y/N): ").strip().lower()
-    except EOFError:
+    # If --accept-all-defaults, skip the upgrade prompt and assume user declined
+    if args and args.accept_all_defaults:
         resp = "n"
+    else:
+        # Prompt for upgrade (handle EOF gracefully – default to 'n')
+        try:
+            resp = input("   Check for Claude CLI upgrade? (y/N): ").strip().lower()
+        except EOFError:
+            resp = "n"
     if resp == "y":
         print("   Upgrading claude CLI via npm...")
         _run(["npm", "install", "-g", "@anthropic-ai/claude-code@latest"], label="cli-upgrade")
@@ -284,12 +288,12 @@ def ensure_litellm():
     return False
 
 
-def ensure_prerequisites():
+def ensure_prerequisites(args=None):
     """Ensure litellm (with the proxy extras) and the claude CLI are available."""
     print("🔍 Checking prerequisites...")
     ok = True
     ok &= ensure_litellm()
-    ok &= ensure_claude_cli()
+    ok &= ensure_claude_cli(args)
     return ok
 
 
@@ -1795,7 +1799,7 @@ def main():
 
     print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
 
-    if not ensure_prerequisites():
+    if not ensure_prerequisites(args):
         print("❌ Prerequisites check failed. Exiting.")
         sys.exit(1)
 
