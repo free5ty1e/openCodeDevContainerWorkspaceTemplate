@@ -72,6 +72,12 @@ vals="$(printf '%s' "$input" | jq -r '
 IFS=$'\x01' read -r model effort thinking style fast exceeds repo dir ver \
   inTok outTok winSize totalUsed used remain cacheRead cacheWrite cost rate5h rate7d provider <<< "$vals"
 
+# Override provider with CLAUDE_CODE_PROVIDER env var if set (launch scripts set this)
+# This takes precedence over the JSON .provider field which is often "n/a" through the proxy
+if [ -n "$CLAUDE_CODE_PROVIDER" ] && [ "$CLAUDE_CODE_PROVIDER" != " " ] && [ "$CLAUDE_CODE_PROVIDER" != "" ]; then
+  provider="$CLAUDE_CODE_PROVIDER"
+fi
+
 # ---- Git branch + dirty count (non-blocking, stderr swallowed) ---------------
 branch=""
 dirty=""

@@ -810,7 +810,16 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
         elif current[0] >= top + visible_count:
             top = current[0] - visible_count + 1
 
+        # Navigation hint - always displayed at top of menu
+        if view_mode == 0:
+            hint_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
+        else:
+            hint_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
+
         fragments = []
+
+        # Navigation hint first - always visible at top
+        fragments.append(("class:hint", hint_text + "\n"))
 
         # Prompt + instructions showing current view
         if view_mode == 0:
@@ -819,13 +828,6 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
             visible_favs = len([e for e in build_options() if e is not None])
             view_label = f"Favorites ({visible_favs} fav)"
         fragments.append(("class:prompt", prompt + f"  ({view_label}) • "))
-
-        # Navigation and view toggle hints
-        if view_mode == 0:
-            frag_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
-        else:
-            frag_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
-        fragments.append(("class:hint", frag_text + "\n"))
 
         items_above = top
         items_below = len(opts) - (top + visible_count)
