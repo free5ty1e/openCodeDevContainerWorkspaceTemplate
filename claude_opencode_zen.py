@@ -1061,16 +1061,12 @@ def display_and_select(standard, free, combined):
     selected_model = combined[selected_idx].get("id", "")
     print(f"\n🚀 Selected Model: {selected_model}")
 
-    # Load current favorites and offer to toggle
-    current_favorites = load_favorites()
-    print(f"\n   Current favorites: {len(current_favorites)} models")
-    if current_favorites:
-        print(f"   Favorite models: {', '.join(sorted(current_favorites))}")
-
     # Save last model
     save_last_model(selected_model)
 
     # Save favorites (persists what was toggled with SPACE during selection)
+    # Note: current_favorites was already modified during selection via SPACE;
+    # do NOT re-load from cache here or the SPACE toggles would be lost.
     save_favorites(current_favorites)
 
     # Get model data for the selected model
@@ -1148,6 +1144,37 @@ def get_context_window(selected_model, model_data):
         print(f"\n   Using default: {default_ctx:,} tokens")
         return default_ctx
 
+    # Prompt for auto-compaction level
+    # Use configured default; optionally cache via favorites file with "compaction:" prefix
+    try:
+        compaction_input = input(f"\n🗜️  Auto-compaction level [0-100, default: {AUTO_COMPACTION_THRESHOLD}% (ENTER to accept, custom number to set)]: ").strip()
+        if not compaction_input:
+            context_window_compaction = AUTO_COMPACTION_THRESHOLD
+        else:
+            try:
+                compaction_val = int(compaction_input)
+                if 0 <= compaction_val <= 100:
+                    context_window_compaction = compaction_val
+                else:
+                    print(f"   ⚠️  Value must be 0-100, using default: {AUTO_COMPACTION_THRESHOLD}%")
+                    context_window_compaction = AUTO_COMPACTION_THRESHOLD
+            except ValueError:
+                print(f"   ⚠️  Invalid number, using default: {AUTO_COMPACTION_THRESHOLD}%")
+                context_window_compaction = AUTO_COMPACTION_THRESHOLD
+
+        # Optionally cache the compaction setting in the favorites file
+        # (keys prefixed with "compaction:" — does not interfere with model favorites)
+        try:
+            current_fav = load_favorites()
+            # Store as string so the set isn't corrupted; callers should ignore non-model IDs
+            current_fav.add(f"compaction={context_window_compaction}")
+            save_favorites(current_fav)
+        except Exception:
+            pass
+
+        print(f"   ✅ Auto-compaction set to {context_window_compaction}%")
+    except (EOFError, KeyboardInterrupt):
+        print(f"   Using default auto-compaction: {AUTO_COMPACTION_THRESHOLD}%")
 
 def check_model_access(selected_model, api_key):
     """Check model access using the litellm proxy test step.
