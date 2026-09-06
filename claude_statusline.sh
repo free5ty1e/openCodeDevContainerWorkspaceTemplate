@@ -6,8 +6,8 @@
 # line packed with live session stats.
 #
 # MODE (set at install time via the setup script, or override with env):
-#   ZEN_STATUSLINE_MODE=full     two lines: identity + resource stats (default)
-#   ZEN_STATUSLINE_MODE=compact  one condensed line
+#   CLAUDE_CODE_STATUSLINE_MODE=full     two lines: identity + resource stats (default)
+#   CLAUDE_CODE_STATUSLINE_MODE=compact  one condensed line
 #
 # WHY null-safe / "n/a": when Claude Code runs THROUGH the zen translation
 # proxy, the CLI receives no upstream token usage, so context_window.used_percentage
@@ -27,7 +27,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # Mode: full (default) or compact
-MODE="${ZEN_STATUSLINE_MODE:-full}"
+MODE="${CLAUDE_CODE_STATUSLINE_MODE:-full}"
 case "$MODE" in compact|one|1|single) MODE=compact ;; *) MODE=full ;; esac
 
 # Provider: prefer CLAUDE_CODE_PROVIDER env var (set by launch scripts), fall back to JSON .provider

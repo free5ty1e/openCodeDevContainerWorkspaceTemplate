@@ -117,72 +117,84 @@ def _claude_version_ok():
 
 
 def ensure_claude_cli(args=None):
-    """Check for updates to Claude CLI and optionally upgrade."""
-    # Get current version
-    rc, out = _run(["claude", "--version"], label="cli-version")
-    if rc == 0:
-        current_version = out.strip()
-        print(f"   Current claude CLI version: {current_version}")
-    else:
-        current_version = "not installed"
+    """Check for claude CLI and optionally upgrade.
 
-    # Check latest version from npm (if available)
-    latest_version = ""
-    try:
-        rc3, out3 = _run(["npm", "view", "@anthropic-ai/claude-code", "version"], label="npm-view-latest")
-        if rc3 == 0 and out3.strip():
-            latest_version = out3.strip()
-    except Exception:
+    Behavior:
+    - If claude is not installed: install it directly (no upgrade prompt needed)
+    - If claude is installed and newer version available: prompt for upgrade
+      (unless --accept-all-defaults is set, then skip upgrade)
+    """
+    # First check if claude CLI is already working
+    if _claude_version_ok():
+        # Claude is installed and working - check for upgrades
+        current_version = None
+        rc, out = _run(["claude", "--version"], label="cli-version")
+        if rc == 0:
+            current_version = out.strip()
+            print(f"   Current claude CLI version: {current_version}")
+
+        # Check latest version from npm (if available)
         latest_version = ""
-
-    # Display version information
-    if latest_version:
-        print(f"   Latest claude CLI version: {latest_version}")
-    print()
-
-    # If --accept-all-defaults, auto-assume user DECLINES upgrade (default NO)
-    if args and args.accept_all_defaults:
-        resp = "n"
-    else:
-        # Prompt for upgrade showing versions
         try:
-            resp = input(f"   Upgrade from {current_version} to {latest_version or 'latest'}? (y/N): ").strip().lower()
-        except EOFError:
+            rc3, out3 = _run(["npm", "view", "@anthropic-ai/claude-code", "version"], label="npm-view-latest")
+            if rc3 == 0 and out3.strip():
+                latest_version = out3.strip()
+        except Exception:
+            latest_version = ""
+
+        # Display version information
+        if latest_version:
+            print(f"   Latest claude CLI version: {latest_version}")
+
+        # If --accept-all-defaults, auto-assume user DECLINES upgrade (default NO)
+        # Also auto-decline if versions are the same or we can't determine latest
+        should_prompt = False
+        if args and args.accept_all_defaults:
+            resp = "n"
+        elif latest_version and latest_version != current_version:
+            should_prompt = True
+        else:
             resp = "n"
 
-    if resp == "y" and latest_version and latest_version != current_version:
-        print("   Upgrading claude CLI via npm...")
-        # Try npm install with --legacy-peer-deps to handle devcontainer environments
-        upgrade_cmd = ["npm", "install", "-g", "--legacy-peer-deps", "@anthropic-ai/claude-code"]
-        upgrade_rc, upgrade_out = _run(upgrade_cmd, label="cli-upgrade")
+        if should_prompt:
+            # Prompt for upgrade showing versions
+            try:
+                resp = input(f"   Upgrade from {current_version} to {latest_version or 'latest'}? (y/N): ").strip().lower()
+            except EOFError:
+                resp = "n"
 
-        # Handle ENOTEMPTY/EPIPE errors common in devcontainers
-        if upgrade_rc != 0 and ("ENOTEMPTY" in upgrade_out or "EPIPE" in upgrade_out):
-            print("   Upgrade encountered directory issues - attempting cleanup...")
-            cleanup_cmd = ["npm", "bin", "cache", "clean", "--force"]
-            _run(cleanup_cmd, label="npm-cache-clean")
-            # Retry the upgrade
-            upgrade_rc, upgrade_out = _run(upgrade_cmd, label="cli-upgrade-retry")
+        if resp == "y" and latest_version and latest_version != current_version:
+            print("   Upgrading claude CLI via npm...")
+            # Try npm install with --legacy-peer-deps to handle devcontainer environments
+            upgrade_cmd = ["npm", "install", "-g", "--legacy-peer-deps", "@anthropic-ai/claude-code"]
+            upgrade_rc, upgrade_out = _run(upgrade_cmd, label="cli-upgrade")
 
-        # Re-verify version after upgrade attempt
-        rc2, out2 = _run(["claude", "--version"], label="cli-version-after")
-        if rc2 == 0:
-            new_version = out2.strip()
-            print(f"   New claude CLI version: {new_version}")
-            # Verify the native binary is working
-            if _claude_version_ok():
-                print("   ✅ claude CLI upgraded and working.")
+            # Handle ENOTEMPTY/EPIPE errors common in devcontainers
+            if upgrade_rc != 0 and ("ENOTEMPTY" in upgrade_out or "EPIPE" in upgrade_out):
+                print("   Upgrade encountered directory issues - attempting cleanup...")
+                cleanup_cmd = ["npm", "bin", "cache", "clean", "--force"]
+                _run(cleanup_cmd, label="npm-cache-clean")
+                # Retry the upgrade
+                upgrade_rc, upgrade_out = _run(upgrade_cmd, label="cli-upgrade-retry")
+
+            # Re-verify version after upgrade attempt
+            rc2, out2 = _run(["claude", "--version"], label="cli-version-after")
+            if rc2 == 0:
+                new_version = out2.strip()
+                print(f"   New claude CLI version: {new_version}")
+                # Verify the native binary is working
+                if _claude_version_ok():
+                    print("   ✅ claude CLI upgraded and working.")
+                else:
+                    print("   ⚠️  claude CLI upgraded but native binary may need fixing:")
+                    print("      Run: node <install_dir>/install.cjs")
             else:
-                print("   ⚠️  claude CLI upgraded but native binary may need fixing:")
-                print("      Run: node <install_dir>/install.cjs")
-        else:
-            print("   ⚠️  Upgrade failed - version check after install failed.")
-    elif resp == "y" and (not latest_version or latest_version == current_version):
-        print("   claude CLI is already up to date.")
-    # Continue with existing logic (return True if already okay)
-    if _claude_version_ok():
+                print("   ⚠️  Upgrade failed - version check after install failed.")
+
+        # Return True since claude is already working
         return True
-    # If not ok, fall through to install (original install logic follows)
+
+    # Claude is not installed or not working - install it
     """Install the claude CLI via npm if not already present, fixing native binary."""
     # First check node availability with verbose logging
     print("  🔍 Checking node.js availability...")
@@ -1642,26 +1654,26 @@ def setup_claude_persistence():
 
 
 def setup_statusline_symlink():
-    """Set up statusline.sh symlink in the Claude config directory.
+    """Set up claude_statusline.sh symlink in the Claude config directory.
 
-    Claude Code looks for statusline.sh in its config directory or we can
-    ensure it's available. We'll create a symlink from workspace/statusline.sh
+    Claude Code looks for claude_statusline.sh in its config directory or we can
+    ensure it's available. We'll create a symlink from workspace/claude_statusline.sh
     to the Claude config location.
     """
     CLAUDE_CONFIG_DIR = os.path.expanduser("~/.claude")
     # statusline_src is now set up via the persistence mechanism - it will be in ~/.claude/
 
-    # Check if statusline.sh exists in the workspace
-    workspace_statusline = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusline.sh")
+    # Check if claude_statusline.sh exists in the workspace
+    workspace_statusline = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_statusline.sh")
 
     if os.path.exists(workspace_statusline):
         # Create symlink in the persist dir (which ~/.claude points to)
-        statusline_dst = os.path.join(CLAUDE_CONFIG_DIR, "statusline.sh")
+        statusline_dst = os.path.join(CLAUDE_CONFIG_DIR, "claude_statusline.sh")
 
         # Resolve the actual path since ~/.claude may be a symlink to .claude_persist
         actual_statusline_path = os.path.realpath(statusline_dst)
 
-        # Check if it's already a symlink pointing to workspace/statusline.sh
+        # Check if it's already a symlink pointing to workspace/claude_statusline.sh
         if os.path.islink(statusline_dst):
             # It's already a symlink - check if target is correct
             try:
@@ -1669,14 +1681,14 @@ def setup_statusline_symlink():
                 # Normalize the target path - if it's relative, prepend ~/.claude
                 if not os.path.isabs(real_target):
                     real_target = os.path.join(CLAUDE_CONFIG_DIR, real_target)
-                # Check if the resolved target is the workspace statusline.sh
+                # Check if the resolved target is the workspace claude_statusline.sh
                 resolved_target = os.path.realpath(real_target)
                 workspace_resolved = os.path.realpath(workspace_statusline)
                 if resolved_target == workspace_resolved:
-                    # Ensure the workspace statusline.sh is executable
+                    # Ensure the workspace claude_statusline.sh is executable
                     if os.path.isfile(workspace_statusline):
                         os.chmod(workspace_statusline, 0o755)
-                    print(f"✅ statusline.sh symlink already correct at {statusline_dst}")
+                    print(f"✅ claude_statusline.sh symlink already correct at {statusline_dst}")
                     return
             except OSError:
                 pass
@@ -1684,13 +1696,13 @@ def setup_statusline_symlink():
             os.unlink(statusline_dst)
         elif os.path.exists(statusline_dst):
             # It's a regular file (not symlink) - remove it to create symlink
-            # But first check if it's the same as workspace/statusline.sh (by content/inode)
+            # But first check if it's the same as workspace/claude_statusline.sh (by content/inode)
             try:
                 if os.path.samestat(os.stat(statusline_dst), os.stat(workspace_statusline)):
-                    # Ensure the workspace statusline.sh is executable
+                    # Ensure the workspace claude_statusline.sh is executable
                     if os.path.isfile(workspace_statusline):
                         os.chmod(workspace_statusline, 0o755)
-                    print(f"✅ statusline.sh already matches workspace version at {statusline_dst}")
+                    print(f"✅ claude_statusline.sh already matches workspace version at {statusline_dst}")
                     return
             except OSError:
                 pass
@@ -1703,18 +1715,18 @@ def setup_statusline_symlink():
         try:
             # Ensure parent dir exists (should already via persistence setup)
             os.makedirs(os.path.dirname(statusline_dst), exist_ok=True)
-            # Ensure the workspace statusline.sh is executable
+            # Ensure the workspace claude_statusline.sh is executable
             if os.path.isfile(workspace_statusline):
                 os.chmod(workspace_statusline, 0o755)
             os.symlink(workspace_statusline, statusline_dst)
-            print(f"📐 Symlinked workspace statusline.sh → {statusline_dst}")
+            print(f"📐 Symlinked workspace claude_statusline.sh → {statusline_dst}")
         except OSError as e:
             print(f"⚠️  Could not create symlink: {e}")
 
         # Now configure the statusLine in settings.json
         settings_file = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
         resolved_statusline = os.path.realpath(statusline_dst)
-        statusline_command = f'ZEN_STATUSLINE_MODE=full bash {resolved_statusline}'
+        statusline_command = f'CLAUDE_CODE_STATUSLINE_MODE=full bash {resolved_statusline}'
 
         try:
             # Read existing settings
@@ -1738,7 +1750,7 @@ def setup_statusline_symlink():
         except (OSError, json.JSONDecodeError) as e:
             print(f"⚠️  Could not configure statusLine: {e}")
     else:
-        print(f"⚠️  workspace statusline.sh not found at {workspace_statusline}")
+        print(f"⚠️  workspace claude_statusline.sh not found at {workspace_statusline}")
 
 
 def launch_claude_with_model(selected_model, context_window, dangerously_skip_permissions=False, compaction_threshold=None):
@@ -1765,21 +1777,21 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
     # Use the per-model cached value if provided, else the default.
     compaction_value = compaction_threshold if compaction_threshold is not None else AUTO_COMPACTION_THRESHOLD
     env["CLAUDE_CODE_COMPACTION_LEVEL"] = str(compaction_value)
-    # Set provider env var for statusline.sh - use the provider indicator from config
+    # Set provider env var for claude_statusline.sh - use the provider indicator from config
     env["CLAUDE_CODE_PROVIDER"] = "openai"
     # Set statusline mode env var
-    # Read from cache; if not set, statusline.sh will default based on JSON payload
+    # Read from cache; if not set, claude_statusline.sh will default based on JSON payload
     statusline_mode = load_statusline_mode()
     if statusline_mode == "compact":
         env["CLAUDE_CODE_STATUSLINE_MODE"] = "compact"
     elif statusline_mode == "full":
         env["CLAUDE_CODE_STATUSLINE_MODE"] = "full"
-    # If no cached mode, leave unset and statusline.sh will use its normal logic
+    # If no cached mode, leave unset and claude_statusline.sh will use its normal logic
 
     # Set up Claude Code persistence so sessions survive devcontainer rebuilds
     setup_claude_persistence()
 
-    # Set up statusline.sh symlink so Claude Code uses our custom status line
+    # Set up claude_statusline.sh symlink so Claude Code uses our custom status line
     setup_statusline_symlink()
 
     print("\n🚀 Launching Claude Code with selected OpenCode Zen model...")
@@ -1954,7 +1966,7 @@ def main():
     save_statusline_mode(selected_mode)
     # End new section
 
-    # Set provider env var for statusline.sh
+    # Set provider env var for claude_statusline.sh
     # Use PROVIDER_INDICATOR or derive from API base URL
     provider_name = PROVIDER_INDICATOR  # "opencode" by default, but could be overridden
 

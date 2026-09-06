@@ -50,7 +50,7 @@
 #   .claude_zen/
 #   ├── repo/                  Cloned claude-code-zen-proxy
 #   ├── .env.zen               Your environment config (API key, model)
-#   ├── statusline.sh          Claude Code statusline (copied from .claude/)
+#   ├── claude_statusline.sh          Claude Code statusline (copied from .claude/)
 #   ├── zen-claude-settings.json  Claude Code settings (env + statusLine)
 #   └── proxy.log              Proxy daemon log (when using cz-proxy-start)
 #
@@ -61,10 +61,10 @@
 #   Every cz / cz-danger launch points Claude Code at zen-claude-settings.json,
 #   which wires in the statusline script (model, context usage %, git branch
 #   with dirty count, cumulative session tokens, cache hit rate, cost).
-#   The script is copied from (in order): ./statusline.sh, <workspace>/.claude/
-#   statusline.sh, or ~/.claude/statusline.sh. To make it portable, keep a copy
-#   of statusline.sh next to this setup script.
-#   Customize:  .claude_zen/statusline.sh
+#   The script is copied from (in order): ./claude_statusline.sh, <workspace>/.claude/
+#   claude_statusline.sh, or ~/.claude/claude_statusline.sh. To make it portable, keep a copy
+#   of claude_statusline.sh next to this setup script.
+#   Customize:  .claude_zen/claude_statusline.sh
 # ==============================================================================
 set -euo pipefail
 
@@ -94,8 +94,8 @@ MARKER_BEGIN="# >>> claude-zen-devcontainer >>>"
 MARKER_END="# <<< claude-zen-devcontainer <<<"
 
 # Statusline integration
-STATUSLINE_SOURCE="${SCRIPT_DIR}/.claude/statusline.sh"
-STATUSLINE_SCRIPT="${PERSISTENCE_DIR}/statusline.sh"
+STATUSLINE_SOURCE="${SCRIPT_DIR}/.claude/claude_statusline.sh"
+STATUSLINE_SCRIPT="${PERSISTENCE_DIR}/claude_statusline.sh"
 SETTINGS_FILE="${PERSISTENCE_DIR}/zen-claude-settings.json"
 OPENROUTER_ENV_FILE="${PERSISTENCE_DIR}/.env.openrouter"
 OPENROUTER_SETTINGS_FILE="${PERSISTENCE_DIR}/openrouter-claude-settings.json"
@@ -1257,7 +1257,7 @@ HOW IT WORKS:
 
   Config file: .claude_zen/.env.zen
   Proxy repo:  .claude_zen/repo/
-  Statusline:  .claude_zen/statusline.sh (wired via zen-claude-settings.json)
+  Statusline:  .claude_zen/claude_statusline.sh (wired via zen-claude-settings.json)
 
 HELPEOF
 }
@@ -1293,9 +1293,9 @@ case "${_sl_choice:-1}" in
   *) STATUSLINE_MODE="full" ;;
 esac
 printf '  Statusline mode: %s\n' "${STATUSLINE_MODE}"
-export ZEN_STATUSLINE_MODE="${STATUSLINE_MODE}"
+export CLAUDE_CODE_STATUSLINE_MODE="${STATUSLINE_MODE}"
 
-# jq (JSON parsing) and bc (arithmetic) are required by statusline.sh
+# jq (JSON parsing) and bc (arithmetic) are required by claude_statusline.sh
 for _tool in jq bc; do
     if have "$_tool"; then
         printf '  %s: found\n' "$_tool"
@@ -1318,32 +1318,32 @@ for _tool in jq bc; do
     fi
 done
 
-# Copy statusline.sh into the persistence dir so it survives rebuilds.
+# Copy claude_statusline.sh into the persistence dir so it survives rebuilds.
 # Source lookup order:
-#   1. .claude_zen/statusline.sh        (already installed — idempotent)
-#   2. ./statusline.sh                  (kept next to this script — portable)
-#   3. <workspace>/.claude/statusline.sh  (this devcontainer's copy)
-#   4. ~/.claude/statusline.sh          (home copy)
+#   1. .claude_zen/claude_statusline.sh        (already installed — idempotent)
+#   2. ./claude_statusline.sh                  (kept next to this script — portable)
+#   3. <workspace>/.claude/claude_statusline.sh  (this devcontainer's copy)
+#   4. ~/.claude/claude_statusline.sh          (home copy)
 if [ -f "${STATUSLINE_SCRIPT}" ]; then
     chmod +x "${STATUSLINE_SCRIPT}" 2>/dev/null || true
     printf '  Statusline already installed: %s\n' "${STATUSLINE_SCRIPT}"
-elif [ -f "${SCRIPT_DIR}/statusline.sh" ]; then
-    cp "${SCRIPT_DIR}/statusline.sh" "${STATUSLINE_SCRIPT}"
+elif [ -f "${SCRIPT_DIR}/claude_statusline.sh" ]; then
+    cp "${SCRIPT_DIR}/claude_statusline.sh" "${STATUSLINE_SCRIPT}"
     chmod +x "${STATUSLINE_SCRIPT}"
-    printf '  Copied statusline: %s -> %s\n' "${SCRIPT_DIR}/statusline.sh" "${STATUSLINE_SCRIPT}"
+    printf '  Copied statusline: %s -> %s\n' "${SCRIPT_DIR}/claude_statusline.sh" "${STATUSLINE_SCRIPT}"
 elif [ -f "${STATUSLINE_SOURCE}" ]; then
     cp "${STATUSLINE_SOURCE}" "${STATUSLINE_SCRIPT}"
     chmod +x "${STATUSLINE_SCRIPT}"
     printf '  Copied statusline: %s -> %s\n' "${STATUSLINE_SOURCE}" "${STATUSLINE_SCRIPT}"
-elif [ -f "${HOME}/.claude/statusline.sh" ]; then
-    cp "${HOME}/.claude/statusline.sh" "${STATUSLINE_SCRIPT}"
+elif [ -f "${HOME}/.claude/claude_statusline.sh" ]; then
+    cp "${HOME}/.claude/claude_statusline.sh" "${STATUSLINE_SCRIPT}"
     chmod +x "${STATUSLINE_SCRIPT}"
-    printf '  Copied statusline from %s\n' "${HOME}/.claude/statusline.sh"
+    printf '  Copied statusline from %s\n' "${HOME}/.claude/claude_statusline.sh"
 else
-    printf '  Warning: no statusline.sh found. Creating placeholder.\n' >&2
+    printf '  Warning: no claude_statusline.sh found. Creating placeholder.\n' >&2
     cat > "${STATUSLINE_SCRIPT}" << 'SL'
 #!/bin/bash
-# Placeholder statusline - drop your own at .claude_zen/statusline.sh
+# Placeholder statusline - drop your own at .claude_zen/claude_statusline.sh
 input=$(cat)
 model=$(echo "$input" | jq -r '.model.display_name // "claude"' 2>/dev/null)
 printf "🤖 %s\n" "$model"
@@ -1358,11 +1358,11 @@ if [ -f "${REPO_DIR}/zen-claude-settings.json" ]; then
 import json, sys
 src, dst, statusline = sys.argv[1], sys.argv[2], sys.argv[3]
 import os
-mode = os.environ.get("ZEN_STATUSLINE_MODE", "full")
+mode = os.environ.get("CLAUDE_CODE_STATUSLINE_MODE", "full")
 with open(src) as f:
     data = json.load(f)
 data.setdefault("statusLine", {})["type"] = "command"
-data["statusLine"]["command"] = f"ZEN_STATUSLINE_MODE={mode} bash {statusline}"
+data["statusLine"]["command"] = f"CLAUDE_CODE_STATUSLINE_MODE={mode} bash {statusline}"
 data.setdefault("env", {})["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
 # Bump context_window to match large upstream models (e.g. DeepSeek V4)
 with open(dst, "w") as f:
@@ -1390,7 +1390,7 @@ else
   },
   "statusLine": {
     "type": "command",
-    "command": "ZEN_STATUSLINE_MODE=${STATUSLINE_MODE} bash ${STATUSLINE_SCRIPT}"
+    "command": "CLAUDE_CODE_STATUSLINE_MODE=${STATUSLINE_MODE} bash ${STATUSLINE_SCRIPT}"
   }
 }
 JSONEOF
@@ -1556,7 +1556,7 @@ cat << SUMMARY
   Statusline (model / context % / git / cost) is wired automatically into
   every cz / cz-danger session via ${SETTINGS_FILE}.
   Customize it:  ${STATUSLINE_SCRIPT}
-  For portability, keep a copy of statusline.sh next to this setup script.
+  For portability, keep a copy of claude_statusline.sh next to this setup script.
 
 SUMMARY
 
