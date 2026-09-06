@@ -481,4 +481,287 @@ def ensure_prerequisites(args=None):
     ok &= install_package("litellm", "litellm[proxy]")
     ok &= ensure_claude_cli(args)
     return ok
-# End of shared functions
+
+
+# ─── Cache Management (Extended) ────────────────────────────────────────────
+
+def load_model_context(model_id):
+    """Load the last context window for a specific model from cache."""
+    cache_dir = os.path.expanduser("~/.claude_opencode_context_windows")
+    cache_file = os.path.join(cache_dir, f"{model_id}.txt")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_model_context(model_id, context_window):
+    """Save the context window for a specific model to cache."""
+    try:
+        cache_dir = os.path.expanduser("~/.claude_opencode_context_windows")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{model_id}.txt")
+        with open(cache_file, "w") as f:
+            f.write(str(context_window))
+    except OSError:
+        pass
+
+
+def load_model_compaction(model_id):
+    """Load the last auto-compaction threshold (%) for a specific model."""
+    cache_dir = os.path.expanduser("~/.claude_opencode_context_windows")
+    cache_file = os.path.join(cache_dir, f"{model_id}.compaction.txt")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_model_compaction(model_id, threshold):
+    """Save the auto-compaction threshold (%) for a specific model."""
+    try:
+        cache_dir = os.path.expanduser("~/.claude_opencode_context_windows")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{model_id}.compaction.txt")
+        with open(cache_file, "w") as f:
+            f.write(str(threshold))
+    except OSError:
+        pass
+
+
+def load_statusline_mode(cache_file=None):
+    """Load the last used statusline mode ('full' or 'compact') from cache."""
+    if cache_file is None:
+        cache_file = os.path.expanduser("~/.claude_opencode_statusline_mode")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip().lower()
+                if val in ("full", "compact"):
+                    return val
+        except OSError:
+            pass
+    return None
+
+
+def save_statusline_mode(mode, cache_file=None):
+    """Save the last used statusline mode ('full' or 'compact') to cache."""
+    if cache_file is None:
+        cache_file = os.path.expanduser("~/.claude_opencode_statusline_mode")
+    try:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            f.write(mode)
+    except OSError:
+        pass
+
+
+# ─── Favorites Management ───────────────────────────────────────────────────
+
+def load_favorites(cache_file=None):
+    """Load the set of favorite model IDs from cache."""
+    if cache_file is None:
+        cache_file = os.path.expanduser("~/.claude_opencode_favorites")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                content = f.read().strip()
+                if content:
+                    return set(content.split("\n"))
+        except OSError:
+            pass
+    return set()
+
+
+def save_favorites(favorites_set, cache_file=None):
+    """Save the set of favorite model IDs to cache."""
+    if cache_file is None:
+        cache_file = os.path.expanduser("~/.claude_opencode_favorites")
+    try:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            f.write("\n".join(sorted(favorites_set)))
+    except OSError:
+        pass
+
+
+# ─── Terminal Utilities ─────────────────────────────────────────────────────
+
+def get_terminal_height():
+    """Return usable terminal height, clamped to a sane minimum."""
+    try:
+        import shutil
+        rows = shutil.get_terminal_size().lines
+        if rows and rows > 4:
+            return rows
+    except Exception:
+        pass
+    return 24
+
+
+# ─── Proxy Utilities ────────────────────────────────────────────────────────
+
+def port_open(port):
+    """Check if a port is open."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def stop_running_proxy(pid_file=None, timeout=5):
+    """Stop any previously-started proxy for this bridge."""
+    if pid_file is None:
+        pid_file = os.path.expanduser("~/.claude_opencode_proxy.pid")
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(timeout)
+        except (OSError, ValueError):
+            pass
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+
+
+def test_proxy_connection(port, master_key, selected_model):
+    """Quick validation via the proxy to verify the model responds."""
+    print(f"\n🧪 Testing selected model through proxy ({selected_model})...")
+    payload = {
+        "model": selected_model,
+        "max_tokens": 50,
+        "messages": [{"role": "user", "content": "Hello! Please respond with a simple greeting."}],
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {master_key}",
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+            content = data.get("content", [])
+            text = "".join(
+                b.get("text", "")
+                for b in content
+                if b.get("type") == "text"
+            )
+            if not text.strip():
+                text = "".join(
+                    b.get("thinking", "")
+                    for b in content
+                    if b.get("type") == "thinking"
+                )
+            print(f"✅ Proxy test successful!")
+            print(f"   Response: {text.strip()[:200]}")
+            print(f"   Usage: {data.get('usage', {})}")
+            return True
+    except urllib.error.HTTPError as e:
+        print(f"⚠️  Proxy test returned status {e.code}")
+        print(f"   Error: {e.read().decode()[:500]}")
+        return False
+    except Exception as e:
+        print(f"⚠️  Proxy test failed: {type(e).__name__}: {str(e)[:200]}")
+        return False
+
+
+# ─── Claude Code Persistence ─────────────────────────────────────────────
+
+def setup_claude_persistence():
+    """Set up Claude Code persistence using .claude_persist in workspace."""
+    import shutil
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    workspace_root = os.path.abspath(script_dir)
+    claude_persist_dir = os.path.join(workspace_root, ".claude_persist")
+    claude_config_dir = os.path.expanduser("~/.claude")
+
+    os.makedirs(claude_persist_dir, exist_ok=True)
+
+    if os.path.islink(claude_config_dir):
+        try:
+            current_target = os.readlink(claude_config_dir)
+        except OSError:
+            current_target = ""
+        if current_target == claude_persist_dir:
+            print(f"✅ ~/.claude already symlinked to {claude_persist_dir}")
+            return
+
+    elif os.path.isdir(claude_config_dir):
+        if not os.listdir(claude_config_dir):
+            shutil.rmtree(claude_config_dir)
+            os.symlink(claude_persist_dir, claude_config_dir)
+            print(f"  ✅ Symlinked empty ~/.claude → {claude_persist_dir}")
+        else:
+            print(f"  Copying existing ~/.claude to {claude_persist_dir}")
+            if os.path.exists(claude_persist_dir):
+                shutil.rmtree(claude_persist_dir)
+            shutil.copytree(claude_config_dir, claude_persist_dir, dirs_exist_ok=True)
+            shutil.rmtree(claude_config_dir)
+            os.symlink(claude_persist_dir, claude_config_dir)
+            print(f"  ✅ Migrated ~/.claude → {claude_persist_dir}")
+    else:
+        os.symlink(claude_persist_dir, claude_config_dir)
+        print(f"  ✅ Created ~/.claude → {claude_persist_dir} (populated on first launch)")
+
+
+# ─── Statusline Setup ─────────────────────────────────────────────────────
+
+def setup_statusline_symlink(workspace_file="claude_statusline.sh", provider_indicator="opencode"):
+    """Set up statusline file symlink in the Claude config directory."""
+    claude_config_dir = os.path.expanduser("~/.claude")
+    workspace_dir = os.path.dirname(os.path.abspath(__file__))
+    workspace_statusline = os.path.join(workspace_dir, workspace_file)
+
+    if not os.path.exists(workspace_statusline):
+        print(f"⚠️  workspace statusline not found at {workspace_statusline}")
+        return None
+
+    statusline_dst = os.path.join(claude_config_dir, workspace_file)
+
+    try:
+        os.makedirs(os.path.dirname(statusline_dst), exist_ok=True)
+        os.chmod(workspace_statusline, 0o755)
+        if os.path.islink(statusline_dst) or os.path.exists(statusline_dst):
+            os.unlink(statusline_dst)
+        os.symlink(workspace_statusline, statusline_dst)
+        print(f"📐 Symlinked workspace statusline → {statusline_dst}")
+
+        settings_file = os.path.join(claude_config_dir, "settings.json")
+        resolved_statusline = os.path.realpath(statusline_dst)
+        statusline_command = f"CLAUDE_CODE_STATUSLINE_MODE=full bash {resolved_statusline}"
+
+        if os.path.exists(settings_file):
+            with open(settings_file, "r") as f:
+                settings = json.load(f)
+        else:
+            settings = {}
+
+        settings["statusLine"] = {
+            "type": "command",
+            "command": statusline_command
+        }
+
+        with open(settings_file, "w") as f:
+            json.dump(settings, f, indent=2)
+
+        print(f"⚙️  Configured statusLine in {settings_file}")
+        return True
+    except OSError as e:
+        print(f"⚠️  Could not create symlink: {e}")
+        return None
+# End of claude_library.py
