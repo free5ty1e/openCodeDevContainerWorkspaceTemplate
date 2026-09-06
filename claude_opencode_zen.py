@@ -15,12 +15,6 @@ import socket
 import signal
 import urllib.request
 import urllib.error
-from prompt_toolkit import Application
-from prompt_toolkit.layout import Layout, HSplit
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.layout.containers import Window
-from prompt_toolkit.styles import Style
 
 # Import shared library
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -265,7 +259,32 @@ def favorites_selector(models, current_favorites):
 
 # ─── Arrow Key Selector ──────────────────────────────────────────────────────
 def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorites=None):
-    """Interactive arrow-key selector using prompt_toolkit."""
+    """Interactive arrow-key selector using prompt_toolkit.
+
+    Returns (selected_index, selected_option, updated_favorites) or (None, None, None) on cancel.
+    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, LEFT/RIGHT to toggle views,
+    ENTER, ESC, and SPACE to toggle favorites.
+    LEFT cycles to favorites-only view; RIGHT cycles back to full model list.
+    The highlighted item is always kept visible via auto-scrolling.
+    Favorites are shown with ★ prefix; SPACE toggles favorite status.
+    """
+    # Import prompt_toolkit here (after prerequisites check)
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout, HSplit
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.styles import Style
+
+    """Interactive arrow-key selector using prompt_toolkit.
+
+    Returns (selected_index, selected_option, updated_favorites) or (None, None, None) on cancel.
+    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, LEFT/RIGHT to toggle views,
+    ENTER, ESC, and SPACE to toggle favorites.
+    LEFT cycles to favorites-only view; RIGHT cycles back to full model list.
+    The highlighted item is always kept visible via auto-scrolling.
+    Favorites are shown with ★ prefix; SPACE toggles favorite status.
+    """
     if not options:
         return None, None, None
 

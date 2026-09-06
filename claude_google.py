@@ -15,12 +15,6 @@ import socket
 import signal
 import urllib.request
 import urllib.error
-from prompt_toolkit import Application
-from prompt_toolkit.layout import Layout, HSplit
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.layout.containers import Window
-from prompt_toolkit.styles import Style
 
 # Import shared library
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
