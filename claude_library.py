@@ -114,6 +114,43 @@ def install_package(pkg_name, pip_name=None):
     except ImportError:
         pass
     print(f"  📦 Installing {pip_name}...")
+
+    # Try different installation strategies
+    strategies = [
+        # Strategy 1: Normal install
+        ([get_python_executable(), "-m", "pip", "install", pip_name], "normal install"),
+        # Strategy 2: With --break-system-packages (for PEP 668 externally-managed environments)
+        ([get_python_executable(), "-m", "pip", "install", "--break-system-packages", pip_name], "with --break-system-packages"),
+        # Strategy 3: With --user flag
+        ([get_python_executable(), "-m", "pip", "install", "--user", pip_name], "with --user flag"),
+        # Strategy 4: Try pipx if available
+        (["pipx", "install", pip_name], "with pipx"),
+    ]
+
+    for cmd, description in strategies:
+        print(f"  📦 Installing {pip_name} ({description})...")
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            print(f"  ✅ Successfully installed {pip_name} ({description})")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"  ⚠️  Failed ({description}): {e.stderr.strip() if e.stderr else 'Unknown error'}")
+            continue
+        except FileNotFoundError:
+            # Command not found (e.g., pipx not installed)
+            continue
+        except Exception as e:
+            print(f"  ⚠️  Unexpected error ({description}): {e}")
+            continue
+
+    # All strategies failed
+    print(f"  ❌ Failed to install {pip_name} after trying all strategies")
+    # Try to get the last error for diagnostics
     try:
         result = subprocess.run(
             [get_python_executable(), "-m", "pip", "install", pip_name],
@@ -121,19 +158,12 @@ def install_package(pkg_name, pip_name=None):
             capture_output=True,
             text=True,
         )
-        print(f"  ✅ Successfully installed {pip_name}")
-        return True
     except subprocess.CalledProcessError as e:
-        print(f"  ❌ Failed to install {pip_name}")
-        print(f"     Error: {e.stderr.strip() if e.stderr else 'Unknown error'}")
-        print(f"     Command: {e.cmd}")
-        print(f"     Return code: {e.returncode}")
-        print_failure_diagnostics(pkg_name, e)
-        return False
+        print_failure_diagnostics(pip_name, e)
     except Exception as e:
         print(f"  ❌ Unexpected error installing {pip_name}: {e}")
         print_failure_diagnostics(pkg_name, e)
-        return False
+    return False
 
 
 # ─── Cache Management ──────────────────────────────────────────────────────
