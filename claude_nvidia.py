@@ -48,6 +48,8 @@ from claude_library import (
     # Compaction
     load_model_compaction,
     save_model_compaction,
+    # Model utilities
+    categorize_models,
     # Statusline mode
     load_statusline_mode,
     save_statusline_mode,

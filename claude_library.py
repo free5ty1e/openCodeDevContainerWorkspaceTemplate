@@ -221,6 +221,15 @@ def format_token_count(tokens):
     return str(tokens)
 
 
+def categorize_models(models, non_chat_keywords=None, free_keywords=None):
+    """Wrapper to categorize models using filter_chat_models with provider-specific keywords.
+
+    This is a convenience function that calls filter_chat_models with the provided keywords.
+    Providers can pass their own non_chat_keywords and free_keywords for customization.
+    """
+    return filter_chat_models(models, non_chat_keywords, free_keywords)
+
+
 # ─── HTTP Utilities ───────────────────────────────────────────────────────
 
 def http_get_json(url, api_key=None, use_query_param=False, timeout=30):
@@ -280,7 +289,7 @@ def find_claude_pkg_dir(claude_prefix="@anthropic-ai/claude-code"):
 
 
 def start_litellm_proxy(config_file, port, master_key, log_file, pid_file):
-    """Start the litellm proxy in the background."""
+    """Start the litellm proxy in the background and wait until ready."""
     # Clean up any existing proxy
     if os.path.exists(pid_file):
         try:
@@ -323,6 +332,27 @@ def start_litellm_proxy(config_file, port, master_key, log_file, pid_file):
         f.write(str(proc.pid))
 
     print(f"🚀 Starting litellm proxy on port {port} (PID {proc.pid})...")
+
+    # Wait for proxy to be ready with retries
+    for i in range(60):  # Wait up to 60 seconds
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/health",
+                headers={"Authorization": f"Bearer {master_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    print("   ✅ Proxy is ready.")
+                    return proc
+        except Exception:
+            time.sleep(1)
+
+    print("   ⚠️  Proxy did not become ready. Check the log below:")
+    try:
+        with open(log_file) as f:
+            print(f.read()[-3000:])
+    except OSError:
+        pass
     return proc
 
 
@@ -445,10 +475,13 @@ def ensure_claude_cli(args=None):
         except Exception:
             pass
 
-        if latest_version and latest_version != version:
+        # Extract just the version number (e.g., "2.1.261" from "2.1.261 (Claude Code)")
+        current_version = version.split()[0] if version else version
+
+        if latest_version and latest_version != current_version:
             print(f"   Latest claude CLI version: {latest_version}")
             try:
-                resp = input(f"   Upgrade from {version} to {latest_version}? (y/N): ").strip().lower()
+                resp = input(f"   Upgrade from {current_version} to {latest_version}? (y/N): ").strip().lower()
             except EOFError:
                 resp = "n"
 
@@ -743,7 +776,8 @@ def setup_statusline_symlink(workspace_file="claude_statusline.sh", provider_ind
 
         settings_file = os.path.join(claude_config_dir, "settings.json")
         resolved_statusline = os.path.realpath(statusline_dst)
-        statusline_command = f"CLAUDE_CODE_STATUSLINE_MODE=full bash {resolved_statusline}"
+        # Don't hardcode CLAUDE_CODE_STATUSLINE_MODE - let the env var from launch_claude_with_model pass through
+        statusline_command = f"bash {resolved_statusline}"
 
         if os.path.exists(settings_file):
             with open(settings_file, "r") as f:
