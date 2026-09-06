@@ -70,6 +70,7 @@ CACHE_FILE = os.path.expanduser("~/.anyapi_api_key_cache")
 MODEL_CACHE_FILE = os.path.expanduser("~/.claude_anyapi_last_model")
 FAVORITES_CACHE_FILE = os.path.expanduser("~/.claude_anyapi_favorites")
 CONTEXT_CACHE_FILE = os.path.expanduser("~/.claude_anyapi_last_context")
+CONTEXT_WINDOW_CACHE_DIR = os.path.expanduser("~/.claude_anyapi_context_windows")
 STATUSLINE_MODE_CACHE_FILE = os.path.expanduser("~/.claude_anyapi_statusline_mode")
 
 PROXY_PORT = 4502
@@ -78,6 +79,8 @@ CONFIG_DIR = os.path.expanduser("~/.claude_anyapi")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "litellm_proxy.yaml")
 LOG_FILE = os.path.join(CONFIG_DIR, "proxy.log")
 PID_FILE = os.path.join(CONFIG_DIR, "proxy.pid")
+AUTO_COMPACTION_THRESHOLD = 91
+PROVIDER_INDICATOR = "anyapi"
 
 # ─── Provider-Specific Functions ──────────────────────────────────────────────
 
@@ -120,14 +123,7 @@ def fetch_models(api_key):
         sys.exit(1)
 
 
-def categorize_models(all_raw_models):
-    """Categorize models into standard and free/tier."""
-    return filter_chat_models(
-        all_raw_models,
-        non_chat_keywords=["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"],
-        free_keywords=["community", "free"]
-    )
-
+# ─── Cache Management (Provider-Specific) ────────────────────────────────────
 
 def load_last_model():
     return read_cache(MODEL_CACHE_FILE)
@@ -145,12 +141,48 @@ def save_last_context(context_window):
     write_cache(CONTEXT_CACHE_FILE, context_window)
 
 
-def load_favorites_wrapper():
-    return load_favorites(FAVORITES_CACHE_FILE)
+def load_model_context(model_id):
+    cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.txt")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
 
 
-def save_favorites_wrapper(favs):
-    save_favorites(favs, FAVORITES_CACHE_FILE)
+def save_model_context(model_id, context_window):
+    try:
+        os.makedirs(CONTEXT_WINDOW_CACHE_DIR, exist_ok=True)
+        cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.txt")
+        with open(cache_file, "w") as f:
+            f.write(str(context_window))
+    except OSError:
+        pass
+
+
+def load_model_compaction(model_id):
+    cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.compaction.txt")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                val = f.read().strip()
+                return int(val) if val.isdigit() else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_model_compaction(model_id, threshold):
+    try:
+        os.makedirs(CONTEXT_WINDOW_CACHE_DIR, exist_ok=True)
+        cache_file = os.path.join(CONTEXT_WINDOW_CACHE_DIR, f"{model_id}.compaction.txt")
+        with open(cache_file, "w") as f:
+            f.write(str(threshold))
+    except OSError:
+        pass
 
 
 def load_statusline_mode_wrapper():
@@ -161,47 +193,190 @@ def save_statusline_mode_wrapper(mode):
     save_statusline_mode(mode, STATUSLINE_MODE_CACHE_FILE)
 
 
-# ─── Arrow Key Selector (Simplified - no favorites) ───────────────────────────
-def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
-    """Interactive arrow-key selector using prompt_toolkit.
+def load_favorites_wrapper():
+    return load_favorites(FAVORITES_CACHE_FILE)
 
-    Returns (selected_index, selected_option) or (None, None) on cancel.
-    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, ENTER, ESC.
-    The highlighted item is always kept visible via auto-scrolling.
-    """
-    if not options:
-        return None, None
+
+def save_favorites_wrapper(favs):
+    save_favorites(favs, FAVORITES_CACHE_FILE)
+
+
+# ─── Favorites Selector ───────────────────────────────────────────────────────
+def favorites_selector(models, current_favorites):
+    """Present a favorites toggle list and return updated favorites set."""
+    if not models:
+        return current_favorites
 
     terminal_height = get_terminal_height()
-    visible_count = max(3, min(terminal_height - 4, len(options)))
-    start_idx = max(0, min(start_idx, len(options) - 1))
+    visible_count = max(3, min(terminal_height - 4, len(models)))
+    start_idx = 0
+
     current = [start_idx]
-    result = [None]
+    result = [None, None, None]
+
+    def get_formatted_options():
+        top = get_top_idx()
+        fragments = []
+        fragments.append(("class:prompt", "Toggle favorites • SPACE to toggle • Enter to confirm • Esc to cancel\n"))
+
+        items_above = top
+        items_below = len(models) - (top + visible_count)
+
+        for i in range(top, min(top + visible_count, len(models))):
+            if i == current[0]:
+                model_id = models[i]
+                is_fav = model_id in current_favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:current", f"  {prefix}{model_id}\n"))
+            else:
+                model_id = models[i]
+                is_fav = model_id in current_favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:normal", f"    {prefix}{model_id}\n"))
+
+        if items_above > 0 or items_below > 0:
+            hint_parts = []
+            if items_above > 0:
+                hint_parts.append(f"{items_above} above")
+            if items_below > 0:
+                hint_parts.append(f"{items_below} below")
+            fragments.append(("class:hint", "  " + " ".join(hint_parts) + "\n"))
+
+        return fragments
 
     def get_top_idx():
         top = current[0] - (current[0] % visible_count)
-        top = max(0, min(top, max(0, len(options) - visible_count)))
+        top = max(0, min(top, max(0, len(models) - visible_count)))
         if current[0] < top:
             top = current[0]
         elif current[0] >= top + visible_count:
             top = current[0] - visible_count + 1
         return top
 
-    def get_formatted_options():
-        top = get_top_idx()
-        fragments = []
+    kb = KeyBindings()
 
-        fragments.append(("class:prompt", prompt + "\n"))
-        fragments.append(("class:hint", "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump • Enter select • Esc cancel\n"))
+    @kb.add("up")
+    def _(event):
+        if current[0] > 0:
+            current[0] -= 1
+
+    @kb.add("down")
+    def _(event):
+        if current[0] < len(models) - 1:
+            current[0] += 1
+
+    @kb.add("space")
+    def _(event):
+        model_id = models[current[0]]
+        if model_id in current_favorites:
+            current_favorites.discard(model_id)
+        else:
+            current_favorites.add(model_id)
+
+    @kb.add("enter")
+    def _(event):
+        result[0] = current[0]
+        event.app.exit()
+
+    @kb.add("escape")
+    def _(event):
+        result[0] = None
+        event.app.exit()
+
+    control = FormattedTextControl(get_formatted_options)
+    window = Window(content=control, height=max(visible_count + 4, 8), always_hide_cursor=True)
+
+    style = Style.from_dict({
+        "current": "reverse",
+        "normal": "",
+        "hint": "italic #888888",
+        "prompt": "bold",
+    })
+
+    app = Application(layout=Layout(HSplit([window])), key_bindings=kb, full_screen=False, style=style, mouse_support=False)
+    app.run()
+
+    if result[0] is not None:
+        save_favorites_wrapper(current_favorites)
+        return current_favorites
+    return current_favorites
+
+
+# ─── Arrow Key Selector ──────────────────────────────────────────────────────
+def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorites=None):
+    """Interactive arrow-key selector using prompt_toolkit.
+
+    Returns (selected_index, selected_option, updated_favorites) or (None, None, None) on cancel.
+    Supports UP/DOWN arrows, PAGE_UP/PAGE_DOWN, HOME/END, LEFT/RIGHT to toggle views,
+    ENTER, ESC, and SPACE to toggle favorites.
+    LEFT cycles to favorites-only view; RIGHT cycles back to full model list.
+    The highlighted item is always kept visible via auto-scrolling.
+    Favorites are shown with ★ prefix; SPACE toggles favorite status.
+    """
+    if not options:
+        return None, None, None
+
+    terminal_height = get_terminal_height()
+    visible_count = max(3, min(terminal_height - 6, len(options)))
+    start_idx = max(0, min(start_idx, len(options) - 1))
+    current = [start_idx, 0]  # [0]=idx, [1]=view (0=full, 1=favorites)
+    result = [None, None, None]  # [0]=idx, [1]=model, [2]=favorites
+
+    if favorites is None:
+        favorites = set()
+
+    def build_options():
+        view_mode = current[1]
+        if view_mode == 0:
+            return [{"type": "model", "id": opt, "idx": i} for i, opt in enumerate(options)]
+        else:
+            fav_entries = []
+            for i, opt in enumerate(options):
+                if opt in favorites:
+                    fav_entries.append({"type": "model", "id": opt, "idx": i})
+            return fav_entries
+
+    def get_formatted_options():
+        opts = build_options()
+        view_mode = current[1]
+        top = current[0] - (current[0] % visible_count)
+        top = max(0, min(top, max(0, len(opts) - visible_count)))
+        if current[0] < top:
+            top = current[0]
+        elif current[0] >= top + visible_count:
+            top = current[0] - visible_count + 1
+
+        if view_mode == 0:
+            hint_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
+        else:
+            hint_text = "  ↑/↓ navigate • PgUp/PgDn page • Home/End jump  Left/Right toggle view• Enter select• SPACE toggle fav• Esc cancel"
+
+        fragments = []
+        fragments.append(("class:hint", hint_text + "\n"))
+
+        if view_mode == 0:
+            view_label = "Full List"
+        else:
+            visible_favs = len([e for e in build_options() if e is not None])
+            view_label = f"Favorites ({visible_favs} fav)"
+        fragments.append(("class:prompt", prompt + f"  ({view_label}) • "))
 
         items_above = top
-        items_below = len(options) - (top + visible_count)
+        items_below = len(opts) - (top + visible_count)
 
-        for i in range(top, min(top + visible_count, len(options))):
+        for i in range(top, min(top + visible_count, len(opts))):
             if i == current[0]:
-                fragments.append(("class:current", f"  → {options[i]}\n"))
+                entry = opts[i]
+                model_id = entry["id"]
+                is_fav = model_id in favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:current", f"  {prefix}{model_id}\n"))
             else:
-                fragments.append(("class:normal", f"    {options[i]}\n"))
+                entry = opts[i]
+                model_id = entry["id"]
+                is_fav = model_id in favorites
+                prefix = "★ " if is_fav else "  "
+                fragments.append(("class:normal", f"    {prefix}{model_id}\n"))
 
         if items_above > 0 or items_below > 0:
             hint_parts = []
@@ -222,18 +397,19 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
 
     @kb.add("down")
     def _(event):
-        if current[0] < len(options) - 1:
+        opts_len = len(build_options())
+        if current[0] < opts_len - 1:
             current[0] += 1
 
     @kb.add("pageup")
     def _(event):
-        page = min(visible_count - 1, len(options))
+        page = min(visible_count - 1, len(build_options()))
         current[0] = max(0, current[0] - page)
 
     @kb.add("pagedown")
     def _(event):
-        page = min(visible_count - 1, len(options))
-        current[0] = min(len(options) - 1, current[0] + page)
+        page = min(visible_count - 1, len(build_options()))
+        current[0] = min(len(build_options()) - 1, current[0] + page)
 
     @kb.add("home")
     def _(event):
@@ -241,16 +417,41 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
 
     @kb.add("end")
     def _(event):
-        current[0] = len(options) - 1
+        opts_len = len(build_options())
+        current[0] = opts_len - 1 if opts_len > 0 else 0
+
+    @kb.add("left")
+    def _(event):
+        if current[1] != 1:
+            current[1] = 1
+            current[0] = min(current[0], len(build_options()) - 1) if build_options() else 0
+
+    @kb.add("right")
+    def _(event):
+        if current[1] != 0:
+            current[1] = 0
+            current[0] = min(current[0], len(options) - 1)
 
     @kb.add("enter")
     def _(event):
         result[0] = current[0]
+        result[2] = favorites
         event.app.exit()
+
+    @kb.add("space")
+    def _(event):
+        opts = build_options()
+        if current[0] < len(opts):
+            model_id = opts[current[0]]["id"]
+            if model_id in favorites:
+                favorites.discard(model_id)
+            else:
+                favorites.add(model_id)
 
     @kb.add("escape")
     def _(event):
         result[0] = None
+        result[2] = None
         event.app.exit()
 
     control = FormattedTextControl(get_formatted_options)
@@ -278,8 +479,15 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0):
     app.run()
 
     if result[0] is not None:
-        return result[0], options[result[0]]
-    return None, None
+        selected_idx = result[0]
+        if current[1] == 1:
+            fav_entries = build_options()
+            if selected_idx < len(fav_entries):
+                orig_idx = fav_entries[selected_idx]["idx"]
+                return orig_idx, options[orig_idx] if orig_idx < len(options) else options[0], favorites
+            return 0, options[0] if options else None, favorites
+        return selected_idx, options[selected_idx] if selected_idx < len(options) else options[0] if options else None, favorites
+    return None, None, None
 
 
 # ─── Model Selection ──────────────────────────────────────────────────────────
@@ -304,7 +512,7 @@ def get_selection_input(prompt, max_val):
             sys.exit(0)
 
 
-def display_and_select(standard, free, combined):
+def display_and_select(standard, free, combined, args=None):
     print("\n========================================")
     print("       ANYAPI CHAT MODELS               ")
     print("========================================")
@@ -345,65 +553,133 @@ def display_and_select(standard, free, combined):
         ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
         display_options.append(f"{model_id}{ctx_str}")
 
-    print("\nUse ↑/↓ arrows to navigate, Enter to select:")
-    selected_idx, _ = arrow_key_selector(display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0)
-    if selected_idx is None:
-        print("\n👋 No model selected. Exiting.")
-        sys.exit(0)
-    selected_model = combined[selected_idx].get("id", "")
+    current_favorites = load_favorites_wrapper()
+
+    if args and args.numeric_model_menu:
+        print("\nUse number selection to choose a model:")
+        default_num = None
+        last_model = load_last_model()
+        if last_model:
+            for i, m in enumerate(combined):
+                if m.get("id") == last_model:
+                    default_num = i + 1
+                    break
+
+        selected_idx = None
+        if default_num:
+            print(f"   (default: {default_num} - {last_model or 'last used'})")
+
+        try:
+            sel = input(f"   Enter model number (1-{len(combined)}): ").strip()
+            if sel and int(sel) > 0 and int(sel) <= len(combined):
+                selected_idx = int(sel) - 1
+            elif not sel and default_num:
+                selected_idx = default_num - 1
+        except (ValueError, KeyboardInterrupt):
+            print("\n👋 Cancelled by user.")
+            sys.exit(0)
+
+        if selected_idx is None:
+            print("\n👋 No model selected. Exiting.")
+            sys.exit(0)
+
+        selected_model = combined[selected_idx].get("id", "")
+        selected_favorites = current_favorites
+    else:
+        if args and args.accept_all_defaults:
+            last_model = load_last_model()
+            if last_model:
+                for i, m in enumerate(combined):
+                    if m.get("id") == last_model:
+                        selected_idx = i
+                        break
+                else:
+                    selected_idx = 0
+            else:
+                selected_idx = None
+        else:
+            print("\nUse ↑/↓ arrows to navigate, Enter to select:")
+            selected_idx, selected_model, current_favorites = arrow_key_selector(
+                display_options, "Select a model:", start_idx=last_idx if last_idx is not None else 0, favorites=current_favorites
+            )
+
+        if selected_idx is None:
+            print("\n👋 No model selected. Exiting.")
+            sys.exit(0)
+        selected_model = combined[selected_idx].get("id", "")
+        selected_favorites = current_favorites
     print(f"\n🚀 Selected Model: {selected_model}")
 
     save_last_model(selected_model)
+    save_favorites_wrapper(current_favorites)
 
-    return selected_model, combined[selected_idx]
+    model_data = combined[selected_idx] if selected_idx is not None and selected_idx < len(combined) else {}
+
+    return selected_model, model_data
 
 
 # ─── Context Window ───────────────────────────────────────────────────────────
-def get_context_window(selected_model, model_data):
+def get_context_window(selected_model, model_data, args=None):
     model_ctx = model_data.get("context_window", 0)
-    cached_ctx = load_last_context()
+    model_cached_ctx = load_model_context(selected_model)
+    default_ctx = model_ctx if model_ctx > 0 else 200000
 
-    if cached_ctx and cached_ctx > 0:
-        default_ctx = cached_ctx
-        source = "cached"
-    elif model_ctx and model_ctx > 0:
-        default_ctx = model_ctx
-        source = "model default"
-    else:
-        default_ctx = 200000
-        source = "fallback"
+    options = []
+    if model_ctx > 0:
+        options.append(("Detected Context Window", model_ctx, "model"))
+    if model_cached_ctx:
+        options.append(("Last Used Context Window", model_cached_ctx, "cached"))
+    options.append(("Enter Custom Context Window", default_ctx, "custom"))
 
-    print(f"\n📏 Context Window Configuration")
+    print(f"\n📏 Context Window Configuration for {selected_model}")
     print(f"   Model default: {model_ctx:,} tokens" if model_ctx > 0 else "   Model default: unknown")
-    print(f"   Last used: {cached_ctx:,} tokens" if cached_ctx and cached_ctx > 0 else "   Last used: none")
-    print(f"   Using: {default_ctx:,} tokens ({source})")
+    print(f"   Last used: {model_cached_ctx:,} tokens" if model_cached_ctx else "   Last used: none")
+
+    for i, (label, value, src) in enumerate(options, 1):
+        src_indicator = {"model": "📦", "cached": "💾", "custom": "✏️"}[src]
+        print(f"   [{i}] {src_indicator} {label}: {value:,} tokens")
+
+    print(f"\n   [0] Cancel")
 
     try:
-        user_input = input(f"\nContext window in tokens [{default_ctx:,}]: ").strip()
-    except EOFError:
+        if args and args.accept_all_defaults:
+            choice = "1"
+        else:
+            choice = input(f"\n📏 Select context window [0-{len(options)}] (ENTER = default, custom number for option {len(options)}): ").strip()
+        if not choice:
+            if model_cached_ctx:
+                choice = "2"
+            else:
+                choice = "1"
+    except (EOFError, KeyboardInterrupt):
+        print("\n👋 Cancelled by user.")
+        return default_ctx
+
+    try:
+        choice_idx = int(choice)
+        if choice_idx == 0:
+            return default_ctx
+        elif 1 <= choice_idx <= len(options):
+            label, value, source = options[choice_idx - 1]
+            if source == "custom":
+                custom_ctx = input(f"Enter custom context window [{value:,}]: ").strip()
+                if not custom_ctx:
+                    context_window = value
+                else:
+                    context_window = int(custom_ctx.replace(",", "").replace("_", ""))
+                print(f"   ✅ Using custom: {context_window:,} tokens")
+            else:
+                context_window = value
+                print(f"   ✅ Selected: {label} = {context_window:,} tokens")
+
+            save_model_context(selected_model, context_window)
+            return context_window
+        else:
+            print(f"   ⚠️  Invalid selection, using default: {default_ctx:,}")
+            return default_ctx
+    except (ValueError, KeyboardInterrupt):
         print(f"\n   Using default: {default_ctx:,} tokens")
         return default_ctx
-    except KeyboardInterrupt:
-        print("\n👋 Cancelled by user.")
-        sys.exit(0)
-
-    if not user_input:
-        context_window = default_ctx
-        print(f"   ✅ Using {context_window:,} tokens")
-    else:
-        try:
-            context_window = int(user_input.replace(",", "").replace("_", ""))
-            if context_window <= 0:
-                print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
-                context_window = default_ctx
-            else:
-                print(f"   ✅ Using custom context window: {context_window:,} tokens")
-        except ValueError:
-            print(f"   ⚠️  Invalid value, using default: {default_ctx:,}")
-            context_window = default_ctx
-
-    save_last_context(context_window)
-    return context_window
 
 
 # ─── Model Access Check ──────────────────────────────────────────────────────
@@ -460,7 +736,7 @@ def generate_litellm_config(selected_model, api_key, context_window=None):
 
 
 # ─── Launch Claude Code ──────────────────────────────────────────────────────
-def launch_claude_with_model(selected_model, context_window, dangerously_skip_permissions=False):
+def launch_claude_with_model(selected_model, context_window, dangerously_skip_permissions=False, compaction_threshold=None):
     claude_cmd = ["claude"]
     if dangerously_skip_permissions:
         claude_cmd.append("--dangerously-skip-permissions")
@@ -475,8 +751,18 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_window)
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"
 
+    compaction_value = compaction_threshold if compaction_threshold is not None else AUTO_COMPACTION_THRESHOLD
+    env["CLAUDE_CODE_COMPACTION_LEVEL"] = str(compaction_value)
+    env["CLAUDE_CODE_PROVIDER"] = PROVIDER_INDICATOR
+
+    statusline_mode = load_statusline_mode(STATUSLINE_MODE_CACHE_FILE)
+    if statusline_mode == "compact":
+        env["CLAUDE_CODE_STATUSLINE_MODE"] = "compact"
+    elif statusline_mode == "full":
+        env["CLAUDE_CODE_STATUSLINE_MODE"] = "full"
+
     setup_claude_persistence()
-    setup_statusline_symlink("claude_statusline.sh", "anyapi")
+    setup_statusline_symlink("claude_statusline.sh", PROVIDER_INDICATOR)
 
     print("\n🚀 Launching Claude Code with selected anyAPI model...")
     print("   (This will open an interactive Claude Code session)")
@@ -491,9 +777,7 @@ def launch_claude_with_model(selected_model, context_window, dangerously_skip_pe
 
 
 # ─── Usage Notes ─────────────────────────────────────────────────────────────
-def print_usage_notes(dangerously_skip_permissions=False):
-    print("=" * 60)
-    print("  AnyAPI → Claude Code Bridge Script")
+def print_usage_notes(dangerously_skip_permissions=False, args=None):
     print("=" * 60)
     print()
     print("📋  SCRIPT PURPOSE:")
@@ -515,6 +799,12 @@ def print_usage_notes(dangerously_skip_permissions=False):
     else:
         print("⚡  PERMISSIONS: Claude Code will show permission prompts")
         print("   (Use --dangerously-skip-permissions to skip these)")
+    print()
+    print("⚡  PARAMETERS:")
+    print(f"   --dangerously-skip-permissions: {'PASSED' if dangerously_skip_permissions else 'NOT passed'}")
+    print(f"   --accept-all-defaults: {'PASSED' if args and args.accept_all_defaults else 'NOT passed'}")
+    print(f"   --numeric-model-menu: {'PASSED' if args and args.numeric_model_menu else 'NOT passed'}")
+    print(f"   --clear-api-key: {'PASSED' if args and args.clear_api_key else 'NOT passed'}")
     print()
     print("🌐  HOW IT WORKS:")
     print("   Claude Code speaks the Anthropic Messages API (/v1/messages).")
@@ -557,9 +847,15 @@ def main():
         default=False,
         help="Auto-accept cached/default values for all prompts (quick re-launch)",
     )
+    parser.add_argument(
+        "--numeric-model-menu",
+        action="store_true",
+        default=False,
+        help="Force TTY model menu with number selection instead of arrow-key selector",
+    )
     args = parser.parse_args()
 
-    print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions)
+    print_usage_notes(dangerously_skip_permissions=args.dangerously_skip_permissions, args=args)
 
     if not ensure_prerequisites(args):
         print("❌ Prerequisites check failed. Exiting.")
@@ -583,9 +879,65 @@ def main():
     all_raw_models = fetch_models(api_key)
 
     standard, free, combined = categorize_models(all_raw_models)
-    selected_model, model_data = display_and_select(standard, free, combined)
+    selected_model, model_data = display_and_select(standard, free, combined, args)
 
-    context_window = get_context_window(selected_model, model_data)
+    context_window = get_context_window(selected_model, model_data, args)
+
+    # Prompt for auto-compaction threshold
+    cached_compaction = load_model_compaction(selected_model)
+    default_compaction = cached_compaction if cached_compaction is not None else AUTO_COMPACTION_THRESHOLD
+    try:
+        if args and args.accept_all_defaults:
+            compaction_input = ""
+        else:
+            compaction_input = input(f"\n🗜️  Auto-Compaction Threshold % [0-100, default: {default_compaction}% (ENTER to accept, custom number to set)]: ").strip()
+        if not compaction_input:
+            context_window_compaction = default_compaction
+        else:
+            try:
+                compaction_val = int(compaction_input)
+                if 0 <= compaction_val <= 100:
+                    context_window_compaction = compaction_val
+                else:
+                    print(f"   ⚠️  Value must be 0-100, using default: {default_compaction}%")
+                    context_window_compaction = default_compaction
+            except ValueError:
+                print(f"   ⚠️  Invalid number, using default: {default_compaction}%")
+                context_window_compaction = default_compaction
+
+        save_model_compaction(selected_model, context_window_compaction)
+        print(f"   ✅ Auto-Compaction Threshold set to {context_window_compaction}%")
+    except (EOFError, KeyboardInterrupt):
+        context_window_compaction = default_compaction
+        print(f"   Using default auto-compaction: {default_compaction}%")
+
+    # Prompt for statusline style
+    cached_mode = load_statusline_mode(STATUSLINE_MODE_CACHE_FILE)
+    if cached_mode == "compact":
+        default_num = 1
+    elif cached_mode == "full":
+        default_num = 2
+    else:
+        default_num = 2
+
+    if args and args.accept_all_defaults:
+        selected_mode = "compact" if default_num == 1 else "full"
+        print(f"   ✅ Using cached statusline mode: {selected_mode} (accept-all-defaults)")
+    else:
+        try:
+            mode_sel = input(f"\n📏 Statusline style [1=compact 1-line, 2=full 2-line, default: {default_num}]: ").strip()
+            if not mode_sel:
+                mode_sel = str(default_num)
+            mode_num = int(mode_sel)
+            if mode_num == 1:
+                selected_mode = "compact"
+            elif mode_num == 2:
+                selected_mode = "full"
+            else:
+                selected_mode = "full" if default_num == 2 else "compact"
+        except (ValueError, TypeError):
+            selected_mode = "full" if default_num == 2 else "compact"
+    save_statusline_mode(selected_mode, STATUSLINE_MODE_CACHE_FILE)
 
     generate_litellm_config(selected_model, api_key, context_window)
     proc = start_litellm_proxy(CONFIG_FILE, PROXY_PORT, PROXY_MASTER_KEY, LOG_FILE, PID_FILE)
@@ -595,7 +947,7 @@ def main():
             print("\n❌ Proxy validation failed. Claude Code likely won't work.")
             print("   Check ~/.claude_anyapi/proxy.log for details.")
             print("   You may still attempt to launch manually.")
-        launch_claude_with_model(selected_model, context_window, args.dangerously_skip_permissions)
+        launch_claude_with_model(selected_model, context_window, args.dangerously_skip_permissions, context_window_compaction)
     finally:
         stop_running_proxy(PID_FILE)
         try:
