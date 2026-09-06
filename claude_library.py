@@ -550,11 +550,20 @@ def ensure_litellm(args=None):
     return False
 
 
+def ensure_prompt_toolkit(args=None):
+    """Ensure prompt_toolkit is installed."""
+    print("   Checking prompt_toolkit...")
+    if install_package("prompt_toolkit", "prompt_toolkit"):
+        return _check_and_prompt_upgrade("prompt_toolkit", "prompt_toolkit", "installed", args)
+    return False
+
+
 def ensure_prerequisites(args=None):
-    """Ensure litellm (with the proxy extras) and the claude CLI are available."""
+    """Ensure litellm (with the proxy extras), prompt_toolkit, and the claude CLI are available."""
     print("🔍 Checking prerequisites...")
     ok = True
     ok &= ensure_litellm(args)
+    ok &= ensure_prompt_toolkit(args)
     ok &= ensure_claude_cli(args)
     return ok
 
