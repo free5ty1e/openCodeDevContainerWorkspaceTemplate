@@ -60,9 +60,15 @@ def run_command(cmd, label="", timeout=300):
 def check_claude_cli_version():
     """Check if the claude CLI is on PATH and has a working native binary.
     Returns tuple of (is_ok, version_string)."""
-    if shutil.which("claude") is None:
+    claude_path = shutil.which("claude")
+    if claude_path is None:
         return False, None
-    rc, out = run_command(["claude", "--version"])
+    try:
+        rc, out = run_command(["claude", "--version"])
+    except OSError as e:
+        # Exec format error or other OS-level error
+        print(f"   ⚠️  claude binary exists but failed to execute: {e}")
+        return False, None
     if rc != 0 or not out:
         return False, None
     has_valid_version = bool(re.match(r".*\d+\.\d+", out.strip()))
@@ -447,6 +453,71 @@ def install_claude_cli(args=None):
     return False
 
 
+def _get_latest_npm_version(package_name):
+    """Get the latest version of an npm package."""
+    try:
+        rc, out = run_command(["npm", "view", package_name, "version"])
+        if rc == 0 and out.strip():
+            return out.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _check_and_prompt_upgrade(package_name, display_name, current_version, args):
+    """Check for available upgrade and prompt user if available.
+    Returns True if upgrade was performed or not needed, False if failed."""
+    # If --accept-all-defaults, skip upgrade check
+    if args and args.accept_all_defaults:
+        return True
+
+    latest_version = _get_latest_npm_version(package_name)
+    if not latest_version:
+        print(f"   Latest {display_name} version: (unable to check)")
+        return True
+
+    # Extract just the version number (e.g., "2.1.261" from "2.1.261 (Claude Code)")
+    current_version = current_version.split()[0] if current_version else current_version
+
+    if latest_version and latest_version != current_version:
+        print(f"   Latest {display_name} version: {latest_version}")
+        try:
+            resp = input(f"   Upgrade {display_name} from {current_version} to {latest_version}? (y/N): ").strip().lower()
+        except EOFError:
+            resp = "n"
+
+        if resp == "y":
+            print(f"   Upgrading {display_name} via npm...")
+            npm_cmd = ["npm", "install", "-g", "--legacy-peer-deps", package_name]
+            rc, out = run_command(npm_cmd, label=f"{package_name}-upgrade")
+
+            # Handle ENOTEMPTY/EPIPE in devcontainers
+            if rc != 0 and ("ENOTEMPTY" in out or "EPIPE" in out):
+                print("   Upgrade encountered issues - attempting cleanup...")
+                run_command(["npm", "bin", "cache", "clean", "--force"])
+                rc, out = run_command(npm_cmd, label=f"{package_name}-upgrade-retry")
+
+            # Handle permission errors
+            if rc != 0 and ("permission" in out.lower() or "EACCES" in out):
+                print("   Upgrade failed with permission error, retrying with sudo...")
+                rc, out = run_command(["sudo"] + npm_cmd, label=f"{package_name}-upgrade-sudo")
+
+            # Re-verify version after upgrade
+            if "claude" in package_name:
+                rc2, out2 = run_command(["claude", "--version"], label="version-after")
+            else:
+                # For other packages, try common command names
+                bin_name = package_name.split("/")[-1].replace("-", "_")
+                rc2, out2 = run_command([bin_name, "--version"], label="version-after")
+            if rc2 == 0:
+                new_version = out2.strip()
+                print(f"   New {display_name} version: {new_version}")
+            else:
+                print(f"   ⚠️  Upgrade may have failed - version check returned non-zero")
+        return True
+    return True
+
+
 def ensure_claude_cli(args=None):
     """Ensure claude CLI is available, installing if needed.
 
@@ -462,56 +533,28 @@ def ensure_claude_cli(args=None):
     if is_ok:
         print(f"   Current claude CLI version: {version}")
 
-        # If --accept-all-defaults, skip upgrade check
-        if args and args.accept_all_defaults:
-            return True
-
-        # Check for available upgrade
-        latest_version = ""
-        try:
-            rc3, out3 = run_command(["npm", "view", "@anthropic-ai/claude-code", "version"])
-            if rc3 == 0 and out3.strip():
-                latest_version = out3.strip()
-        except Exception:
-            pass
-
-        # Extract just the version number (e.g., "2.1.261" from "2.1.261 (Claude Code)")
-        current_version = version.split()[0] if version else version
-
-        if latest_version and latest_version != current_version:
-            print(f"   Latest claude CLI version: {latest_version}")
-            try:
-                resp = input(f"   Upgrade from {current_version} to {latest_version}? (y/N): ").strip().lower()
-            except EOFError:
-                resp = "n"
-
-            if resp == "y":
-                print("   Upgrading claude CLI via npm...")
-                npm_cmd = ["npm", "install", "-g", "--legacy-peer-deps", "@anthropic-ai/claude-code"]
-                rc, out = run_command(npm_cmd, label="cli-upgrade")
-
-                # Handle ENOTEMPTY/EPIPE in devcontainers
-                if rc != 0 and ("ENOTEMPTY" in out or "EPIPE" in out):
-                    print("   Upgrade encountered issues - attempting cleanup...")
-                    run_command(["npm", "bin", "cache", "clean", "--force"])
-                    rc, out = run_command(npm_cmd, label="cli-upgrade-retry")
-
-                # Re-verify version after upgrade
-                rc2, out2 = run_command(["claude", "--version"], label="cli-version-after")
-                if rc2 == 0:
-                    new_version = out2.strip()
-                    print(f"   New claude CLI version: {new_version}")
-        return True
+        # Check for available upgrade and prompt if needed
+        return _check_and_prompt_upgrade("@anthropic-ai/claude-code", "claude CLI", version, args)
 
     # Claude not installed - auto-install it (no prompt needed)
     return install_claude_cli(args)
+
+
+def ensure_litellm(args=None):
+    """Ensure litellm is installed and check for upgrades."""
+    print("   Checking litellm...")
+    # First check if litellm is available
+    if install_package("litellm", "litellm[proxy]"):
+        # Check for available upgrade
+        return _check_and_prompt_upgrade("litellm[proxy]", "litellm", "installed", args)
+    return False
 
 
 def ensure_prerequisites(args=None):
     """Ensure litellm (with the proxy extras) and the claude CLI are available."""
     print("🔍 Checking prerequisites...")
     ok = True
-    ok &= install_package("litellm", "litellm[proxy]")
+    ok &= ensure_litellm(args)
     ok &= ensure_claude_cli(args)
     return ok
 
