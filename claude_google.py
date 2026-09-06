@@ -32,6 +32,7 @@ from claude_library import (
     cache_api_key,
     # Model utilities
     filter_chat_models,
+    categorize_models,
     format_token_count,
     # HTTP
     http_get_json,
