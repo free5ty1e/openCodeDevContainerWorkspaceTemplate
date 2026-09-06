@@ -76,6 +76,33 @@ def check_claude_cli_version():
     return has_valid_version and no_error_messages, out.strip() if has_valid_version and no_error_messages else None
 
 
+def print_failure_diagnostics(pkg_name, error):
+    """Print detailed diagnostics and troubleshooting commands for installation failures."""
+    print(f"\n  🔧 Troubleshooting commands for {pkg_name}:")
+    print(f"     # Try installing manually with verbose output:")
+    print(f"     python3 -m pip install -v {pkg_name}")
+    print(f"     ")
+    print(f"     # If permission issues, try with --user flag:")
+    print(f"     python3 -m pip install --user {pkg_name}")
+    print(f"     ")
+    print(f"     # If pip is broken, try reinstalling pip:")
+    print(f"     python3 -m ensurepip --upgrade")
+    print(f"     python3 -m pip install --upgrade pip")
+    print(f"     ")
+    print(f"     # If network/proxy issues, try with alternative index:")
+    print(f"     python3 -m pip install --index-url https://pypi.org/simple {pkg_name}")
+    print(f"     ")
+    print(f"     # If pip is broken, try reinstalling pip:")
+    print(f"     python3 -m ensurepip --upgrade")
+    print(f"     python3 -m pip install --upgrade pip")
+    print(f"     ")
+    print(f"     # Check Python and pip versions:")
+    print(f"     python3 --version && python3 -m pip --version")
+    print(f"     ")
+    print(f"     # If all else fails, share the error above with another agent")
+    print(f"     # for further troubleshooting.")
+
+
 def install_package(pkg_name, pip_name=None):
     """Check if a package is importable; install via pip if not.
     Returns True if package was available or successfully installed."""
@@ -101,9 +128,11 @@ def install_package(pkg_name, pip_name=None):
         print(f"     Error: {e.stderr.strip() if e.stderr else 'Unknown error'}")
         print(f"     Command: {e.cmd}")
         print(f"     Return code: {e.returncode}")
+        print_failure_diagnostics(pkg_name, e)
         return False
     except Exception as e:
         print(f"  ❌ Unexpected error installing {pip_name}: {e}")
+        print_failure_diagnostics(pkg_name, e)
         return False
 
 
