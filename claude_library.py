@@ -88,14 +88,22 @@ def install_package(pkg_name, pip_name=None):
         pass
     print(f"  📦 Installing {pip_name}...")
     try:
-        subprocess.run(
-            [get_python_executable(), "-m", "pip", "install", "-q", pip_name],
+        result = subprocess.run(
+            [get_python_executable(), "-m", "pip", "install", pip_name],
             check=True,
             capture_output=True,
+            text=True,
         )
+        print(f"  ✅ Successfully installed {pip_name}")
         return True
-    except subprocess.CalledProcessError:
-        print(f"  ❌ Failed to install {pip_name}.")
+    except subprocess.CalledProcessError as e:
+        print(f"  ❌ Failed to install {pip_name}")
+        print(f"     Error: {e.stderr.strip() if e.stderr else 'Unknown error'}")
+        print(f"     Command: {e.cmd}")
+        print(f"     Return code: {e.returncode}")
+        return False
+    except Exception as e:
+        print(f"  ❌ Unexpected error installing {pip_name}: {e}")
         return False
 
 
