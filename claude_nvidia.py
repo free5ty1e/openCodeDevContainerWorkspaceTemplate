@@ -80,11 +80,15 @@ PROVIDER_INDICATOR = "nvidia"
 
 # Context window mapping for display (NVIDIA API doesn't return this)
 CONTEXT_WINDOWS = {
+    "nvidia/nemotron-3-super-120b-a12b": 1000000,
+    "nvidia/nemotron-3-ultra-550b-a55b": 1000000,
     "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
     "moonshotai/kimi-k3": 1000000,
     "deepseek-ai/deepseek-v4-pro-0813": 1000000,
     "deepseek-ai/deepseek-v4-flash-0731": 1000000,
     "poolside/laguna-xs-2.1": 262000,
+    "meta/muse-glimmer-30b": 131000,
+    "google/gemma-4-31b-it": 262000,
 }
 
 # ─── Provider-Specific Functions ──────────────────────────────────────────────
