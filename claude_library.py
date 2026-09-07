@@ -324,16 +324,64 @@ def http_get_json(url, api_key=None, use_query_param=False, timeout=30):
 # ─── Proxy Management ─────────────────────────────────────────────────────
 
 def get_litellm_binary():
-    """Find the litellm binary, preferring venv, then system install."""
-    # Check venv first
-    venv_litellm = "/workspace/.venv/bin/litellm"
-    if os.path.isfile(venv_litellm) and os.access(venv_litellm, os.X_OK):
-        return venv_litellm
+    """Find the litellm binary, trying multiple locations and install strategies."""
+    import shutil
 
-    # Fall back to shutil.which
-    bin_path = shutil.which("litellm")
-    if bin_path:
-        return bin_path
+    # Look for the binary in a list of candidate locations
+    candidate_paths = [
+        "/workspace/.venv/bin/litellm",                    # workspace virtualenv
+        os.path.expanduser("~/.local/bin/litellm"),        # pip --user
+        os.path.expanduser("~/venv/bin/litellm"),          # user venv
+        shutil.which("litellm"),                           # on PATH (system or pipx)
+    ]
+    for path in candidate_paths:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    # Not found on disk — attempt to install litellm[proxy]
+    print("   📦 Installing litellm[proxy]...")
+
+    # pip-driven strategies, ordered by least-to-most invasive
+    install_strategies = [
+        ([sys.executable, "-m", "pip", "install", "--user", "-q", "litellm[proxy]"],
+         "pip install --user"),
+        ([sys.executable, "-m", "pip", "install", "-q", "litellm[proxy]"],
+         "pip install (default)"),
+        (["pip", "install", "--user", "-q", "litellm[proxy]"],
+         "pip (PATH) --user"),
+        ([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "litellm[proxy]"],
+         "pip install --break-system-packages"),
+    ]
+
+    for cmd, desc in install_strategies:
+        try:
+            print(f"  📦 Trying {desc}...")
+            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+            # Re-check all candidate locations after the install
+            for path in candidate_paths:
+                if path and os.path.isfile(path) and os.access(path, os.X_OK):
+                    print(f"  ✅ litellm installed via {desc} at {path}")
+                    return path
+            # Also re-check PATH in case the shell picks it up fresh
+            fresh = shutil.which("litellm")
+            if fresh:
+                return fresh
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or "").strip()
+            print(f"  ⚠️  {desc} failed: {err[:200] if err else 'Unknown error'}")
+        except FileNotFoundError as e:
+            print(f"  ⚠️  {desc} failed (command not found): {e}")
+        except Exception as e:
+            print(f"  ⚠️  {desc} error: {e}")
+
+    # Fallback: is litellm importable but simply missing a console entry point?
+    try:
+        import litellm
+        version = getattr(litellm, "__version__", "unknown")
+        print(f"  ℹ️  litellm is importable (v{version}) but no CLI binary was found on disk.")
+        print("      The proxy needs the `litellm` console script; try 'pip install litellm[proxy]'.")
+    except ImportError:
+        pass
 
     return None
 
@@ -391,6 +439,13 @@ def start_litellm_proxy(config_file, port, master_key, log_file, pid_file):
 
     if litellm_bin is None:
         print("   ❌ Could not find or install litellm CLI binary")
+        print(f"   Trying to install: {['pip', 'install', '-q', 'litellm[proxy]']}")
+        print(f"   Trying user install: {sys.executable} -m pip install --user -q litellm[proxy]")
+        if shutil.which("pipx"):
+            print(f"   Trying pipx install: pipx install litellm[proxy]")
+        print(f"\n   💡 Troubleshooting command:")
+        print(f"   {sys.executable} -m pip install --user litellm[proxy]")
+        print(f"   or: sudo {sys.executable} -m pip install litellm[proxy]")
         return None
 
     with open(log_file, "w") as logf:
@@ -608,10 +663,15 @@ def ensure_claude_cli(args=None):
 
 
 def ensure_litellm(args=None):
-    """Ensure litellm is installed and check for upgrades."""
+    """Ensure litellm is installed AND its CLI binary is available, and check for upgrades."""
     print("   Checking litellm...")
-    # First check if litellm is available
+    # First check if litellm Python package is importable OR the CLI binary exists
     if install_package("litellm", "litellm[proxy]"):
+        # Verify the CLI binary is actually available (not just the Python package)
+        litellm_bin = get_litellm_binary()
+        if litellm_bin is None:
+            print("   ⚠️  litellm Python package is importable but the CLI binary is missing.")
+            print("       The proxy requires the `litellm` console script.")
         # Check for available upgrade
         return _check_and_prompt_upgrade("litellm[proxy]", "litellm", "installed", args)
     return False
