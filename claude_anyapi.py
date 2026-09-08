@@ -27,6 +27,7 @@ from claude_library import (
     # Model utilities
     filter_chat_models,
     format_token_count,
+    categorize_models,
     # HTTP
     http_get_json,
     # Proxy management
@@ -56,7 +57,7 @@ from claude_library import (
 )
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-ANYAPI_BASE_URL = "https://api.anyapi.example/v1"
+ANYAPI_BASE_URL = "https://api.anyapi.ai/v1"
 ANYAPI_MODELS_ENDPOINT = f"{ANYAPI_BASE_URL}/models"
 ANYAPI_CHAT_ENDPOINT_TEMPLATE = f"{ANYAPI_BASE_URL}/models/{{model}}:chat"
 
@@ -78,6 +79,18 @@ PROVIDER_INDICATOR = "anyapi"
 
 # ─── Provider-Specific Functions ──────────────────────────────────────────────
 
+def api_model_id(model_id):
+    """Map an anyAPI model id to the id their chat endpoint actually accepts.
+
+    The /v1/models list tags free-tier models with a ``:free`` suffix
+    (e.g. ``qwen/qwen3-coder:free``), but the chat-completions endpoint
+    404s on that suffix and expects the bare id (``qwen/qwen3-coder``).
+    """
+    if model_id.endswith(":free"):
+        return model_id[:-len(":free")]
+    return model_id
+
+
 def fetch_models(api_key):
     """Fetch the list of available models from the anyAPI provider."""
     try:
@@ -95,14 +108,17 @@ def fetch_models(api_key):
             if any(keyword in model_id_lower for keyword in NON_CHAT_KEYWORDS):
                 continue
 
+            # anyAPI marks free-tier models with a trailing ":free" suffix.
             is_free = (
                 "community" in owned_by
-                or "free" in model_id_lower
+                or model_id_lower.endswith(":free")
             )
 
             context_window = (
                 m.get("input_token_limit")
+                or m.get("max_input_tokens")
                 or m.get("inputTokenLimit")
+                or m.get("maxInputTokens")
                 or m.get("max_tokens")
                 or m.get("maxTokens")
                 or m.get("context_length")
@@ -110,7 +126,13 @@ def fetch_models(api_key):
                 or 0
             )
 
-            models.append({"id": model_id, "owned_by": owned_by, "is_free": is_free, "context_window": context_window})
+            models.append({
+                "id": model_id,
+                "api_model": api_model_id(model_id),
+                "owned_by": owned_by,
+                "is_free": is_free,
+                "context_window": context_window,
+            })
         return models
     except Exception as e:
         print(f"❌ Failed to retrieve models: {e}")
@@ -200,6 +222,14 @@ def favorites_selector(models, current_favorites):
     """Present a favorites toggle list and return updated favorites set."""
     if not models:
         return current_favorites
+
+    # Import prompt_toolkit here (after prerequisites are ensured installed)
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout, HSplit
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.styles import Style
 
     terminal_height = get_terminal_height()
     visible_count = max(3, min(terminal_height - 4, len(models)))
@@ -309,6 +339,14 @@ def arrow_key_selector(options, prompt="Select an option:", start_idx=0, favorit
     """
     if not options:
         return None, None, None
+
+    # Import prompt_toolkit here (after prerequisites are ensured installed)
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout, HSplit
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.styles import Style
 
     terminal_height = get_terminal_height()
     visible_count = max(3, min(terminal_height - 6, len(options)))
@@ -708,7 +746,7 @@ def generate_litellm_config(selected_model, api_key, context_window=None):
     }
 
     params = {
-        "model": f"openai/{selected_model}",
+        "model": f"openai/{api_model_id(selected_model)}",
         "api_base": ANYAPI_BASE_URL,
     }
     if api_key:
@@ -872,7 +910,9 @@ def main():
     print("\n🔄 Fetching model list from anyAPI...")
     all_raw_models = fetch_models(api_key)
 
-    standard, free, combined = categorize_models(all_raw_models)
+    # anyAPI marks free-tier models with a trailing ":free" suffix (owned_by is
+    # always "openai", so the generic keyword heuristics over-match standard models).
+    standard, free, combined = categorize_models(all_raw_models, free_keywords=[":free"])
     selected_model, model_data = display_and_select(standard, free, combined, args)
 
     context_window = get_context_window(selected_model, model_data, args)

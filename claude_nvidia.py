@@ -187,6 +187,14 @@ def favorites_selector(models, current_favorites):
     if not models:
         return current_favorites
 
+    # Import prompt_toolkit here (after prerequisites are ensured installed)
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout, HSplit
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.styles import Style
+
     terminal_height = get_terminal_height()
     visible_count = max(3, min(terminal_height - 4, len(models)))
     start_idx = 0

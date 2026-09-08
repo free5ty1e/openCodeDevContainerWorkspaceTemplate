@@ -33,6 +33,14 @@ import re
 # Default paths
 DEFAULT_VENV_PYTHON = "/workspace/.venv/bin/python3"
 
+# The litellm install spec that pulls in ALL proxy runtime dependencies.
+# `proxy` provides the console script + core proxy deps (fastapi, uvicorn, ...),
+# while `extra-proxy` additionally provides `prisma`, which the proxy's DB
+# error-handler imports even when `store_model_in_db` is disabled. A bare
+# `litellm[proxy]` (or bare `litellm`) leaves `prisma` missing and crashes the
+# proxy on any unauthenticated request. Use both extras together, always.
+LITELLM_PROXY_SPEC = "litellm[proxy,extra-proxy]"
+
 
 # ─── Utility Functions ───────────────────────────────────────────────────────
 
@@ -103,16 +111,21 @@ def print_failure_diagnostics(pkg_name, error):
     print(f"     # for further troubleshooting.")
 
 
-def install_package(pkg_name, pip_name=None):
+def install_package(pkg_name, pip_name=None, force=False):
     """Check if a package is importable; install via pip if not.
+
+    When ``force`` is True, pip is invoked even if the package is already
+    importable. This is used to repair installs that are missing optional
+    extras (e.g. a bare ``litellm`` that lacks the ``[proxy]`` extras).
     Returns True if package was available or successfully installed."""
     pip_name = pip_name or pkg_name
-    try:
-        __import__(pkg_name)
-        print(f"  ✅ {pkg_name} already available")
-        return True
-    except ImportError:
-        pass
+    if not force:
+        try:
+            __import__(pkg_name)
+            print(f"  ✅ {pkg_name} already available")
+            return True
+        except ImportError:
+            pass
     print(f"  📦 Installing {pip_name}...")
 
     # Try different installation strategies
@@ -338,18 +351,18 @@ def get_litellm_binary():
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
 
-    # Not found on disk — attempt to install litellm[proxy]
-    print("   📦 Installing litellm[proxy]...")
+    # Not found on disk — attempt to install litellm proxy extras
+    print(f"   📦 Installing {LITELLM_PROXY_SPEC}...")
 
     # pip-driven strategies, ordered by least-to-most invasive
     install_strategies = [
-        ([sys.executable, "-m", "pip", "install", "--user", "-q", "litellm[proxy]"],
+        ([sys.executable, "-m", "pip", "install", "--user", "-q", LITELLM_PROXY_SPEC],
          "pip install --user"),
-        ([sys.executable, "-m", "pip", "install", "-q", "litellm[proxy]"],
+        ([sys.executable, "-m", "pip", "install", "-q", LITELLM_PROXY_SPEC],
          "pip install (default)"),
-        (["pip", "install", "--user", "-q", "litellm[proxy]"],
+        (["pip", "install", "--user", "-q", LITELLM_PROXY_SPEC],
          "pip (PATH) --user"),
-        ([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "litellm[proxy]"],
+        ([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", LITELLM_PROXY_SPEC],
          "pip install --break-system-packages"),
     ]
 
@@ -379,7 +392,8 @@ def get_litellm_binary():
         import litellm
         version = getattr(litellm, "__version__", "unknown")
         print(f"  ℹ️  litellm is importable (v{version}) but no CLI binary was found on disk.")
-        print("      The proxy needs the `litellm` console script; try 'pip install litellm[proxy]'.")
+        print("      The proxy needs the `litellm` console script; try "
+              f"'pip install {LITELLM_PROXY_SPEC}'.")
     except ImportError:
         pass
 
@@ -430,22 +444,22 @@ def start_litellm_proxy(config_file, port, master_key, log_file, pid_file):
 
     # If not found, try to install
     if litellm_bin is None:
-        print("   📦 Installing litellm[proxy] system-wide...")
+        print(f"   📦 Installing {LITELLM_PROXY_SPEC} system-wide...")
         subprocess.run(
-            ["pip", "install", "--break-system-packages", "-q", "litellm[proxy]"],
+            ["pip", "install", "--break-system-packages", "-q", LITELLM_PROXY_SPEC],
             capture_output=True, timeout=180,
         )
         litellm_bin = get_litellm_binary()
 
     if litellm_bin is None:
         print("   ❌ Could not find or install litellm CLI binary")
-        print(f"   Trying to install: {['pip', 'install', '-q', 'litellm[proxy]']}")
-        print(f"   Trying user install: {sys.executable} -m pip install --user -q litellm[proxy]")
+        print(f"   Trying to install: {['pip', 'install', '-q', LITELLM_PROXY_SPEC]}")
+        print(f"   Trying user install: {sys.executable} -m pip install --user -q {LITELLM_PROXY_SPEC}")
         if shutil.which("pipx"):
-            print(f"   Trying pipx install: pipx install litellm[proxy]")
+            print(f"   Trying pipx install: pipx install {LITELLM_PROXY_SPEC}")
         print(f"\n   💡 Troubleshooting command:")
-        print(f"   {sys.executable} -m pip install --user litellm[proxy]")
-        print(f"   or: sudo {sys.executable} -m pip install litellm[proxy]")
+        print(f"   {sys.executable} -m pip install --user {LITELLM_PROXY_SPEC}")
+        print(f"   or: sudo {sys.executable} -m pip install {LITELLM_PROXY_SPEC}")
         return None
 
     with open(log_file, "w") as logf:
@@ -662,18 +676,67 @@ def ensure_claude_cli(args=None):
     return install_claude_cli(args)
 
 
+def _litellm_proxy_deps_present():
+    """Return True only when the litellm proxy has everything it needs at runtime.
+
+    litellm's proxy has runtime deps that are NOT pulled in by a bare
+    ``pip install litellm``:
+      * the ``litellm`` console script (provided by the ``[proxy]`` extra)
+      * the ``prisma`` module (provided by the ``extra-proxy`` extra), which the
+        proxy's DB error-handler imports even when ``store_model_in_db`` is off.
+
+    Missing either one surfaces as a confusing crash only after the proxy is up,
+    so we check both explicitly up front.
+    """
+    if get_litellm_binary() is None:
+        return False
+    try:
+        import prisma  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def ensure_litellm(args=None):
-    """Ensure litellm is installed AND its CLI binary is available, and check for upgrades."""
+    """Ensure litellm (with proxy extras) is fully available, and check for upgrades."""
     print("   Checking litellm...")
-    # First check if litellm Python package is importable OR the CLI binary exists
-    if install_package("litellm", "litellm[proxy]"):
-        # Verify the CLI binary is actually available (not just the Python package)
-        litellm_bin = get_litellm_binary()
-        if litellm_bin is None:
-            print("   ⚠️  litellm Python package is importable but the CLI binary is missing.")
-            print("       The proxy requires the `litellm` console script.")
-        # Check for available upgrade
-        return _check_and_prompt_upgrade("litellm[proxy]", "litellm", "installed", args)
+    # The bare Python package may be importable while the proxy runtime deps
+    # (console script + prisma) are still missing. Check everything explicitly.
+    try:
+        import litellm  # noqa: F401
+        pkg_importable = True
+    except ImportError:
+        pkg_importable = False
+
+    if pkg_importable and _litellm_proxy_deps_present():
+        print("  ✅ litellm already available")
+        return _check_and_prompt_upgrade(LITELLM_PROXY_SPEC, "litellm", "installed", args)
+
+    # Either the package is missing, or it's present but the proxy extras
+    # (console script / prisma) are not. Install/repair with the proxy extras.
+    if pkg_importable:
+        print("   ⚠️  litellm is importable but proxy extras (prisma / CLI binary) are missing.")
+        print(f"       Reinstalling with `{LITELLM_PROXY_SPEC}` to pull in the proxy runtime deps...")
+    else:
+        print(f"   📦 Installing {LITELLM_PROXY_SPEC}...")
+
+    if install_package("litellm", LITELLM_PROXY_SPEC, force=True):
+        # Re-verify the full runtime deps actually landed.
+        if _litellm_proxy_deps_present():
+            print(f"  ✅ {LITELLM_PROXY_SPEC} installed with all runtime dependencies")
+            return _check_and_prompt_upgrade(LITELLM_PROXY_SPEC, "litellm", "installed", args)
+        else:
+            missing = []
+            if get_litellm_binary() is None:
+                missing.append("CLI binary (litellm console script)")
+            try:
+                import prisma  # noqa: F401
+            except ImportError:
+                missing.append("prisma module")
+            print(f"   ❌ litellm installed but still missing: {', '.join(missing)}")
+            print("   💡 Try manually: "
+                  f"{sys.executable} -m pip install --user {LITELLM_PROXY_SPEC}")
+            return False
     return False
 
 
