@@ -316,6 +316,69 @@ def categorize_models(models, non_chat_keywords=None, free_keywords=None):
     return filter_chat_models(models, non_chat_keywords, free_keywords)
 
 
+# ─── NVIDIA Context Window Retrieval ──────────────────────────────────────────
+
+def fetch_nvidia_context_windows(model_ids, cache_file, on_progress=None, timeout=20):
+    """Resolve context windows for a list of NVIDIA NIM model ids.
+
+    NVIDIA's ``integrate.api.nvidia.com/v1/models`` endpoint does NOT return
+    context sizes (only id/object/created/owned_by). The authoritative source is
+    NVIDIA's own catalog page at ``build.nvidia.com/<org>/<model>``, which embeds
+    ``{"specifications": {"contextLength": <tokens>}}`` in its payload. This
+    scrapes that value for each model and caches it to disk so repeat runs are
+    instant and models only missing from the cache are (re)fetched.
+
+    The cache is a JSON file mapping model id -> context token count. Only
+    models NOT already present in the cache are fetched. Returns the merged
+    dict of {model_id: context_window}.
+    """
+    # Load any existing cache.
+    cached = {}
+    if cache_file and os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cached = {k: int(v) for k, v in json.load(f).items()}
+        except (OSError, ValueError, json.JSONDecodeError):
+            cached = {}
+
+    missing = [mid for mid in model_ids if mid not in cached]
+
+    results = dict(cached)
+    if not missing:
+        return results
+
+    fetched = 0
+    for mid in missing:
+        url = f"https://build.nvidia.com/{mid}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                html = resp.read().decode("utf-8", "replace")
+            m = re.search(r"contextLength\\?\"?\s*:\s*(\d+)", html)
+            if m:
+                results[mid] = int(m.group(1))
+            fetched += 1
+        except Exception:
+            # Legacy/deprecated NIMs have stub catalog pages without contextLength.
+            # Leave them absent so the caller falls back to its curated map.
+            pass
+        if on_progress:
+            on_progress(fetched, len(missing), mid)
+        elif fetched and fetched % 10 == 0:
+            print(f"   📏 Scraped context for {fetched}/{len(missing)} uncached models...")
+
+    # Persist the merged cache.
+    if cache_file:
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump({k: v for k, v in results.items()}, f, indent=1)
+        except OSError:
+            pass
+
+    return results
+
+
 # ─── HTTP Utilities ───────────────────────────────────────────────────────
 
 def http_get_json(url, api_key=None, use_query_param=False, timeout=30):

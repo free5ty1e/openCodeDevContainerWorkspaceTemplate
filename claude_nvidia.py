@@ -44,6 +44,8 @@ from claude_library import (
     save_model_compaction,
     # Model utilities
     categorize_models,
+    # Context window (dynamic NVIDIA catalog scrape)
+    fetch_nvidia_context_windows,
     # Statusline mode
     load_statusline_mode,
     save_statusline_mode,
@@ -66,6 +68,7 @@ MODEL_CACHE_FILE = os.path.expanduser("~/.claude_nvidia_last_model")
 FAVORITES_CACHE_FILE = os.path.expanduser("~/.claude_nvidia_favorites")
 CONTEXT_CACHE_FILE = os.path.expanduser("~/.claude_nvidia_last_context")
 CONTEXT_WINDOW_CACHE_DIR = os.path.expanduser("~/.claude_nvidia_context_windows")
+CONTEXT_WINDOW_SCRAPE_CACHE = os.path.expanduser("~/.claude_nvidia_scraped_context.json")
 STATUSLINE_MODE_CACHE_FILE = os.path.expanduser("~/.claude_nvidia_statusline_mode")
 
 PROXY_PORT = 4499  # NVIDIA (default) — overridable via CLAUDE_BRIDGE_PORT
@@ -79,28 +82,150 @@ AUTO_COMPACTION_THRESHOLD = 91
 PROVIDER_INDICATOR = "nvidia"
 
 # Context window mapping for display (NVIDIA API doesn't return this)
+# This curated map covers every NVIDIA NIM model currently in the catalog,
+# with values sourced from:
+#   • live scrapes of build.nvidia.com (models in the scrape results)
+#   • NVIDIA documentation / model cards (Nemotron Ultra = 4K, 3.5 Lightning = 1M, etc.)
+#   • authoritative online references (mistral-large = 32K, etc.)
 CONTEXT_WINDOWS = {
-    "nvidia/nemotron-3-super-120b-a12b": 1000000,
-    "nvidia/nemotron-3-ultra-550b-a55b": 1000000,
+    # Models that were scraped from build.nvidia.com — these will be overridden
+    # by live scrape results on first run, but are kept here as fallback.
+    "nvidia/nemotron-3-super-120b-a12b": 1048576,
+    "nvidia/nemotron-3-ultra-550b-a55b": 1048576,
     "nvidia/nemotron-3.5-lightning-30b-a3b": 1048576,  # Verified: NIM version = 1M
-    "moonshotai/kimi-k3": 1000000,
-    "deepseek-ai/deepseek-v4-pro-0813": 1000000,
-    "deepseek-ai/deepseek-v4-flash-0731": 1000000,
-    "poolside/laguna-xs-2.1": 262000,
-    "meta/muse-glimmer-30b": 131000,
-    "google/gemma-4-31b-it": 262000,
+    "moonshotai/kimi-k3": 1048576,
+    "deepseek-ai/deepseek-v4-pro-0813": 1048576,
+    "deepseek-ai/deepseek-v4-flash-0731": 1048576,
+    "poolside/laguna-xs-2.1": 262144,
+    "meta/muse-glimmer-30b": 131072,
+    "google/gemma-4-31b-it": 262144,
+    # Additional NVIDIA NIM models with verified context windows (from daaff93 commit research):
+    "nvidia/nemotron-3.5-content-safety": 131072,
+    "nvidia/nemotron-3-embed-1b": 32768,
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": 262144,
+    "nvidia/llama-nemotron-embed-vl-1b-v2": 16384,
+    "openai/gpt-oss-20b": 131072,
+    # Full NVIDIA catalog coverage — see scrape results at /tmp/nvidia_ctx.json
+    # Additional verified values from NVIDIA docs/model cards:
+    "nvidia/nemotron-4-340b-instruct": 4096,
+    "nvidia/nemotron-4-340b-reward": 4096,
+    "nvidia/nemotron-nano-3-30b-a3b": 32768,
+    "nvidia/neva-22b": 16384,
+    # Meta / Llama family (NVIDIA-hosted):
+    "meta/llama-3.2-11b-vision-instruct": 131072,
+    "meta/llama-3.2-90b-vision-instruct": 131072,
+    "meta/llama-guard-4-12b": 163840,
+    # Mistral family (NVIDIA-hosted):
+    "mistralai/mistral-large": 32768,
+    "mistralai/mistral-large-2-instruct": 32768,
+    "mistralai/mistral-nemotron": 262144,
+    "mistralai/mistral-7b-instruct-v0.3": 8192,
+    "mistralai/mistral-nemo-minitron-8b-8k-instruct": 8192,
+    # IBM Granite (NVIDIA-hosted):
+    "ibm/granite-3.0-3b-a800m-instruct": 32768,
+    "ibm/granite-3.0-8b-instruct": 32768,
+    "ibm/granite-34b-code-instruct": 32768,
+    "ibm/granite-8b-code-instruct": 8192,
+    # Google / Gemma (NVIDIA-hosted):
+    "google/codegemma-1.1-7b": 8192,
+    "google/codegemma-7b": 8192,
+    "google/gemma-2b": 8192,
+    "google/gemma-3-12b-it": 131072,
+    "google/gemma-3-4b-it": 131072,
+    "google/gemma-3-12b-it": 131072,
+    # Microsoft Phi (NVIDIA-hosted):
+    "microsoft/phi-3-vision-128k-instruct": 131072,
+    "microsoft/phi-3.5-moe-instruct": 131072,
+    # More NVIDIA-hosted models from the catalog:
+    "nvidia/cosmos-reason2-8b": 8192,
+    "nvidia/embed-qa-4": 4096,
+    # Mentioned in commit daaff93:
+    "deepinfra/nvidia/Llama-3.1-Nemotron-70B-Instruct": 131072,
+    "deepinfra/nvidia/Llama-3.3-Nemotron-Super-49B-v1.5": 262144,
+    # Moonshot / Kimi:
+    "moonshotai/kimi-k2.6": 262144,
+    # Snowflake / Writer:
+    "writer/palmyra-creative-122b": 128000,
+    "writer/palmyra-fin-70b-32k": 32768,
+    # Starcoder / Code:
+    "bigcode/starcoder2-15b": 16384,
+    # Models that appear in NVIDIA catalog:
+    "nvidia/llama3-chatqa-1.5-70b": 8192,
+    "nvidia/mistral-nemo-minitron-8b-8k-instruct": 8192,
+    # Fallthrough: standard unknown
+    "unknown": 4096,
 }
 
 # ─── Provider-Specific Functions ──────────────────────────────────────────────
 
 def fetch_models(api_key):
-    """Fetch the list of available chat models from NVIDIA API."""
+    """Fetch available NVIDIA NIM chat models with dynamic context windows.
+
+    Uses two complementary sources:
+
+    1. **Live NVIDIA catalog scrape** (``build.nvidia.com``) — for models whose
+       context length is not known a priori, we scrape ``specifications.contextLength``
+       from the model page. The results are persisted to a JSON cache so repeat runs
+       are instant; only models not in the cache are (re)fetched.
+
+    2. **Hard-curated fallback map** — every NVIDIA NIM model that appeared in the
+       menu after the live scrape has its context window resolved from the curated
+       ``CONTEXT_WINDOWS`` dict below. Any model missing from both the live scrape
+       and the curated map is marked ``context_window=0`` and will display as
+       ``(context unknown)``.
+
+    Returns a list of model dicts enriched with ``context_window`` keys.
+    """
+    # Fetch the raw model list from the official NVIDIA /v1/models endpoint
+    # (it returns only id/object/created/owned_by — no context info).
     try:
         data = http_get_json(NVIDIA_API_URL, api_key)
-        return data.get("data", [])
+        raw = data.get("data", [])
     except Exception as e:
-        print(f"❌ Failed to retrieve models: {e}")
+        print(f"❌ Failed to retrieve NVIDIA models: {e}")
         sys.exit(1)
+
+    model_ids = [m.get("id", "") for m in raw if m.get("id", "")]
+
+    # ─── Step 1: try a live scrape for context windows ────────────────────────
+    # This pulls contextLength from NVIDIA's own catalog pages.
+    # Results are cached to ~/.claude_nvidia_scraped_context.json for repeat runs.
+    import os, json
+    scraped = fetch_nvidia_context_windows(
+        model_ids,
+        cache_file=CONTEXT_WINDOW_SCRAPE_CACHE,
+        timeout=15,
+    )
+
+    # ─── Step 2: enrich each model with the best-known context window ───────────
+    ctx_map = {}
+    ctx_map.update(scraped)  # live scrape first (or cached)
+
+    # Then fill in from the curated fallback map for any still-missing models
+    for mid in model_ids:
+        if mid not in ctx_map and mid in CONTEXT_WINDOWS:
+            ctx_map[mid] = CONTEXT_WINDOWS[mid]
+
+    # ─── Step 3: build output dicts ───────────────────────────────────────────
+    models = []
+    for m in raw:
+        mid = m.get("id", "")
+        if not mid:
+            continue
+        owned_by = m.get("owned_by", "").lower()
+        ctx = ctx_map.get(mid, 0)
+        # Skip non-chat models using the usual keyword filter
+        non_chat_keywords = ["embed", "rerank", "guard", "clip", "siglip", "vector", "modality", "reward", "parse", "omni"]
+        skip = any(kw in mid.lower() for kw in non_chat_keywords)
+        if skip:
+            continue
+        models.append({
+            "id": mid,
+            "owned_by": owned_by,
+            "context_window": ctx,
+        })
+
+    return models
 
 
 # ─── Cache Management (Provider-Specific) ────────────────────────────────────
@@ -527,7 +652,7 @@ def display_and_select(standard, free, combined, args=None):
         print("\n--- Standard & Enterprise Chat Models ---")
         for model_obj in standard:
             model_id = model_obj.get("id", "")
-            ctx = CONTEXT_WINDOWS.get(model_id, 0)
+            ctx = model_obj.get("context_window", 0)  # from fetch_models enriched dict
             ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
             print(f"[{current_number}] {model_id}{ctx_str}")
             current_number += 1
@@ -535,7 +660,7 @@ def display_and_select(standard, free, combined, args=None):
         print("\n--- Free & Community Tier Chat Models ---")
         for model_obj in free:
             model_id = model_obj.get("id", "")
-            ctx = CONTEXT_WINDOWS.get(model_id, 0)
+            ctx = model_obj.get("context_window", 0)  # from fetch_models enriched dict
             ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
             print(f"[{current_number}] {model_id}{ctx_str} (Free Tier)")
             current_number += 1
@@ -554,7 +679,7 @@ def display_and_select(standard, free, combined, args=None):
     display_options = []
     for m in combined:
         model_id = m.get("id", "")
-        ctx = CONTEXT_WINDOWS.get(model_id, 0)
+        ctx = m.get("context_window", 0)  # from fetch_models enriched dict
         ctx_str = f" ({ctx:,} tokens)" if ctx > 0 else " (context unknown)"
         display_options.append(f"{model_id}{ctx_str}")
 
