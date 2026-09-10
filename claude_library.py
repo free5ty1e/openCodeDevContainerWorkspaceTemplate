@@ -318,7 +318,7 @@ def categorize_models(models, non_chat_keywords=None, free_keywords=None):
 
 # ─── NVIDIA Context Window Retrieval ──────────────────────────────────────────
 
-def fetch_nvidia_context_windows(model_ids, cache_file, on_progress=None, timeout=20):
+def fetch_nvidia_context_windows(model_ids, cache_file, on_progress=None, timeout=20, force=False):
     """Resolve context windows for a list of NVIDIA NIM model ids.
 
     NVIDIA's ``integrate.api.nvidia.com/v1/models`` endpoint does NOT return
@@ -331,6 +331,14 @@ def fetch_nvidia_context_windows(model_ids, cache_file, on_progress=None, timeou
     The cache is a JSON file mapping model id -> context token count. Only
     models NOT already present in the cache are fetched. Returns the merged
     dict of {model_id: context_window}.
+
+    Args:
+        model_ids: List of model IDs to resolve context for.
+        cache_file: Path to the JSON cache file.
+        on_progress: Optional callback(fetched, total, model_id) for progress.
+        timeout: HTTP timeout in seconds.
+        force: If True, return only cached values (skip live scrape entirely).
+               Use this when the user explicitly opted out of scraping.
     """
     # Load any existing cache.
     cached = {}
@@ -340,6 +348,11 @@ def fetch_nvidia_context_windows(model_ids, cache_file, on_progress=None, timeou
                 cached = {k: int(v) for k, v in json.load(f).items()}
         except (OSError, ValueError, json.JSONDecodeError):
             cached = {}
+
+    # If force=True, return only what's cached (may be empty if no cache exists).
+    # This is used when user opts out of scraping.
+    if force:
+        return dict(cached)
 
     missing = [mid for mid in model_ids if mid not in cached]
 

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""
-NVIDIA NIM → Claude Code Bridge Script
+"""NVIDIA NIM → Claude Code Bridge Script
 
 Bridges NVIDIA NIM models with the Claude Code CLI via a local litellm proxy.
+
+**IMPORTANT**: This script is designed to run from the workspace virtualenv at /workspace/.venv/.
+If running from a different python, it will attempt to use the workspace
+virtualenv at /workspace/.venv/ for all pip operations and the litellm binary.
+
+**Running from the system python3 (without the workspace virtualenv) may result in missing
+dependencies (notably the prisma module for the litellm proxy).**
 """
 import argparse
 import os
@@ -15,6 +21,74 @@ import socket
 import signal
 import urllib.request
 import urllib.error
+
+# ── Workspace virtualenv detection ──────────────────────────────────────────────
+# Ensure we're using the workspace virtualenv if it exists.
+def _get_venv_python():
+    """Return the workspace virtualenv python executable, if it exists."""
+    venv_py = "/workspace/.venv/bin/python3"
+    if os.path.isfile(venv_py) and os.access(venv_py, os.X_OK):
+        return venv_py
+    return sys.executable
+
+def _get_venv_litellm():
+    """Return the workspace venv litellm binary, if it exists."""
+    litellm_bin = "/workspace/.venv/bin/litellm"
+    if os.path.isfile(litellm_bin) and os.access(litellm_bin, os.X_OK):
+        return litellm_bin
+    return None
+
+def _get_venv_pip():
+    """Return the workspace venv pip executable, if it exists."""
+    pip_bin = "/workspace/.venv/bin/pip"
+    if os.path.isfile(pip_bin) and os.access(pip_bin, os.X_OK):
+        return pip_bin
+    return shutil.which("pip") or shutil.which("pip3")
+
+# Check if we need to switch to the venv
+if _get_venv_python() != sys.executable:
+    # Not already running from the venv — switch to it.
+    # We re-exec the interpreter so that all subsequent imports/use of pip etc.
+    # use the virtual environment.
+    os.execv(_get_venv_python(), [_get_venv_python()] + sys.argv)
+    # The above call never returns, but if it does, fall through
+# ── End workspace virtualenv detection ─────────────────────────────────────────
+
+import argparse
+import os
+import sys
+import subprocess
+import json
+import shutil
+import time
+import socket
+import signal
+import urllib.request
+import urllib.error
+
+# Use the workspace virtualenv python for all pip operations and the litellm binary.
+# Fall back to the system python if the venv is not available.
+_VENV_PYTHON = "/workspace/.venv/bin/python3"
+_VENV_LITELLM = "/workspace/.venv/bin/litellm"
+_VENV_PIP = "/workspace/.venv/bin/pip"
+
+def _get_venv_python():
+    """Return the workspace virtualenv python executable, if it exists."""
+    if os.path.isfile(_VENV_PYTHON) and os.access(_VENV_PYTHON, os.X_OK):
+        return _VENV_PYTHON
+    return sys.executable
+
+def _get_venv_litellm():
+    """Return the workspace venv litellm binary, if it exists."""
+    if os.path.isfile(_VENV_LITELLM) and os.access(_VENV_LITELLM, os.X_OK):
+        return _VENV_LITELLM
+    return None
+
+def _get_venv_pip():
+    """Return the workspace venv pip executable, if it exists."""
+    if os.path.isfile(_VENV_PIP) and os.access(_VENV_PIP, os.X_OK):
+        return _VENV_PIP
+    return shutil.which("pip") or shutil.which("pip3")
 
 # Import shared library
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -158,7 +232,7 @@ CONTEXT_WINDOWS = {
 
 # ─── Provider-Specific Functions ──────────────────────────────────────────────
 
-def fetch_models(api_key):
+def fetch_models(api_key, force_scrape=False):
     """Fetch available NVIDIA NIM chat models with dynamic context windows.
 
     Uses two complementary sources:
@@ -173,6 +247,11 @@ def fetch_models(api_key):
        ``CONTEXT_WINDOWS`` dict below. Any model missing from both the live scrape
        and the curated map is marked ``context_window=0`` and will display as
        ``(context unknown)``.
+
+    Args:
+        api_key: NVIDIA API key (unused for nongated endpoints).
+        force_scrape: If True, return only cached values; skip live scraping.
+                      Used when user opts out of scraping.
 
     Returns a list of model dicts enriched with ``context_window`` keys.
     """
@@ -190,11 +269,11 @@ def fetch_models(api_key):
     # ─── Step 1: try a live scrape for context windows ────────────────────────
     # This pulls contextLength from NVIDIA's own catalog pages.
     # Results are cached to ~/.claude_nvidia_scraped_context.json for repeat runs.
-    import os, json
     scraped = fetch_nvidia_context_windows(
         model_ids,
         cache_file=CONTEXT_WINDOW_SCRAPE_CACHE,
         timeout=15,
+        force=force_scrape,
     )
 
     # ─── Step 2: enrich each model with the best-known context window ───────────
@@ -1029,7 +1108,33 @@ def main():
             os.environ["NVIDIA_API_KEY"] = api_key
 
     print("\n🔄 Fetching model list from NVIDIA NIM API...")
-    all_raw_models = fetch_models(api_key)
+
+    # Prompt for whether to scrape updated context windows from NVIDIA catalog.
+    # Only prompt if we have cached data (meaning we've scraped before).
+    # Default is "No" (use cached), but user can type Y to force refresh.
+    # --accept-all-defaults auto-answers "No" (use cached values).
+    cache_exists = os.path.exists(CONTEXT_WINDOW_SCRAPE_CACHE)
+    # force_scrape=True means: skip live scraping, use cached-only (empty dict if no cache)
+    # force_scrape=False (default) means: scrape missing models
+    force_scrape = False  # default: scrape missing models
+
+    if cache_exists:
+        # Check if --accept-all-defaults is set (auto-answer "No")
+        auto_accept = args is not None and args.accept_all_defaults
+        if auto_accept:
+            # --accept-all-defaults answers "No" (skip scrape, use cached)
+            force_scrape = True
+            print("   📏 Using cached context values (--accept-all-defaults).")
+        else:
+            # Prompt user for confirmation
+            try:
+                resp = input(f"\n📏 Update NVIDIA context windows from catalog? [y/N]: ").strip().lower()
+                if resp in ("n", "no", ""):
+                    force_scrape = True  # skip scraping, use cached only
+            except (EOFError, KeyboardInterrupt):
+                force_scrape = False  # default to scrape on interrupt
+
+    all_raw_models = fetch_models(api_key, force_scrape=force_scrape)
 
     standard, free, combined = categorize_models(all_raw_models)
     selected_model, model_data = display_and_select(standard, free, combined, args)
