@@ -117,13 +117,38 @@ def list_sessions(base_dir, session_type):
                 title = f"Session {session_id}"
                 try:
                     with open(chat_file, "r", encoding="utf-8") as f:
-                        first_line = f.readline().strip()
-                        if first_line:
-                            data = json.loads(first_line)
-                            if isinstance(data, dict) and "message" in data:
-                                msg = data["message"]
-                                if isinstance(msg, str) and len(msg) > 0:
-                                    title = msg[:50] + ("..." if len(msg) > 50 else "")
+                        # Read all lines to find the most recent user message with content
+                        lines = f.readlines()
+                        if lines:
+                            # Check for customTitle in the first line (newer Claude sessions)
+                            try:
+                                first_data = json.loads(lines[0].strip())
+                                if isinstance(first_data, dict) and "customTitle" in first_data and isinstance(first_data["customTitle"], str) and len(first_data["customTitle"].strip()) > 0:
+                                    custom_title = first_data["customTitle"]
+                                    title = custom_title[:50] + ("..." if len(custom_title) > 50 else "")
+                            except (json.JSONDecodeError, IndexError):
+                                pass
+
+                            # If we didn't find a customTitle, scan for user messages
+                            if title == f"Session {session_id}":
+                                # Scan lines in reverse order to find the most recent user message
+                                for line in reversed(lines):
+                                    line = line.strip()
+                                    if not line:
+                                        continue
+                                    try:
+                                        data = json.loads(line)
+                                        if isinstance(data, dict) and data.get("type") == "user" and "message" in data:
+                                            msg = data["message"]
+                                            if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str) and len(msg["content"].strip()) > 0:
+                                                content = msg["content"]
+                                                title = content[:50] + ("..." if len(content) > 50 else "")
+                                                break
+                                            elif isinstance(msg, str) and len(msg.strip()) > 0:
+                                                title = msg[:50] + ("..." if len(msg) > 50 else "")
+                                                break
+                                    except (json.JSONDecodeError, KeyError):
+                                        continue
                 except Exception:
                     pass
                 sessions.append({
