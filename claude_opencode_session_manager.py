@@ -461,7 +461,7 @@ def session_selector(sessions, session_type, favorites):
 
     if result[0] is not None:
         selected_idx = result[0]
-        selected_session = sessions[selected_idx]["session"]
+        selected_session = sessions[selected_idx]
         action = result[1]
         return selected_session, action
     # If no session was selected but we have an action (like exit or switch_view), return it
