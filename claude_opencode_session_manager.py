@@ -137,36 +137,90 @@ def list_sessions(base_dir, session_type):
         return sessions
 
     elif session_type == 'opencode':
-        # Opencode stores each session as a JSON file. We'll look recursively under base_dir for .jsonl files.
-        for root, dirs, files in os.walk(base_dir):
-            for file in files:
-                if not file.endswith(".jsonl"):
+        # Opencode stores session data in multiple locations:
+        # 1. Individual session files in storage/session_diff/ (chat sessions)
+        # 2. prompt-history.jsonl in state/opencode/ (as a fallback session)
+        sessions_found = {}  # Avoid duplicates by session ID
+
+        # Look for individual session JSON files in storage/session_diff/
+        # These are the actual chat sessions
+        session_diff_dir = os.path.join(base_dir, "storage", "session_diff")
+        if os.path.isdir(session_diff_dir):
+            for file in os.listdir(session_diff_dir):
+                if not file.endswith(".json"):
                     continue
-                session_path = os.path.join(root, file)
+                # Skip non-session files
+                if file in ["model.json", "kv.json"]:
+                    continue
+                session_path = os.path.join(session_diff_dir, file)
+                # Extract session ID from filename (without .json extension)
                 session_id = os.path.splitext(file)[0]
+                # Skip if we've already processed this session
+                if session_id in sessions_found:
+                    continue
                 modified = os.path.getmtime(session_path)
                 title = f"Session {session_id}"
                 try:
                     with open(session_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         if isinstance(data, dict):
-                            if "title" in data and isinstance(data["title"], str):
+                            # Try to get title from the session data
+                            if "title" in data and isinstance(data["title"], str) and data["title"].strip():
                                 title = data["title"]
+                            # Fallback: try to extract from messages or other content
                             elif "messages" in data and isinstance(data["messages"], list) and len(data["messages"]) > 0:
-                                first_msg = data["messages"][0]
-                                if isinstance(first_msg, dict) and "content" in first_msg:
-                                    content = first_msg["content"]
-                                    if isinstance(content, str) and len(content) > 0:
-                                        title = content[:50] + ("..." if len(content) > 50 else "")
+                                # Look through recent messages for content
+                                for msg in reversed(data["messages"]):  # Check recent messages first
+                                    if isinstance(msg, dict) and "content" in msg:
+                                        content = msg["content"]
+                                        if isinstance(content, str) and len(content.strip()) > 0:
+                                            title = content[:50] + ("..." if len(content) > 50 else "")
+                                            break
+                            # Another fallback: look for any string content that looks like a message
+                            elif "content" in data and isinstance(data["content"], str) and len(data["content"].strip()) > 0:
+                                content = data["content"]
+                                # Only use as title if it looks like substantive content (not just config/status)
+                                if len(content.strip()) > 10 and not content.startswith('{') and not content.startswith('['):
+                                    title = content[:50] + ("..." if len(content) > 50 else "")
                 except Exception:
-                    pass
-                sessions.append({
+                    pass  # Keep default title if we can't read the file
+
+                sessions_found[session_id] = {
                     "id": session_id,
                     "path": session_path,
                     "modified": modified,
                     "title": title,
-                })
-        # Sort by modification time, newest first
+                }
+
+        # Also check for prompt-history.jsonl as a fallback session source
+        prompt_history_path = os.path.join(base_dir, "state", "opencode", "prompt-history.jsonl")
+        if os.path.exists(prompt_history_path):
+            # Use a descriptive ID for prompt history
+            session_id = "prompt-history"
+            if session_id not in sessions_found:
+                modified = os.path.getmtime(prompt_history_path)
+                title = "Prompt History"
+                try:
+                    with open(prompt_history_path, "r", encoding="utf-8") as f:
+                        first_line = f.readline().strip()
+                        if first_line:
+                            data = json.loads(first_line)
+                            if isinstance(data, dict) and "message" in data:
+                                msg = data["message"]
+                                if isinstance(msg, str) and len(msg) > 0:
+                                    title = msg[:50] + ("..." if len(msg) > 50 else "")
+                except Exception:
+                    pass
+
+                sessions_found[session_id] = {
+                    "id": session_id,
+                    "path": prompt_history_path,
+                    "modified": modified,
+                    "title": title,
+                }
+
+        # Convert to list and sort by modification time, newest first
+        sessions = list(sessions_found.values())
         sessions.sort(key=lambda x: x["modified"], reverse=True)
         return sessions
 
@@ -261,14 +315,13 @@ def session_selector(sessions, session_type, favorites):
                 session = opts[i]["session"]
                 is_fav = session["id"] in favorites
                 prefix = "★ " if is_fav else "  "
-                modified_str = datetime.fromtimestamp(session["modified"]).strftime("%Y-%m-%d %H:%M")
-                fragments.append(("class:current", f"  {prefix}{session['title']} (ID: {session['id']}, Modified: {modified_str})\n"))
+                # Show title followed by ID in parentheses at the end
+                fragments.append(("class:current", f"  {prefix}{session['title']} (ID: {session['id']})\n"))
             else:
                 session = opts[i]["session"]
                 is_fav = session["id"] in favorites
                 prefix = "★ " if is_fav else "  "
-                modified_str = datetime.fromtimestamp(session["modified"]).strftime("%Y-%m-%d %H:%M")
-                fragments.append(("class:normal", f"    {prefix}{session['title']} (ID: {session['id']}, Modified: {modified_str})\n"))
+                fragments.append(("class:normal", f"    {prefix}{session['title']} (ID: {session['id']})\n"))
 
         if items_above > 0 or items_below > 0:
             hint_parts = []
@@ -345,7 +398,6 @@ def session_selector(sessions, session_type, favorites):
 
     @kb.add("escape")
     def _(event):
-        result[0] = None
         result[1] = 'exit'
         event.app.exit()
 
@@ -371,13 +423,25 @@ def session_selector(sessions, session_type, favorites):
         mouse_support=False,
     )
 
-    app.run()
+    try:
+        app.run()
+    except EOFError:
+        # If we get EOFError, it means we can't read input (likely non-terminal environment)
+        # Treat this as a request to exit
+        result[1] = 'exit'
+    except Exception as e:
+        # If we get any other exception, treat it as a request to exit unless we already have an action
+        if result[1] is None:
+            result[1] = 'exit'
 
     if result[0] is not None:
         selected_idx = result[0]
         selected_session = sessions[selected_idx]["session"]
         action = result[1]
         return selected_session, action
+    # If no session was selected but we have an action (like exit or switch_view), return it
+    if result[1] is not None:
+        return None, result[1]
     return None, None
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -461,8 +525,8 @@ def main():
     try:
         input("Press Enter to continue...")
     except (EOFError, KeyboardInterrupt):
-        print("\nContinuing...")
-        pass
+        print("\nExiting...")
+        sys.exit(0)
 
     # Main loop
     current_view = 0  # 0 for Claude, 1 for Opencode
@@ -472,101 +536,123 @@ def main():
     elif current_view == 1 and not opencode_sessions and claude_sessions:
         current_view = 0
 
-    while True:
-        # Determine which sessions to show based on current_view
-        if current_view == 0:
-            sessions = claude_sessions
-            session_type = "Claude"
-            base_dir = claude_base
-            other_base_dir = opencode_base
-            other_sessions = opencode_sessions
-            other_type = "Opencode"
-        else:
-            sessions = opencode_sessions
-            session_type = "Opencode"
-            base_dir = opencode_base
-            other_base_dir = claude_base
-            other_sessions = claude_sessions
-            other_type = "Claude"
-
-        # If there are no sessions in the current view, we can still show a message and allow switching
-        if not sessions:
-            print(f"\nNo {session_type} sessions found.")
-            if other_sessions:
-                print(f"Press Left/Right to switch to {other_type} sessions ({len(other_sessions)} found).")
+    try:
+        while True:
+            # Determine which sessions to show based on current_view
+            if current_view == 0:
+                sessions = claude_sessions
+                session_type = "Claude"
+                base_dir = claude_base
+                other_base_dir = opencode_base
+                other_sessions = opencode_sessions
+                other_type = "Opencode"
             else:
-                print(f"No {other_type} sessions found either.")
-            # Wait for a key press to switch view or exit
-            try:
-                key = input("\nPress Left/Right to switch view, or any other key to exit: ").strip().lower()
-                if key in ("left", "right"):
-                    current_view = 1 - current_view
+                sessions = opencode_sessions
+                session_type = "Opencode"
+                base_dir = opencode_base
+                other_base_dir = claude_base
+                other_sessions = claude_sessions
+                other_type = "Claude"
+
+            # If there are no sessions in the current view, we can still show a message and allow switching
+            if not sessions:
+                print(f"\nNo {session_type} sessions found.")
+                if other_sessions:
+                    print(f"Press Left/Right to switch to {other_type} sessions ({len(other_sessions)} found).")
+                else:
+                    print(f"No {other_type} sessions found either.")
+                # Wait for a key press to switch view or exit
+                try:
+                    key = input("\nPress Left/Right to switch view, or any other key to exit: ").strip().lower()
+                    if key in ("left", "right"):
+                        current_view = 1 - current_view
+                        continue
+                    else:
+                        break
+                except (EOFError, KeyboardInterrupt):
+                    break
+
+            # Show the selector for the current view
+            selected_session, action = session_selector(sessions, session_type, favorites)
+
+            if action == 'exit':
+                break
+            elif action == 'switch_view':
+                current_view = 1 - current_view
+                # When switching view, we might want to reset the selection index? The selector will start at top.
+                continue
+            elif action == 'toggle_favorite':
+                # Toggle favorite for the selected session (if any)
+                if selected_session is not None:
+                    session_id = selected_session["id"]
+                    if session_id in favorites:
+                        favorites.discard(session_id)
+                    else:
+                        favorites.add(session_id)
+                    # Save favorites immediately
+                    save_favorites(favorites, FAVORITES_CACHE_FILE)
+                    # We'll redraw the list to show the updated favorite status
                     continue
                 else:
-                    break
-            except (EOFError, KeyboardInterrupt):
-                break
-
-        # Show the selector for the current view
-        selected_session, action = session_selector(sessions, session_type, favorites)
-
-        if action == 'exit':
-            break
-        elif action == 'switch_view':
-            current_view = 1 - current_view
-            # When switching view, we might want to reset the selection index? The selector will start at top.
-            continue
-        elif action == 'toggle_favorite':
-            # Toggle favorite for the selected session (if any)
-            if selected_session is not None:
-                session_id = selected_session["id"]
-                if session_id in favorites:
-                    favorites.discard(session_id)
+                    # No session selected, just redraw
+                    continue
+            elif action == 'sync':
+                if selected_session is not None:
+                    # Show confirmation
+                    from_to = f"{session_type} → {other_type}"
+                    sync_msg = f"About to sync {session_type} session: '{selected_session['title']}' (ID: {selected_session['id']}) to {other_type} as a new session."
+                    print(f"\n{sync_msg}")
+                    try:
+                        if args.accept_all_defaults:
+                            # Auto-decline when using --accept-all-defaults
+                            print("Sync declined (--accept-all-defaults).")
+                            continue
+                        answer = input("Sync this session? [y/N]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nSync declined.")
+                        continue
+                    if answer != 'y':
+                        print("Sync declined.")
+                        continue
+                    # Proceed with sync
+                    if current_view == 0:  # viewing Claude, sync to Opencode
+                        if opencode_base is not None:
+                            new_path = sync_claude_to_opencode(selected_session, opencode_base)
+                            if new_path:
+                                print(f"\n✅ Synced Claude session to Opencode: {new_path}")
+                                # Optionally, we could add the new session to the opencode_sessions list for immediate viewing
+                                # But we'll just let the user switch view to see it.
+                            else:
+                                print(f"\n❌ Failed to sync Claude session to Opencode")
+                        else:
+                            print(f"\n❌ Opencode sessions directory not set")
+                    else:  # viewing Opencode, sync to Claude
+                        if claude_base is not None:
+                            new_path = sync_opencode_to_claude(selected_session, claude_base)
+                            if new_path:
+                                print(f"\n✅ Synced Opencode session to Claude: {new_path}")
+                            else:
+                                print(f"\n❌ Failed to sync Opencode session to Claude")
+                        else:
+                            print(f"\n❌ Claude sessions directory not set")
+                    # Save favorites after any change (sync doesn't change favorites, but we save anyway)
+                    save_favorites(favorites, FAVORITES_CACHE_FILE)
+                    # Pause briefly to let the user see the message
+                    time.sleep(1.5)
+                    # After syncing, we can optionally refresh the other side's list if we want to show it immediately.
+                    # For simplicity, we'll just continue and let the user switch view to see the new session.
+                    continue
                 else:
-                    favorites.add(session_id)
-                # Save favorites immediately
-                save_favorites(favorites, favorites_file=FAVORITES_CACHE_FILE)
-                # We'll redraw the list to show the updated favorite status
-                continue
-            else:
-                # No session selected, just redraw
-                continue
-        elif action == 'sync':
-            if selected_session is not None:
-                if current_view == 0:  # viewing Claude, sync to Opencode
-                    if opencode_base is not None:
-                        new_path = sync_claude_to_opencode(selected_session, opencode_base)
-                        if new_path:
-                            print(f"\n✅ Synced Claude session to Opencode: {new_path}")
-                            # Optionally, we could add the new session to the opencode_sessions list for immediate viewing
-                            # But we'll just let the user switch view to see it.
-                        else:
-                            print(f"\n❌ Failed to sync Claude session to Opencode")
-                    else:
-                        print(f"\n❌ Opencode sessions directory not set")
-                else:  # viewing Opencode, sync to Claude
-                    if claude_base is not None:
-                        new_path = sync_opencode_to_claude(selected_session, claude_base)
-                        if new_path:
-                            print(f"\n✅ Synced Opencode session to Claude: {new_path}")
-                        else:
-                            print(f"\n❌ Failed to sync Opencode session to Claude")
-                    else:
-                        print(f"\n❌ Claude sessions directory not set")
-                # Save favorites after any change (sync doesn't change favorites, but we save anyway)
-                save_favorites(favorites, favorites_file=FAVORITES_CACHE_FILE)
-                # Pause briefly to let the user see the message
-                time.sleep(1.5)
-                # After syncing, we can optionally refresh the other side's list if we want to show it immediately.
-                # For simplicity, we'll just continue and let the user switch view to see the new session.
-                continue
-            else:
-                # No session selected, just redraw
-                continue
-        # If action is None (just moved highlight), we just redraw the list in the next loop iteration.
+                    # No session selected, just redraw
+                    continue
+            # If action is None (just moved highlight), we just redraw the list in the next loop iteration.
+
+    except KeyboardInterrupt:
+        print("\n👋 Interrupted. Exiting...")
+        pass
 
     # Save favorites before exiting
-    save_favorites(favorites, favorites_file=FAVORITES_CACHE_FILE)
+    save_favorites(favorites, FAVORITES_CACHE_FILE)
     print("\n👋 Goodbye!")
 
 if __name__ == "__main__":
