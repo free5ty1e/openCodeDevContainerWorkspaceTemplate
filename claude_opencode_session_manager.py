@@ -62,6 +62,7 @@ CLAUDE_SESSIONS_CANDIDATES = [
 OPCODE_SESSIONS_CANDIDATES = [
     "~/.opencode/sessions",
     "~/.ai_working/opencode_data",
+    "~/.local/share/opencode",
     ".opencode/sessions",
     ".ai_working/opencode_data"
 ]
@@ -163,16 +164,40 @@ def list_sessions(base_dir, session_type):
 
     elif session_type == 'opencode':
         # Opencode stores session data in multiple locations:
-        # 1. Individual session files in storage/session_diff/ (chat sessions)
+        # 1. SQLite database for session metadata (primary source)
         # 2. prompt-history.jsonl in state/opencode/ (as a fallback session)
+        # 3. Individual session files in storage/session_diff/ (backup/special sessions)
         sessions_found = {}  # Avoid duplicates by session ID
+
+        # First, check the Opencode database for sessions
+        db_path = os.path.join(base_dir, "opencode.db")
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, title, time_created FROM session")
+                for row in cursor.fetchall():
+                    session_id, title, time_created = row[0], row[1], row[2]
+                    # Use database timestamp for sorting
+                    modified = time_created if time_created else os.path.getmtime(db_path)
+                    sessions_found[session_id] = {
+                        "id": session_id,
+                        "path": db_path,  # database is the path
+                        "modified": modified,
+                        "title": title if title and title.strip() else f"Session {session_id[:8]}",
+                    }
+                conn.close()
+            except Exception as e:
+                pass  # Fall back to file-based detection
 
         # Look for individual session JSON files in storage/session_diff/
         # These are the actual chat sessions
         session_diff_dir = os.path.join(base_dir, "storage", "session_diff")
         if os.path.isdir(session_diff_dir):
             for file in os.listdir(session_diff_dir):
-                if not file.endswith(".json"):
+                # Look for both .json and .jsonl files (Opencode uses both)
+                if not (file.endswith(".json") or file.endswith(".jsonl")):
                     continue
                 # Skip non-session files
                 if file in ["model.json", "kv.json"]:
@@ -186,27 +211,43 @@ def list_sessions(base_dir, session_type):
                 modified = os.path.getmtime(session_path)
                 title = f"Session {session_id}"
                 try:
+                    # Opencode sessions are JSONL format (like Claude), not single JSON objects
                     with open(session_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, dict):
-                            # Try to get title from the session data
-                            if "title" in data and isinstance(data["title"], str) and data["title"].strip():
-                                title = data["title"]
-                            # Fallback: try to extract from messages or other content
-                            elif "messages" in data and isinstance(data["messages"], list) and len(data["messages"]) > 0:
-                                # Look through recent messages for content
-                                for msg in reversed(data["messages"]):  # Check recent messages first
-                                    if isinstance(msg, dict) and "content" in msg:
-                                        content = msg["content"]
-                                        if isinstance(content, str) and len(content.strip()) > 0:
-                                            title = content[:50] + ("..." if len(content) > 50 else "")
-                                            break
-                            # Another fallback: look for any string content that looks like a message
-                            elif "content" in data and isinstance(data["content"], str) and len(data["content"].strip()) > 0:
-                                content = data["content"]
-                                # Only use as title if it looks like substantive content (not just config/status)
-                                if len(content.strip()) > 10 and not content.startswith('{') and not content.startswith('['):
-                                    title = content[:50] + ("..." if len(content) > 50 else "")
+                        lines = f.readlines()
+                    if lines:
+                        try:
+                            # Try to parse the first line for title (Opencode uses customTitle)
+                            first_data = json.loads(lines[0].strip())
+                            if isinstance(first_data, dict):
+                                # Try customTitle first (Opencode format)
+                                if "customTitle" in first_data and isinstance(first_data["customTitle"], str) and first_data["customTitle"].strip():
+                                    custom_title = first_data["customTitle"]
+                                    title = custom_title[:50] + ("..." if len(custom_title) > 50 else "")
+                                # Fallback: try regular title field
+                                elif "title" in first_data and isinstance(first_data["title"], str) and first_data["title"].strip():
+                                    title = first_data["title"][:50] + ("..." if len(first_data["title"]) > 50 else "")
+
+                                # If no title found, look for user message content
+                                if title == f"Session {session_id}":
+                                    for line in reversed(lines):
+                                        line = line.strip()
+                                        if not line:
+                                            continue
+                                        try:
+                                            data = json.loads(line)
+                                            if isinstance(data, dict) and data.get("type") == "user" and "message" in data:
+                                                msg = data["message"]
+                                                if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str) and len(msg["content"].strip()) > 0:
+                                                    content = msg["content"]
+                                                    title = content[:50] + ("..." if len(content) > 50 else "")
+                                                    break
+                                                elif isinstance(msg, str) and len(msg.strip()) > 0:
+                                                    title = msg[:50] + ("..." if len(msg) > 50 else "")
+                                                    break
+                                        except (json.JSONDecodeError, KeyError):
+                                            continue
+                        except (json.JSONDecodeError, IndexError):
+                            pass
                 except Exception:
                     pass  # Keep default title if we can't read the file
 
@@ -253,14 +294,152 @@ def list_sessions(base_dir, session_type):
 
 def sync_claude_to_opencode(claude_session, opencode_base_dir):
     """Copy a Claude session (.jsonl file) to Opencode as a new session.
-    We'll create a new session file in opencode_base_dir with a generated ID.
+    Creates the session file in opencode_base_dir/storage/session_diff/ and
+    inserts messages into the Opencode database.
     """
-    # Generate a new session ID based on timestamp
     from datetime import datetime
-    new_id = f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{claude_session['id']}"
-    new_path = os.path.join(opencode_base_dir, f"{new_id}.jsonl")
+    import sqlite3
+    import hashlib
+
+    # Generate a new session ID matching Opencode's format (ses_...)
+    new_id = f"ses_{datetime.now().strftime('%y%m%d%H%M%S')}_{hashlib.md5(str(datetime.now()).encode()).hexdigest()[:10]}"
+
+    # Place the file in storage/session_diff/ to match the existing Opencode session format
+    session_diff_dir = os.path.join(opencode_base_dir, "storage", "session_diff")
+    os.makedirs(session_diff_dir, exist_ok=True)
+    new_path = os.path.join(session_diff_dir, f"{new_id}.jsonl")
+
+    # Get title from claude session
+    title = claude_session.get('title', f'Synced from Claude: {claude_session["id"][:8]}')
+
     try:
+        # Copy the Claude session file to Opencode location
         shutil.copy2(claude_session['path'], new_path)
+
+        # Update Opencode database with session and messages
+        db_path = os.path.join(opencode_base_dir, "opencode.db")
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+
+                # Get the default project ID
+                cursor.execute("SELECT id FROM project LIMIT 1")
+                project_row = cursor.fetchone()
+                project_id = project_row[0] if project_row else "-sync-project"
+
+                # Generate a slug for the session
+                slug = f"synced-{datetime.now().strftime('%y%m%d%H%M%S')}"
+
+                # Generate unique message IDs and timestamps
+                current_time_ms = int(time.time() * 1000)
+
+                # Check if session already exists in database
+                cursor.execute("SELECT id FROM session WHERE id = ?", (new_id,))
+                if cursor.fetchone() is None:
+                    # Read the session file to get content and message count
+                    file_content = ""
+                    try:
+                        with open(claude_session['path'], 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                    except Exception as e:
+                        pass
+
+                    # Count lines to estimate tokens
+                    line_count = len(claude_messages) if 'claude_messages' in dir() else 0
+                    total_chars = len(file_content)
+                    estimated_tokens = total_chars // 4
+
+                    # Generate a slug for the session
+                    slug = f"synced-{datetime.now().strftime('%y%m%d%H%M%S')}"
+
+                    # Insert new session with all required fields including tokens
+                    cursor.execute("""
+                        INSERT INTO session
+                        (id, project_id, slug, title, version, directory, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, model)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_id,
+                        project_id,
+                        slug,
+                        title,
+                        "1.0",
+                        "",
+                        0.0,  # cost
+                        estimated_tokens,  # tokens_input
+                        estimated_tokens // 2,  # tokens_output (rough estimate)
+                        0,  # tokens_reasoning
+                        0,  # tokens_cache_read
+                        0,  # tokens_cache_write
+                        current_time_ms,
+                        current_time_ms,
+                        '{"providerID":"claude","modelID":"claude-sonnet-4-20250416"}'  # model
+                    ))
+
+                    # Read Claude session messages for database insertion
+                    claude_messages = file_content.strip().split('\n') if file_content else []
+
+                    # Insert each message into Opencode database
+                    for i, line in enumerate(claude_messages):
+                        try:
+                            data = json.loads(line.strip())
+                            if isinstance(data, dict):
+                                # Handle different Claude message formats
+                                role = data.get('type', 'user')
+                                content = None
+
+                                # Extract content from various locations
+                                if 'message' in data:
+                                    msg = data['message']
+                                    if isinstance(msg, dict) and 'content' in msg:
+                                        content = msg['content']
+                                    elif isinstance(msg, str):
+                                        content = msg
+                                elif 'content' in data:
+                                    content = data['content']
+
+                                if content is None:
+                                    continue
+
+                                # Determine role
+                                if role == 'user':
+                                    role = 'user'
+                                elif role == 'assistant':
+                                    role = 'assistant'
+                                elif role == 'system':
+                                    role = 'system'
+                                else:
+                                    role = 'user'
+
+                                # Create Opencode message format with content
+                                opencode_msg = {
+                                    'role': role,
+                                    'content': content if isinstance(content, str) else str(content),
+                                    'model': {'providerID': 'claude', 'modelID': 'claude-sonnet-4-20250416'},
+                                    'time': {'created': current_time_ms + i * 100}
+                                }
+
+                                if role == 'user':
+                                    opencode_msg['agent'] = 'user'
+                                elif role.startswith('assistant'):
+                                    opencode_msg['agent'] = 'opencode'
+
+                                msg_data = json.dumps(opencode_msg)
+                                msg_id = f"{new_id}_{i}"
+
+                                cursor.execute("""
+                                    INSERT INTO message (id, session_id, time_created, time_updated, data)
+                                    VALUES (?, ?, ?, ?, ?)
+                                """, (msg_id, new_id, current_time_ms + i * 100, current_time_ms + i * 100, msg_data))
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+
+                conn.commit()
+            except Exception as db_error:
+                print(f"⚠️  Note: Could not update Opencode database: {db_error}")
+            finally:
+                conn.close()
+
         return new_path
     except Exception as e:
         print(f"⚠️  Failed to sync Claude session to Opencode: {e}")
