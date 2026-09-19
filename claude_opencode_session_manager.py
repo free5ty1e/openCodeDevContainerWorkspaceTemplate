@@ -60,9 +60,9 @@ CLAUDE_SESSIONS_CANDIDATES = [
     ".claude/projects"
 ]
 OPCODE_SESSIONS_CANDIDATES = [
+    "~/.local/share/opencode",
     "~/.opencode/sessions",
     "~/.ai_working/opencode_data",
-    "~/.local/share/opencode",
     ".opencode/sessions",
     ".ai_working/opencode_data"
 ]
@@ -188,7 +188,7 @@ def list_sessions(base_dir, session_type):
                         "title": title if title and title.strip() else f"Session {session_id[:8]}",
                     }
                 conn.close()
-            except Exception as e:
+            except Exception as _:
                 pass  # Fall back to file-based detection
 
         # Look for individual session JSON files in storage/session_diff/
@@ -319,14 +319,18 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
         # Update Opencode database with session and messages
         db_path = os.path.join(opencode_base_dir, "opencode.db")
         if os.path.exists(db_path):
+            conn = None
             try:
                 conn = sqlite3.connect(db_path)
                 cursor = conn.cursor()
 
                 # Get the default project ID
-                cursor.execute("SELECT id FROM project LIMIT 1")
-                project_row = cursor.fetchone()
-                project_id = project_row[0] if project_row else "-sync-project"
+                try:
+                    cursor.execute("SELECT id FROM project LIMIT 1")
+                    project_row = cursor.fetchone()
+                    project_id = project_row[0] if project_row else "-sync-project"
+                except Exception:
+                    project_id = "-sync-project"
 
                 # Generate a slug for the session
                 slug = f"synced-{datetime.now().strftime('%y%m%d%H%M%S')}"
@@ -345,26 +349,26 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
                     except Exception as e:
                         pass
 
-                    # Count lines to estimate tokens
-                    line_count = len(claude_messages) if 'claude_messages' in dir() else 0
+                    # Count characters to estimate tokens
                     total_chars = len(file_content)
                     estimated_tokens = total_chars // 4
 
-                    # Generate a slug for the session
-                    slug = f"synced-{datetime.now().strftime('%y%m%d%H%M%S')}"
-
                     # Insert new session with all required fields including tokens
+                    # Use a valid directory path for the workspace
+                    sync_directory = os.path.expanduser('~/.local/share/opencode')
+
                     cursor.execute("""
                         INSERT INTO session
-                        (id, project_id, slug, title, version, directory, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, model)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, project_id, slug, title, version, directory, path, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, model, workspace_id, parent_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         new_id,
                         project_id,
                         slug,
                         title,
                         "1.0",
-                        "",
+                        sync_directory,  # directory
+                        ".opencode",  # path - relative identifier like existing sessions
                         0.0,  # cost
                         estimated_tokens,  # tokens_input
                         estimated_tokens // 2,  # tokens_output (rough estimate)
@@ -373,7 +377,9 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
                         0,  # tokens_cache_write
                         current_time_ms,
                         current_time_ms,
-                        '{"providerID":"claude","modelID":"claude-sonnet-4-20250416"}'  # model
+                        '{"providerID":"claude","modelID":"claude-sonnet-4-20250416"}',  # model
+                        None,  # workspace_id (SQL NULL)
+                        None,  # parent_id (SQL NULL)
                     ))
 
                     # Read Claude session messages for database insertion
@@ -401,28 +407,21 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
                                 if content is None:
                                     continue
 
-                                # Determine role
+                                # Determine role for Opencode (user, assistant, system)
                                 if role == 'user':
-                                    role = 'user'
+                                    opencode_role = 'user'
                                 elif role == 'assistant':
-                                    role = 'assistant'
+                                    opencode_role = 'assistant'
                                 elif role == 'system':
-                                    role = 'system'
+                                    opencode_role = 'system'
                                 else:
-                                    role = 'user'
+                                    opencode_role = 'user'  # Default to user for unknown types
 
-                                # Create Opencode message format with content
+                                # Create Opencode message format matching what Opencode expects from session files
                                 opencode_msg = {
-                                    'role': role,
-                                    'content': content if isinstance(content, str) else str(content),
-                                    'model': {'providerID': 'claude', 'modelID': 'claude-sonnet-4-20250416'},
-                                    'time': {'created': current_time_ms + i * 100}
+                                    'type': opencode_role,
+                                    'message': content
                                 }
-
-                                if role == 'user':
-                                    opencode_msg['agent'] = 'user'
-                                elif role.startswith('assistant'):
-                                    opencode_msg['agent'] = 'opencode'
 
                                 msg_data = json.dumps(opencode_msg)
                                 msg_id = f"{new_id}_{i}"
@@ -438,7 +437,8 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
             except Exception as db_error:
                 print(f"⚠️  Note: Could not update Opencode database: {db_error}")
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
         return new_path
     except Exception as e:
@@ -540,31 +540,31 @@ def session_selector(sessions, session_type, favorites):
     kb = KeyBindings()
 
     @kb.add("up")
-    def _(event):
+    def _(_):
         if current[0] > 0:
             current[0] -= 1
 
     @kb.add("down")
-    def _(event):
+    def _(_):
         if current[0] < len(sessions) - 1:
             current[0] += 1
 
     @kb.add("pageup")
-    def _(event):
+    def _(_):
         page = min(visible_count - 1, len(sessions))
         current[0] = max(0, current[0] - page)
 
     @kb.add("pagedown")
-    def _(event):
+    def _(_):
         page = min(visible_count - 1, len(sessions))
         current[0] = min(len(sessions) - 1, current[0] + page)
 
     @kb.add("home")
-    def _(event):
+    def _(_):
         current[0] = 0
 
     @kb.add("end")
-    def _(event):
+    def _(_):
         opts_len = len(sessions)
         current[0] = opts_len - 1 if opts_len > 0 else 0
 
@@ -633,7 +633,7 @@ def session_selector(sessions, session_type, favorites):
         # If we get EOFError, it means we can't read input (likely non-terminal environment)
         # Treat this as a request to exit
         result[1] = 'exit'
-    except Exception as e:
+    except Exception as _:
         # If we get any other exception, treat it as a request to exit unless we already have an action
         if result[1] is None:
             result[1] = 'exit'
