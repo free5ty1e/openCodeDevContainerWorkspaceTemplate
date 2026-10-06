@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 ubuntu:24.04
+FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -95,12 +95,12 @@ RUN npm install -g prettier
 # ── OpenCode CLI (anomalyco/opencode — Linux x64) ─────────────────────────────
 # OpenCode is used for various Rock Band modding and exploration tasks via CLI.
 # The latest release is fetched dynamically from GitHub at build time.
-RUN LATEST_TAG=$(curl -fsSL https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name') \
-    && echo "⬇️  Downloading opencode ${LATEST_TAG}..." \
-    && curl -fsSL -o /tmp/opencode.tar.gz "https://github.com/anomalyco/opencode/releases/download/${LATEST_TAG}/opencode-linux-x64.tar.gz" \
-    && tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin \
-    && chmod +x /usr/local/bin/opencode \
-    && rm /tmp/opencode.tar.gz
+# RUN LATEST_TAG=$(curl -fsSL https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name') \
+#     && echo "⬇️  Downloading opencode ${LATEST_TAG}..." \
+#     && curl -fsSL -o /tmp/opencode.tar.gz "https://github.com/anomalyco/opencode/releases/download/${LATEST_TAG}/opencode-linux-x64.tar.gz" \
+#     && tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin \
+#     && chmod +x /usr/local/bin/opencode \
+#     && rm /tmp/opencode.tar.gz
 
 # ── Ollama (local LLM inference) ──────────────────────────────────────────────
 # Ollama runs locally-hosted AI models (e.g., qwen2.5-coder) without cloud API.
@@ -124,6 +124,8 @@ RUN if getent passwd $USER_UID > /dev/null; then \
     && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
     && echo "$USERNAME ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
     && chmod 0440 /etc/sudoers.d/$USERNAME \
+    && mkdir -p /home/$USERNAME/.local/share/opencode \
+    && chown -R $USERNAME:$USERNAME /home/$USERNAME/.local/share/opencode \
     && mkdir -p /home/$USERNAME/.ollama/models \
     && chown -R $USERNAME:$USERNAME /home/$USERNAME/.ollama
 RUN usermod -s /usr/bin/zsh $USERNAME \

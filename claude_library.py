@@ -24,6 +24,7 @@ import shutil
 import time
 import socket
 import signal
+import platform
 import urllib.request
 import urllib.error
 import re
@@ -40,6 +41,292 @@ DEFAULT_VENV_PYTHON = "/workspace/.venv/bin/python3"
 # `litellm[proxy]` (or bare `litellm`) leaves `prisma` missing and crashes the
 # proxy on any unauthenticated request. Use both extras together, always.
 LITELLM_PROXY_SPEC = "litellm[proxy,extra-proxy]"
+
+
+# ─── Native extension health / import diagnostics ──────────────────────────────
+#
+# A package can be *installed* yet still be unimportable. The usual cause in a
+# container is a native extension (a compiled `.so`) built for a different CPU
+# architecture than the one actually running -- e.g. a `.venv` baked on x86_64 that
+# is then mounted into an aarch64 devcontainer. pip is happy (the dist-info says
+# the requirement is satisfied) so `pip install <pkg>` is a silent no-op, and every
+# import fails deep inside an unrelated dependency. Conflating that with "package
+# missing" produces misleading messages and pointless reinstall loops.
+
+_ELF_MACHINE = {
+    "x86_64": 62, "amd64": 62,
+    "aarch64": 183, "arm64": 183,
+    "i686": 3, "i386": 3, "x86": 3,
+    "armv7l": 40, "arm": 40,
+    "ppc64le": 21, "ppc64": 21,
+    "s390x": 22,
+    "riscv64": 243,
+    "loongarch64": 258,
+}
+
+# A dependency failing to import because one of ITS dependencies is broken.
+IMPORT_OK = "ok"
+IMPORT_NOT_INSTALLED = "not-installed"
+IMPORT_BROKEN_NATIVE = "broken-native"
+IMPORT_BROKEN = "broken"
+
+
+def host_elf_machine():
+    """Return the ELF e_machine value for this machine, or None if unknown."""
+    import platform
+    return _ELF_MACHINE.get(platform.machine().lower())
+
+
+def _elf_machine_of(path):
+    """Read e_machine from an ELF file's header. None if not ELF/unreadable."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(20)
+    except OSError:
+        return None
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        return None
+    # EI_DATA: 1 = little endian, 2 = big endian. e_machine sits at 0x12.
+    endian = "little" if header[5] == 1 else "big"
+    return int.from_bytes(header[18:20], endian)
+
+
+def _site_package_roots():
+    """Best-effort list of site-packages / dist-packages directories on sys.path."""
+    import site
+    roots = []
+    try:
+        roots.extend(site.getsitepackages())
+    except AttributeError:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str):
+            roots.append(user_site)
+    except AttributeError:
+        pass
+    for entry in sys.path:
+        if entry and entry not in roots and (
+            entry.endswith("site-packages") or entry.endswith("dist-packages")
+        ):
+            roots.append(entry)
+    return [r for r in roots if os.path.isdir(r)]
+
+
+_DIST_FILE_MAP = None
+
+# Native-extension architecture is scanned once per process: the scan walks every
+# site-packages directory, and the answer cannot change within a run.
+_NATIVE_SCAN_DONE = False
+
+
+def _so_key(name):
+    """Reduce a native-extension filename to a tag-independent key.
+
+    ``orjson.cpython-312-x86_64-linux-gnu.so`` and
+    ``orjson.cpython-312-aarch64-linux-gnu.so`` must map to the same key, otherwise a
+    RECORD map built before a reinstall goes stale and the new binaries fall through
+    to path guessing (which yields uninstallable names like ``yaml`` for ``PyYAML``).
+    The module name is the part before the ABI/platform tags.
+    """
+    return name.split(".")[0]
+
+
+def _dist_file_map():
+    """Map normalized native-extension filenames -> owning distribution name.
+
+    Deriving the distribution from the path is unreliable: wheels vendor their
+    binaries into sibling directories (``numpy.libs/``, ``polars/_polars_runtime_32.so``)
+    and some ship a bare top-level ``.so`` (``_cffi_backend...so``). RECORD is the
+    authoritative answer and lets us hand pip a real distribution name.
+    """
+    global _DIST_FILE_MAP
+    if _DIST_FILE_MAP is not None:
+        return _DIST_FILE_MAP
+    import importlib.metadata as md
+    mapping = {}
+    try:
+        dists = list(md.distributions())
+    except Exception:
+        dists = []
+    for dist in dists:
+        try:
+            name = dist.metadata["Name"]
+        except Exception:
+            name = None
+        if not name:
+            continue
+        try:
+            files = dist.files or []
+        except Exception:
+            continue
+        for f in files:
+            fn = os.path.basename(str(f))
+            if ".so" not in fn:
+                continue
+            mapping.setdefault(_so_key(fn), name)
+    _DIST_FILE_MAP = mapping
+    return mapping
+
+
+def _package_for_so(so_path):
+    """Map a native extension path to the distribution that owns it.
+
+    Returns a pip-installable distribution name, or None if it cannot be determined.
+    """
+    so_path = os.path.abspath(so_path)
+    owner = _dist_file_map().get(_so_key(os.path.basename(so_path)))
+    if owner:
+        return owner
+    return None
+
+
+def find_broken_native_extensions():
+    """Find installed native extensions built for a different CPU than this machine.
+
+    Returns a list of dicts: {"package", "path", "reason"}.
+
+    Detection is based solely on the ELF header's ``e_machine`` field, which is
+    unambiguous and cannot produce false positives.
+
+    An earlier version of this also tried to dlopen each matching ``.so`` to catch
+    loader-level problems. That was wrong: a CPython extension module only exports
+    ``PyInit_<its own name>``, so loading one under a synthetic probe name fails
+    with "does not define module export function" for *every* correctly installed
+    binary. That made a healthy environment look 100% broken and drove an endless
+    reinstall loop. Loader-level breakage is now detected by importing the package
+    itself (see ``diagnose_module``), which is the only honest test.
+    """
+    expected = host_elf_machine()
+    if expected is None:
+        return []
+    found = []
+    seen = set()
+    for root in _site_package_roots():
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Skip caches; they only waste time and hold duplicate .so files.
+            dirnames[:] = [d for d in dirnames if d not in ("__pycache__", ".git")]
+            for fn in filenames:
+                if ".so" not in fn:
+                    continue
+                so_path = os.path.join(dirpath, fn)
+                if so_path in seen:
+                    continue
+                seen.add(so_path)
+                machine = _elf_machine_of(so_path)
+                if machine is None:
+                    continue
+                if expected is not None and machine != expected:
+                    found.append({
+                        "package": _package_for_so(so_path),
+                        "path": so_path,
+                        "reason": (
+                            f"built for ELF machine {machine}, "
+                            f"host is {expected}"
+                        ),
+                    })
+    return found
+
+
+def diagnose_module(module_name):
+    """Import a module and classify the outcome.
+
+    Returns (ok, status, detail). This distinguishes "genuinely not installed" from
+    "installed but its native extension is broken", which look identical to a bare
+    `except ImportError` but need completely different fixes.
+    """
+    import importlib
+    try:
+        importlib.import_module(module_name)
+        return True, IMPORT_OK, f"{module_name} imports cleanly"
+    except ImportError as e:
+        missing_name = getattr(e, "name", None) or ""
+        if missing_name == module_name or missing_name.startswith(module_name + "."):
+            return False, IMPORT_NOT_INSTALLED, f"{module_name} is not installed"
+        # The module itself resolved but a dependency failed to import. If the
+        # missing piece looks like a compiled extension, call it out specifically.
+        if ".so" in str(e) or "wrong ELF" in str(e) or "invalid ELF" in str(e):
+            return False, IMPORT_BROKEN_NATIVE, (
+                f"{module_name} is installed but a native extension failed to load: {e}"
+            )
+        return False, IMPORT_BROKEN, (
+            f"{module_name} is installed but importing it failed: {e}"
+        )
+    except Exception as e:
+        return False, IMPORT_BROKEN, f"{module_name} raised {type(e).__name__}: {e}"
+
+
+def _installed_version(dist_name):
+    """Return the currently installed version of a distribution, or None."""
+    try:
+        import importlib.metadata as md
+        return md.version(dist_name)
+    except Exception:
+        return None
+
+
+def repair_broken_native_extensions(max_passes=2):
+    """Reinstall packages whose native extensions were built for another CPU.
+
+    Reinstalls the **exact version already installed** rather than the latest one.
+    That matters: a bare ``pip install --force-reinstall <pkg>`` resolves to the newest
+    release and silently upgrades transitive pins, which breaks the environment in
+    ways that look unrelated. (Reinstalling pydantic-core this way pulled 2.49.0 over
+    a pydantic 2.13.5 that requires exactly 2.46.5, and litellm stopped importing.)
+
+    ``--no-cache-dir`` matters too: pip's wheel cache happily serves the same
+    wrong-arch wheel that caused the problem in the first place.
+
+    Returns the list of distribution names that were successfully reinstalled.
+    """
+    repaired = []
+    for _ in range(max_passes):
+        broken = find_broken_native_extensions()
+        packages = sorted({b["package"] for b in broken if b["package"]})
+        if not packages:
+            break
+        # RECORD now describes the new binaries, so the cached map is stale.
+        global _DIST_FILE_MAP
+        _DIST_FILE_MAP = None
+        print("  ⚠️  Native extensions built for a different CPU:")
+        for item in broken[:10]:
+            pkg = item["package"] or "<unknown>"
+            print(f"       {pkg}: {item['reason']}")
+            print(f"         {item['path']}")
+        if len(broken) > 10:
+            print(f"       ... and {len(broken) - 10} more")
+
+        print("  🔧 Reinstalling affected packages at their current versions"
+              " for this platform...")
+        progress = []
+        for pkg in packages:
+            version = _installed_version(pkg)
+            if version is None:
+                # Not a real distribution name; reinstalling it would just error.
+                print(f"  ⚠️  Skipping {pkg}: not an installed distribution")
+                continue
+            target = f"{pkg}=={version}"
+            cmd = [get_python_executable(), "-m", "pip", "install",
+                   "--force-reinstall", "--no-cache-dir", target]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                print(f"  ❌  Could not reinstall {target}: {e}")
+                continue
+            if res.returncode == 0:
+                print(f"  ✅ Reinstalled {target}")
+                progress.append(pkg)
+            else:
+                tail = (res.stderr or res.stdout or "").strip().splitlines()
+                print(f"  ❌  Failed to reinstall {target}: "
+                      f"{tail[-1] if tail else 'unknown error'}")
+        for pkg in progress:
+            if pkg not in repaired:
+                repaired.append(pkg)
+        if not progress:
+            # Nothing could be reinstalled; another pass would repeat identically.
+            break
+    return repaired
 
 
 # ─── Utility Functions ───────────────────────────────────────────────────────
@@ -117,30 +404,46 @@ def install_package(pkg_name, pip_name=None, force=False):
     When ``force`` is True, pip is invoked even if the package is already
     importable. This is used to repair installs that are missing optional
     extras (e.g. a bare ``litellm`` that lacks the ``[proxy]`` extras).
+
+    A package that is installed but whose native extensions cannot load on this CPU
+    is treated as *not* usable: the check below distinguishes that from a genuine
+    absence, so a broken architecture-mismatched install is reported instead of being
+    silently accepted as "already available".
+
     Returns True if package was available or successfully installed."""
     pip_name = pip_name or pkg_name
     if not force:
-        try:
-            __import__(pkg_name)
+        ok, status, detail = diagnose_module(pkg_name)
+        if ok:
             print(f"  ✅ {pkg_name} already available")
             return True
-        except ImportError:
-            pass
+        if status in (IMPORT_BROKEN, IMPORT_BROKEN_NATIVE):
+            # A plain reinstall of the same pin can be a no-op here; fix the native
+            # layer first so the install below actually replaces the bad binaries.
+            print(f"  ⚠️  {detail}")
+            if repair_broken_native_extensions() and diagnose_module(pkg_name)[0]:
+                print(f"  ✅ {pkg_name} available after native-extension repair")
+                return True
     print(f"  📦 Installing {pip_name}...")
 
-    # Try different installation strategies
+    # Try different installation strategies.
+    # `verifiable` marks strategies that install into the environment this process
+    # actually runs in, so a post-install import check is meaningful. `--user` and
+    # `pipx` install elsewhere (and are typically absent from a venv's sys.path),
+    # so for those pip's exit status is all we can trust.
     strategies = [
         # Strategy 1: Normal install
-        ([get_python_executable(), "-m", "pip", "install", pip_name], "normal install"),
+        ([get_python_executable(), "-m", "pip", "install", pip_name], "normal install", True),
         # Strategy 2: With --break-system-packages (for PEP 668 externally-managed environments)
-        ([get_python_executable(), "-m", "pip", "install", "--break-system-packages", pip_name], "with --break-system-packages"),
+        ([get_python_executable(), "-m", "pip", "install", "--break-system-packages", pip_name],
+         "with --break-system-packages", True),
         # Strategy 3: With --user flag
-        ([get_python_executable(), "-m", "pip", "install", "--user", pip_name], "with --user flag"),
+        ([get_python_executable(), "-m", "pip", "install", "--user", pip_name], "with --user flag", False),
         # Strategy 4: Try pipx if available
-        (["pipx", "install", pip_name], "with pipx"),
+        (["pipx", "install", pip_name], "with pipx", False),
     ]
 
-    for cmd, description in strategies:
+    for cmd, description, verifiable in strategies:
         print(f"  📦 Installing {pip_name} ({description})...")
         try:
             result = subprocess.run(
@@ -149,8 +452,27 @@ def install_package(pkg_name, pip_name=None, force=False):
                 capture_output=True,
                 text=True,
             )
-            print(f"  ✅ Successfully installed {pip_name} ({description})")
-            return True
+            # pip exiting 0 only means pip is happy. Verify the module actually
+            # imports now, otherwise a reinstall that changed nothing would be
+            # reported as a success and the caller would loop forever.
+            if not verifiable:
+                print(f"  ✅ Successfully installed {pip_name} ({description})")
+                return True
+            verified, status, detail = diagnose_module(pkg_name)
+            if verified:
+                print(f"  ✅ Successfully installed {pkg_name} ({description})")
+                return True
+            if status in (IMPORT_BROKEN, IMPORT_BROKEN_NATIVE):
+                # Reinstalling the same spec cannot fix a broken native layer.
+                print(f"  ⚠️  pip succeeded but {detail}")
+                print("       Repairing native extensions for this architecture...")
+                if repair_broken_native_extensions() and diagnose_module(pkg_name)[0]:
+                    print(f"  ✅ {pkg_name} available after native-extension repair")
+                    return True
+                print(f"  ❌ {pkg_name} still unusable after native-extension repair")
+                return False
+            print(f"  ⚠️  pip reported success but {detail}; trying next strategy")
+            continue
         except subprocess.CalledProcessError as e:
             print(f"  ⚠️  Failed ({description}): {e.stderr.strip() if e.stderr else 'Unknown error'}")
             continue
@@ -766,53 +1088,73 @@ def _litellm_proxy_deps_present():
     """
     if get_litellm_binary() is None:
         return False
-    try:
-        import prisma  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    return diagnose_module("prisma")[0]
 
 
 def ensure_litellm(args=None):
     """Ensure litellm (with proxy extras) is fully available, and check for upgrades."""
     print("   Checking litellm...")
-    # The bare Python package may be importable while the proxy runtime deps
-    # (console script + prisma) are still missing. Check everything explicitly.
-    try:
-        import litellm  # noqa: F401
-        pkg_importable = True
-    except ImportError:
-        pkg_importable = False
+    # Distinguish "litellm isn't installed" from "litellm is installed but one of its
+    # compiled dependencies can't load on this CPU". The second case is invisible to a
+    # plain `except ImportError` and reinstalling litellm itself never fixes it.
+    importable, status, detail = diagnose_module("litellm")
 
-    if pkg_importable and _litellm_proxy_deps_present():
+    if not importable and status in (IMPORT_BROKEN, IMPORT_BROKEN_NATIVE):
+        print(f"   ⚠️  {detail}")
+        print("       This is usually a native extension built for a different CPU "
+              "architecture than this machine.")
+        if repair_broken_native_extensions():
+            print("  🔄  Re-checking litellm after native-extension repair...")
+            importable, status, detail = diagnose_module("litellm")
+
+    if importable and _litellm_proxy_deps_present():
         print("  ✅ litellm already available")
         return _check_and_prompt_upgrade(LITELLM_PROXY_SPEC, "litellm", "installed", args)
 
     # Either the package is missing, or it's present but the proxy extras
     # (console script / prisma) are not. Install/repair with the proxy extras.
-    if pkg_importable:
+    if importable:
         print("   ⚠️  litellm is importable but proxy extras (prisma / CLI binary) are missing.")
         print(f"       Reinstalling with `{LITELLM_PROXY_SPEC}` to pull in the proxy runtime deps...")
-    else:
-        print(f"   📦 Installing {LITELLM_PROXY_SPEC}...")
 
     if install_package("litellm", LITELLM_PROXY_SPEC, force=True):
         # Re-verify the full runtime deps actually landed.
         if _litellm_proxy_deps_present():
             print(f"  ✅ {LITELLM_PROXY_SPEC} installed with all runtime dependencies")
             return _check_and_prompt_upgrade(LITELLM_PROXY_SPEC, "litellm", "installed", args)
-        else:
-            missing = []
-            if get_litellm_binary() is None:
-                missing.append("CLI binary (litellm console script)")
-            try:
-                import prisma  # noqa: F401
-            except ImportError:
+
+        # Still broken. Report what is actually wrong instead of asserting
+        # "prisma missing" when prisma is present but unimportable.
+        missing = []
+        if get_litellm_binary() is None:
+            missing.append("CLI binary (litellm console script)")
+        prisma_ok, prisma_status, prisma_detail = diagnose_module("prisma")
+        if not prisma_ok:
+            if prisma_status == IMPORT_NOT_INSTALLED:
                 missing.append("prisma module")
-            print(f"   ❌ litellm installed but still missing: {', '.join(missing)}")
+            else:
+                missing.append(f"prisma module ({prisma_detail})")
+
+        if not prisma_ok and prisma_status != IMPORT_NOT_INSTALLED:
+            # prisma is present but cannot be imported -> fix the native layer.
+            print("   ⚠️  prisma is installed but will not import; repairing "
+                  "native extensions rather than reinstalling litellm again...")
+            if repair_broken_native_extensions() and _litellm_proxy_deps_present():
+                print(f"  ✅ {LITELLM_PROXY_SPEC} available after native-extension repair")
+                return _check_and_prompt_upgrade(
+                    LITELLM_PROXY_SPEC, "litellm", "installed", args)
+
+        print(f"   ❌ litellm installed but still unusable: {', '.join(missing)}")
+        if not prisma_ok and prisma_status != IMPORT_NOT_INSTALLED:
+            print("       The installed packages contain native extensions that do not "
+                  "match this CPU architecture.")
+            print(f"       Rebuild the environment for this platform, e.g.: "
+                  f"{get_python_executable()} -m pip install --force-reinstall "
+                  f"--no-cache-dir {LITELLM_PROXY_SPEC}")
+        else:
             print("   💡 Try manually: "
-                  f"{sys.executable} -m pip install --user {LITELLM_PROXY_SPEC}")
-            return False
+                  f"{get_python_executable()} -m pip install --user {LITELLM_PROXY_SPEC}")
+        return False
     return False
 
 
@@ -824,10 +1166,58 @@ def ensure_prompt_toolkit(args=None):
     return False
 
 
+def ensure_native_extensions_healthy(args=None):
+    """Repair compiled packages that were installed for the wrong CPU architecture.
+
+    Every script in this family calls ``ensure_prerequisites``. A devcontainer image
+    that mounts a virtualenv built on another architecture leaves every compiled
+    dependency (pydantic_core, orjson, grpcio, numpy, ...) installed-but-unimportable.
+    pip reports those requirements as satisfied, so the per-package checks below can
+    never repair it on their own and every script fails with a misleading message.
+
+    Run once up front, this fixes the whole environment in one pass so the individual
+    ``ensure_*`` checks behave normally afterwards. Scans once per process.
+    """
+    global _NATIVE_SCAN_DONE
+    print(f"🔍 Checking native extensions for this CPU "
+          f"({platform.machine()})...")
+    if _NATIVE_SCAN_DONE:
+        return True
+    _NATIVE_SCAN_DONE = True
+
+    broken = find_broken_native_extensions()
+    if not broken:
+        print("  ✅ Native extensions match this architecture")
+        return True
+
+    packages = sorted({b["package"] for b in broken if b["package"]})
+    print(f"  ⚠️  {len(broken)} native extension(s) cannot load on "
+          f"{platform.machine()}; {len(packages)} package(s) affected")
+    print("     (Typical cause: a virtualenv baked on another architecture was "
+          "mounted into this container.)")
+
+    _NATIVE_SCAN_DONE = False  # repair rescans; allow another pass afterwards
+    repaired = repair_broken_native_extensions()
+    _NATIVE_SCAN_DONE = True
+
+    if repaired:
+        print(f"  ✅ Repaired {len(repaired)} package(s): "
+              f"{', '.join(repaired[:8])}"
+              f"{' ...' if len(repaired) > 8 else ''}")
+    still = find_broken_native_extensions()
+    if still:
+        print(f"  ⚠️  {len(still)} native extension(s) still cannot load; "
+              "some features may be unavailable")
+    else:
+        print("  ✅ All native extensions now load correctly")
+    return not still
+
+
 def ensure_prerequisites(args=None):
     """Ensure litellm (with the proxy extras), prompt_toolkit, and the claude CLI are available."""
     print("🔍 Checking prerequisites...")
     ok = True
+    ok &= ensure_native_extensions_healthy(args)
     ok &= ensure_litellm(args)
     ok &= ensure_prompt_toolkit(args)
     ok &= ensure_claude_cli(args)
@@ -1058,13 +1448,24 @@ def setup_claude_persistence():
             os.symlink(claude_persist_dir, claude_config_dir)
             print(f"  ✅ Symlinked empty ~/.claude → {claude_persist_dir}")
         else:
-            print(f"  Copying existing ~/.claude to {claude_persist_dir}")
-            if os.path.exists(claude_persist_dir):
-                shutil.rmtree(claude_persist_dir)
+            # ~/.claude has content. .claude_persist may ALREADY be the real store
+            # (that is the whole point of persistence), so never delete it: merge
+            # into it instead. The previous rmtree here destroyed every persisted
+            # session whenever a freshly created container happened to ship a
+            # non-empty ~/.claude.
+            if os.path.isdir(claude_persist_dir) and os.listdir(claude_persist_dir):
+                print("  Merging ~/.claude into .claude_persist "
+                      "(existing persisted data preserved)")
+            else:
+                print("  Copying existing ~/.claude to .claude_persist")
             shutil.copytree(claude_config_dir, claude_persist_dir, dirs_exist_ok=True)
-            shutil.rmtree(claude_config_dir)
+            # Remove the original without following a symlink (rmtree refuses those).
+            if os.path.islink(claude_config_dir):
+                os.unlink(claude_config_dir)
+            else:
+                shutil.rmtree(claude_config_dir)
             os.symlink(claude_persist_dir, claude_config_dir)
-            print(f"  ✅ Migrated ~/.claude → {claude_persist_dir}")
+            print(f"  ✅ Merged ~/.claude → {claude_persist_dir}")
     else:
         os.symlink(claude_persist_dir, claude_config_dir)
         print(f"  ✅ Created ~/.claude → {claude_persist_dir} (populated on first launch)")

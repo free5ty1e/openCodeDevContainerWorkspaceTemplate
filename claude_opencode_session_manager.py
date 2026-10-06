@@ -10,6 +10,11 @@ import sys
 import json
 import shutil
 import time
+import sqlite3
+import subprocess
+import tempfile
+import random
+import hashlib
 from datetime import datetime
 
 # Import shared library
@@ -57,6 +62,11 @@ from claude_library import (
 # We will use a list of candidate directories for each type.
 CLAUDE_SESSIONS_CANDIDATES = [
     "~/.claude/projects",
+    # ~/.claude is normally a symlink into the workspace (see
+    # claude_library.setup_claude_persistence). In a freshly recreated devcontainer
+    # that symlink does not exist yet, so fall back to the persistent copy directly
+    # rather than reporting zero Claude sessions.
+    ".claude_persist/projects",
     ".claude/projects"
 ]
 OPCODE_SESSIONS_CANDIDATES = [
@@ -67,6 +77,408 @@ OPCODE_SESSIONS_CANDIDATES = [
     ".ai_working/opencode_data"
 ]
 FAVORITES_CACHE_FILE = os.path.expanduser("~/.claude_opencode_session_favorites")
+
+# ─── Opencode session format constants ─────────────────────────────────────────
+# opencode persists sessions in a SQLite database (opencode.db). Message *content*
+# does NOT live in the `message` table -- it lives in the separate `part` table, one
+# row per content block, joined by message_id. Writing content into message.data
+# (as previous versions of this script did) produces sessions that opencode opens as
+# completely empty.
+#
+# The authoritative, importable shape is what `opencode export <sessionID>` emits:
+#   { "info": {session fields}, "messages": [ {"info": {...}, "parts": [...] } ] }
+# We build that document and hand it to `opencode import`, which validates it.
+
+OC_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+OC_VERSION = "1.18.34"
+OC_DEFAULT_PROVIDER = "opencode"
+OC_DEFAULT_MODEL = "big-pickle"
+
+# Text that Claude Code injects into the transcript but that is not a real user turn.
+# Importing these produces noisy, confusing bubbles at the top of the session.
+_CLAUDE_META_PREFIXES = (
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<system-reminder>",
+    "<user-memory-input>",
+    "<ide_selection>",
+)
+
+
+def _oc_id(prefix, length=22):
+    """Generate an opencode-style identifier.
+
+    opencode ids are `<prefix>_<12 chars of ms-timestamp in base32><random base32>`,
+    which makes them lexicographically sortable by creation time. Matching that shape
+    keeps imported sessions ordered correctly alongside native ones.
+    """
+    ts = int(time.time() * 1000)
+    tsb = ""
+    t = ts
+    for _ in range(12):
+        tsb = OC_ID_ALPHABET[t % 32] + tsb
+        t //= 32
+    rnd = "".join(random.choice(OC_ID_ALPHABET) for _ in range(max(0, length - 12)))
+    return f"{prefix}_{tsb}{rnd}"
+
+
+def _is_meta_text(text):
+    """True if this text is a Claude Code harness/system injection, not a real message."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return stripped.startswith(_CLAUDE_META_PREFIXES)
+
+
+def _oc_model(claude_model):
+    """Map a Claude model string onto an opencode model reference.
+
+    Claude's model ids (claude-sonnet-4-6, etc.) do not exist in opencode, so an
+    unmapped id falls back to a model the local install is known to have.
+    """
+    if isinstance(claude_model, str) and claude_model.strip():
+        m = claude_model.strip()
+        if "/" in m:
+            provider, model = m.split("/", 1)
+            return provider, model
+    return OC_DEFAULT_PROVIDER, OC_DEFAULT_MODEL
+
+
+def _oc_project_for_directory(db_path, preferred_dir):
+    """Resolve (project_id, directory) for an imported session.
+
+    opencode only lists a session under a project whose directory is registered in
+    `project_directory`, so an unregistered directory makes the session invisible in
+    the UI. Prefer an exact match, then any registered directory.
+    """
+    pids, dirs = None, []
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            for pid, directory in cur.execute("SELECT project_id, directory FROM project_directory"):
+                dirs.append(directory)
+                if preferred_dir and os.path.normpath(directory) == os.path.normpath(preferred_dir):
+                    pids = pid
+            if pids is None and dirs:
+                pids = cur.execute("SELECT id FROM project LIMIT 1").fetchone()[0]
+            conn.close()
+        except sqlite3.Error:
+            pass
+    if pids is None:
+        pids = "global"
+    directory = preferred_dir if (preferred_dir and dirs and
+                                  any(os.path.normpath(d) == os.path.normpath(preferred_dir) for d in dirs)) \
+        else (dirs[0] if dirs else (preferred_dir or os.getcwd()))
+    return pids, directory
+
+
+def read_claude_jsonl(path):
+    """Parse a Claude Code .jsonl transcript into a list of dicts, skipping bad lines."""
+    records = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                records.append(obj)
+    return records
+
+
+def claude_to_opencode_export(claude_path, db_path=None, directory=None):
+    """Build an opencode export-format document (the shape `opencode import` accepts).
+
+    Returns a dict: {"info": {...}, "messages": [{"info": {...}, "parts": [...]}]}
+    """
+    db_path = db_path or os.path.join(os.path.expanduser("~/.local/share/opencode"), "opencode.db")
+    records = read_claude_jsonl(claude_path)
+
+    title = "Imported from Claude Code"
+    session_id = _oc_id("ses")
+    messages = []
+    parent_mid = None
+    tokens = {"input": 0, "output": 0, "reasoning": 0,
+              "cache": {"read": 0, "write": 0}}
+    claude_cwd = None
+    session_model = None
+
+    for rec in records:
+        rtype = rec.get("type")
+
+        if rtype == "custom-title":
+            ct = rec.get("customTitle")
+            if isinstance(ct, str) and ct.strip():
+                title = ct.strip()
+            continue
+
+        if rtype not in ("user", "assistant"):
+            continue
+        if rec.get("isSidechain"):
+            continue
+
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+
+        # The transcript's cwd tells us which project this conversation belongs to.
+        if claude_cwd is None and isinstance(rec.get("cwd"), str):
+            claude_cwd = rec["cwd"]
+
+        content = msg.get("content")
+        parts = []
+        if isinstance(content, str):
+            if not _is_meta_text(content):
+                parts.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = block.get("text")
+                    if isinstance(text, str) and not _is_meta_text(text):
+                        parts.append({"type": "text", "text": text})
+                elif btype == "thinking":
+                    thinking = block.get("thinking")
+                    if isinstance(thinking, str) and thinking.strip():
+                        parts.append({"type": "reasoning", "text": thinking})
+                elif btype == "tool_use":
+                    parts.append({
+                        "type": "tool",
+                        "tool": block.get("name") or "unknown",
+                        "callID": block.get("id") or _oc_id("call"),
+                        "state": {
+                            "status": "completed",
+                            "title": block.get("name") or "unknown",
+                            "metadata": {},
+                            "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                            "output": "",
+                        },
+                    })
+                elif btype == "tool_result":
+                    body = block.get("content")
+                    if isinstance(body, list):
+                        body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
+                    elif not isinstance(body, str):
+                        body = json.dumps(body)
+                    parts.append({
+                        "type": "tool",
+                        "tool": block.get("__name") or "unknown",
+                        "callID": block.get("tool_use_id") or _oc_id("call"),
+                        "state": {
+                            "status": "completed",
+                            "title": block.get("__name") or "unknown",
+                            "metadata": {},
+                            "input": {},
+                            "output": body,
+                        },
+                    })
+
+        if not parts:
+            continue
+
+        mid = _oc_id("msg")
+        created = int(time.time() * 1000) + len(messages)
+        provider_id, model_id = _oc_model(msg.get("model"))
+
+        if rtype == "user":
+            info = {
+                "role": "user",
+                "time": {"created": created},
+                "agent": "build",
+                "model": {"providerID": provider_id, "modelID": model_id},
+                "summary": {"diffs": []},
+            }
+        else:
+            usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+            details = usage.get("output_tokens_details") if isinstance(usage.get("output_tokens_details"), dict) else {}
+            msg_tokens = {
+                "input": int(usage.get("input_tokens") or 0),
+                "output": int(usage.get("output_tokens") or 0),
+                "reasoning": int(details.get("thinking_tokens") or 0),
+                "cache": {
+                    "read": int(usage.get("cache_read_input_tokens") or 0),
+                    "write": int(usage.get("cache_creation_input_tokens") or 0),
+                },
+            }
+            for key in ("input", "output", "reasoning"):
+                tokens[key] += msg_tokens[key]
+            tokens["cache"]["read"] += msg_tokens["cache"]["read"]
+            tokens["cache"]["write"] += msg_tokens["cache"]["write"]
+            session_model = session_model or {"providerID": provider_id, "modelID": model_id}
+            info = {
+                "role": "assistant",
+                "mode": "build",
+                "agent": "build",
+                "cost": 0,
+                "tokens": msg_tokens,
+                "path": {"cwd": claude_cwd or directory or os.getcwd(),
+                         "root": claude_cwd or directory or os.getcwd()},
+                "modelID": model_id,
+                "providerID": provider_id,
+                "time": {"created": created, "completed": created},
+            }
+            if parent_mid:
+                info["parentID"] = parent_mid
+
+        info["id"] = mid
+        info["sessionID"] = session_id
+
+        for part in parts:
+            part["id"] = _oc_id("prt")
+            part["messageID"] = mid
+            part["sessionID"] = session_id
+            if part["type"] in ("text", "reasoning"):
+                part["time"] = {"start": created, "end": created}
+            elif part["type"] == "tool":
+                part["state"]["time"] = {"start": created, "end": created}
+
+        messages.append({"info": info, "parts": parts})
+        parent_mid = mid
+
+    if not messages:
+        return None
+
+    # opencode brackets assistant turns with step-start / step-finish parts.
+    wrapped = []
+    for message in messages:
+        info, parts = message["info"], message["parts"]
+        if info["role"] == "assistant":
+            has_tool = any(p["type"] == "tool" for p in parts)
+            wrapped.append({
+                "info": info,
+                "parts": [{
+                    "type": "step-start",
+                    "snapshot": "",
+                    "id": _oc_id("prt"),
+                    "sessionID": info["sessionID"],
+                    "messageID": info["id"],
+                }] + parts + [{
+                    "type": "step-finish",
+                    "reason": "tool-calls" if has_tool else "stop",
+                    "snapshot": "",
+                    "tokens": info["tokens"],
+                    "cost": 0,
+                    "id": _oc_id("prt"),
+                    "sessionID": info["sessionID"],
+                    "messageID": info["id"],
+                }],
+            })
+        else:
+            wrapped.append({"info": info, "parts": parts})
+
+    project_id, resolved_dir = _oc_project_for_directory(db_path, directory or claude_cwd)
+    now = int(time.time() * 1000)
+
+    return {
+        "info": {
+            "id": session_id,
+            "slug": "claude-import-" + hashlib.md5(session_id.encode()).hexdigest()[:8],
+            "projectID": project_id,
+            "directory": resolved_dir,
+            "path": "",
+            "title": title,
+            "agent": "build",
+            "model": {"id": OC_DEFAULT_MODEL, "providerID": OC_DEFAULT_PROVIDER},
+            "version": OC_VERSION,
+            "summary": {"additions": 0, "deletions": 0, "files": 0},
+            "cost": 0,
+            "tokens": tokens,
+            "time": {"created": now, "updated": now},
+        },
+        "messages": wrapped,
+    }
+
+
+def opencode_export_to_claude_jsonl(doc, claude_session_id):
+    """Convert an opencode export document back into a Claude Code .jsonl transcript."""
+    info = doc.get("info", {}) or {}
+    lines = []
+    lines.append(json.dumps({
+        "type": "custom-title",
+        "customTitle": info.get("title") or "Synced from opencode",
+        "sessionId": claude_session_id,
+    }))
+    directory = info.get("directory") or os.getcwd()
+
+    previous_uuid = None
+    for message in doc.get("messages", []) or []:
+        minfo = message.get("info", {}) or {}
+        role = minfo.get("role")
+        if role not in ("user", "assistant"):
+            continue
+
+        blocks = []
+        for part in message.get("parts", []) or []:
+            ptype = part.get("type")
+            if ptype == "text":
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    blocks.append({"type": "text", "text": text})
+            elif ptype == "reasoning":
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    blocks.append({"type": "thinking", "thinking": text})
+            elif ptype == "tool":
+                state = part.get("state") or {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": part.get("callID") or _oc_id("call"),
+                    "name": part.get("tool") or "unknown",
+                    "input": state.get("input") if isinstance(state.get("input"), dict) else {},
+                })
+                output = state.get("output")
+                if isinstance(output, str) and output.strip():
+                    blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": part.get("callID") or "",
+                        "content": output,
+                    })
+        if not blocks:
+            continue
+
+        uuid = minfo.get("id") or _oc_id("uuid")
+        created = (minfo.get("time") or {}).get("created")
+        message_obj = {
+            "id": uuid,
+            "type": "message",
+            "role": role,
+            "content": blocks,
+            "model": f"{minfo.get('providerID', 'opencode')}/{minfo.get('modelID', OC_DEFAULT_MODEL)}",
+        }
+        if role == "assistant":
+            message_obj["usage"] = {
+                "input_tokens": (minfo.get("tokens") or {}).get("input", 0),
+                "output_tokens": (minfo.get("tokens") or {}).get("output", 0),
+                "cache_read_input_tokens": ((minfo.get("tokens") or {}).get("cache") or {}).get("read", 0),
+                "cache_creation_input_tokens": ((minfo.get("tokens") or {}).get("cache") or {}).get("write", 0),
+            }
+            message_obj["stop_reason"] = "end_turn"
+
+        lines.append(json.dumps({
+            "parentUuid": previous_uuid,
+            "isSidechain": False,
+            "type": role,
+            "message": message_obj,
+            "uuid": uuid,
+            "timestamp": datetime.utcfromtimestamp(created / 1000).isoformat() + "Z" if created else None,
+            "userType": "external",
+            "cwd": directory,
+            "sessionId": claude_session_id,
+            "version": info.get("version") or OC_VERSION,
+        }))
+        previous_uuid = uuid
+
+    return "\n".join(lines) + "\n"
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -141,11 +553,11 @@ def list_sessions(base_dir, session_type):
                                         data = json.loads(line)
                                         if isinstance(data, dict) and data.get("type") == "user" and "message" in data:
                                             msg = data["message"]
-                                            if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str) and len(msg["content"].strip()) > 0:
+                                            if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str) and not _is_meta_text(msg["content"]):
                                                 content = msg["content"]
                                                 title = content[:50] + ("..." if len(content) > 50 else "")
                                                 break
-                                            elif isinstance(msg, str) and len(msg.strip()) > 0:
+                                            elif isinstance(msg, str) and not _is_meta_text(msg):
                                                 title = msg[:50] + ("..." if len(msg) > 50 else "")
                                                 break
                                     except (json.JSONDecodeError, KeyError):
@@ -163,307 +575,259 @@ def list_sessions(base_dir, session_type):
         return sessions
 
     elif session_type == 'opencode':
-        # Opencode stores session data in multiple locations:
-        # 1. SQLite database for session metadata (primary source)
-        # 2. prompt-history.jsonl in state/opencode/ (as a fallback session)
-        # 3. Individual session files in storage/session_diff/ (backup/special sessions)
-        sessions_found = {}  # Avoid duplicates by session ID
-
-        # First, check the Opencode database for sessions
+        # opencode's sessions live entirely in the SQLite database. There is no
+        # per-session file on disk: `storage/session_diff/` holds snapshot diffs and
+        # `state/opencode/prompt-history.jsonl` is raw prompt history -- neither is a
+        # chat session, so neither is listed here.
         db_path = os.path.join(base_dir, "opencode.db")
-        if os.path.exists(db_path):
-            try:
-                import sqlite3
-                conn = sqlite3.connect(db_path)
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, title, time_created FROM session")
-                for row in cursor.fetchall():
-                    session_id, title, time_created = row[0], row[1], row[2]
-                    # Use database timestamp for sorting
-                    modified = time_created if time_created else os.path.getmtime(db_path)
-                    sessions_found[session_id] = {
-                        "id": session_id,
-                        "path": db_path,  # database is the path
-                        "modified": modified,
-                        "title": title if title and title.strip() else f"Session {session_id[:8]}",
-                    }
-                conn.close()
-            except Exception as _:
-                pass  # Fall back to file-based detection
+        if not os.path.exists(db_path):
+            return sessions
 
-        # Look for individual session JSON files in storage/session_diff/
-        # These are the actual chat sessions
-        session_diff_dir = os.path.join(base_dir, "storage", "session_diff")
-        if os.path.isdir(session_diff_dir):
-            for file in os.listdir(session_diff_dir):
-                # Look for both .json and .jsonl files (Opencode uses both)
-                if not (file.endswith(".json") or file.endswith(".jsonl")):
-                    continue
-                # Skip non-session files
-                if file in ["model.json", "kv.json"]:
-                    continue
-                session_path = os.path.join(session_diff_dir, file)
-                # Extract session ID from filename (without .json extension)
-                session_id = os.path.splitext(file)[0]
-                # Skip if we've already processed this session
-                if session_id in sessions_found:
-                    continue
-                modified = os.path.getmtime(session_path)
-                title = f"Session {session_id}"
-                try:
-                    # Opencode sessions are JSONL format (like Claude), not single JSON objects
-                    with open(session_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                    if lines:
-                        try:
-                            # Try to parse the first line for title (Opencode uses customTitle)
-                            first_data = json.loads(lines[0].strip())
-                            if isinstance(first_data, dict):
-                                # Try customTitle first (Opencode format)
-                                if "customTitle" in first_data and isinstance(first_data["customTitle"], str) and first_data["customTitle"].strip():
-                                    custom_title = first_data["customTitle"]
-                                    title = custom_title[:50] + ("..." if len(custom_title) > 50 else "")
-                                # Fallback: try regular title field
-                                elif "title" in first_data and isinstance(first_data["title"], str) and first_data["title"].strip():
-                                    title = first_data["title"][:50] + ("..." if len(first_data["title"]) > 50 else "")
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error as e:
+            print(f"\u26a0\ufe0f  Could not open opencode database: {e}")
+            return sessions
 
-                                # If no title found, look for user message content
-                                if title == f"Session {session_id}":
-                                    for line in reversed(lines):
-                                        line = line.strip()
-                                        if not line:
-                                            continue
-                                        try:
-                                            data = json.loads(line)
-                                            if isinstance(data, dict) and data.get("type") == "user" and "message" in data:
-                                                msg = data["message"]
-                                                if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str) and len(msg["content"].strip()) > 0:
-                                                    content = msg["content"]
-                                                    title = content[:50] + ("..." if len(content) > 50 else "")
-                                                    break
-                                                elif isinstance(msg, str) and len(msg.strip()) > 0:
-                                                    title = msg[:50] + ("..." if len(msg) > 50 else "")
-                                                    break
-                                        except (json.JSONDecodeError, KeyError):
-                                            continue
-                        except (json.JSONDecodeError, IndexError):
-                            pass
-                except Exception:
-                    pass  # Keep default title if we can't read the file
+        try:
+            rows = conn.execute(
+                "SELECT s.id, s.title, s.directory, s.time_created, s.time_updated,"
+                " (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count,"
+                " (SELECT COUNT(*) FROM part p WHERE p.session_id = s.id) AS part_count"
+                " FROM session s WHERE s.parent_id IS NULL"
+                " ORDER BY s.time_updated DESC"
+            ).fetchall()
+        except sqlite3.Error as e:
+            print(f"\u26a0\ufe0f  Could not query opencode sessions: {e}")
+            conn.close()
+            return sessions
 
-                sessions_found[session_id] = {
-                    "id": session_id,
-                    "path": session_path,
-                    "modified": modified,
-                    "title": title,
-                }
+        for row in rows:
+            # A session with no parts renders as an empty conversation. Several of
+            # those exist from older broken imports; keep them out of the list.
+            if not row["part_count"]:
+                continue
+            sessions.append({
+                "id": row["id"],
+                "path": db_path,
+                "db_path": db_path,
+                "modified": (row["time_updated"] or row["time_created"] or 0) / 1000.0,
+                "title": row["title"] or f"Session {row['id'][:12]}",
+                "msg_count": row["msg_count"],
+                "part_count": row["part_count"],
+            })
 
-        # Also check for prompt-history.jsonl as a fallback session source
-        prompt_history_path = os.path.join(base_dir, "state", "opencode", "prompt-history.jsonl")
-        if os.path.exists(prompt_history_path):
-            # Use a descriptive ID for prompt history
-            session_id = "prompt-history"
-            if session_id not in sessions_found:
-                modified = os.path.getmtime(prompt_history_path)
-                title = "Prompt History"
-                try:
-                    with open(prompt_history_path, "r", encoding="utf-8") as f:
-                        first_line = f.readline().strip()
-                        if first_line:
-                            data = json.loads(first_line)
-                            if isinstance(data, dict) and "message" in data:
-                                msg = data["message"]
-                                if isinstance(msg, str) and len(msg) > 0:
-                                    title = msg[:50] + ("..." if len(msg) > 50 else "")
-                except Exception:
-                    pass
-
-                sessions_found[session_id] = {
-                    "id": session_id,
-                    "path": prompt_history_path,
-                    "modified": modified,
-                    "title": title,
-                }
-
-        # Convert to list and sort by modification time, newest first
-        sessions = list(sessions_found.values())
-        sessions.sort(key=lambda x: x["modified"], reverse=True)
+        conn.close()
         return sessions
 
     return sessions
 
 def sync_claude_to_opencode(claude_session, opencode_base_dir):
-    """Copy a Claude session (.jsonl file) to Opencode as a new session.
-    Creates the session file in opencode_base_dir/storage/session_diff/ and
-    inserts messages into the Opencode database.
+    """Import a Claude Code session into opencode.
+
+    Builds an opencode export-format document and hands it to `opencode import`,
+    which writes the `session` / `message` / `part` rows itself. Returns the new
+    opencode session id, or None on failure.
     """
-    from datetime import datetime
-    import sqlite3
-    import hashlib
+    db_path = os.path.join(opencode_base_dir, "opencode.db")
 
-    # Generate a new session ID matching Opencode's format (ses_...)
-    new_id = f"ses_{datetime.now().strftime('%y%m%d%H%M%S')}_{hashlib.md5(str(datetime.now()).encode()).hexdigest()[:10]}"
+    doc = claude_to_opencode_export(claude_session['path'], db_path=db_path)
+    if not doc:
+        print("\u26a0\ufe0f  No convertible user/assistant messages found in that Claude session.")
+        return None
 
-    # Place the file in storage/session_diff/ to match the existing Opencode session format
-    session_diff_dir = os.path.join(opencode_base_dir, "storage", "session_diff")
-    os.makedirs(session_diff_dir, exist_ok=True)
-    new_path = os.path.join(session_diff_dir, f"{new_id}.jsonl")
-
-    # Get title from claude session
-    title = claude_session.get('title', f'Synced from Claude: {claude_session["id"][:8]}')
-
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    before_ids = _session_ids(db_path)
+    started_at_ms = int(time.time() * 1000) - 1000
     try:
-        # Copy the Claude session file to Opencode location
-        shutil.copy2(claude_session['path'], new_path)
+        json.dump(doc, tmp)
+        tmp.close()
 
-        # Update Opencode database with session and messages
-        db_path = os.path.join(opencode_base_dir, "opencode.db")
-        if os.path.exists(db_path):
-            conn = None
+        result = subprocess.run(
+            ["opencode", "import", tmp.name],
+            capture_output=True, text=True, timeout=900,
+            # opencode import re-resolves the session's project and directory from its
+            # own working directory, ignoring the values in the document. Run it from
+            # the target project directory so the session lands in the right project
+            # instead of a synthetic "global" one.
+            cwd=doc["info"].get("directory") or None,
+        )
+    except FileNotFoundError:
+        print("\u274c  `opencode` executable not found on PATH; cannot import session.")
+        _unlink(tmp.name)
+        return None
+    except subprocess.TimeoutExpired:
+        print("\u274c  `opencode import` timed out.")
+        _unlink(tmp.name)
+        return None
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        tail = detail[-1] if detail else "unknown error"
+        print(f"❌  opencode import failed: {tail}")
+        strays = _cleanup_partial_import(db_path, before_ids, started_at_ms)
+        if strays:
+            print(f"   Removed partial session stub(s): {', '.join(strays)}")
+        return None
+
+    # opencode prints: Imported session: ses_...
+    new_id = None
+    for line in (result.stdout or "").splitlines():
+        if "ses_" in line:
+            new_id = line.strip().split("ses_", 1)[1]
+            new_id = "ses_" + new_id.split()[0].strip()
+            break
+    return new_id
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _session_ids(db_path):
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        ids = {row[0] for row in conn.execute("SELECT id FROM session")}
+        conn.close()
+        return ids
+    except sqlite3.Error:
+        return set()
+
+
+def _cleanup_partial_import(db_path, before_ids, started_at_ms):
+    """Remove the stub session left behind by a failed `opencode import`.
+
+    opencode import is not atomic: it inserts the session row before validating the
+    messages, so a schema mismatch leaves a half-populated session that shows up in the
+    UI as a near-empty conversation. Only rows created after this import started and not
+    present beforehand are touched.
+    """
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        strays = [row[0] for row in cur.execute(
+            "SELECT id FROM session WHERE time_created >= ?", (started_at_ms,)
+        ) if row[0] not in before_ids]
+        if strays:
+            cur.executemany("DELETE FROM session WHERE id = ?", [(s,) for s in strays])
+            conn.commit()
+        conn.close()
+        return strays
+    except sqlite3.Error:
+        return []
+
+
+def opencode_session_to_export(opencode_session):
+    """Read an opencode session out of the database as an export-format document."""
+    db_path = opencode_session.get("db_path")
+    session_id = opencode_session["id"]
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id, project_id, slug, directory, path, title, agent, model, version,"
+            " summary_additions, summary_deletions, summary_files, cost, tokens_input,"
+            " tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,"
+            " time_created, time_updated FROM session WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        info = {
+            "id": row["id"],
+            "slug": row["slug"],
+            "projectID": row["project_id"],
+            "directory": row["directory"],
+            "path": row["path"] or "",
+            "title": row["title"],
+            "agent": row["agent"] or "build",
+            "model": json.loads(row["model"]) if row["model"] else {"id": OC_DEFAULT_MODEL, "providerID": OC_DEFAULT_PROVIDER},
+            "version": row["version"] or OC_VERSION,
+            "summary": {
+                "additions": row["summary_additions"] or 0,
+                "deletions": row["summary_deletions"] or 0,
+                "files": row["summary_files"] or 0,
+            },
+            "cost": row["cost"] or 0,
+            "tokens": {
+                "input": row["tokens_input"] or 0,
+                "output": row["tokens_output"] or 0,
+                "reasoning": row["tokens_reasoning"] or 0,
+                "cache": {"read": row["tokens_cache_read"] or 0, "write": row["tokens_cache_write"] or 0},
+            },
+            "time": {"created": row["time_created"], "updated": row["time_updated"]},
+        }
+
+        messages = []
+        msg_rows = conn.execute(
+            "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+            (session_id,),
+        ).fetchall()
+        for mrow in msg_rows:
             try:
-                conn = sqlite3.connect(db_path)
-                cursor = conn.cursor()
-
-                # Get the default project ID
+                minfo = json.loads(mrow["data"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            minfo["id"] = mrow["id"]
+            minfo["sessionID"] = session_id
+            parts = []
+            for prow in conn.execute(
+                "SELECT data FROM part WHERE message_id = ? ORDER BY time_created, id",
+                (mrow["id"],),
+            ):
                 try:
-                    cursor.execute("SELECT id FROM project LIMIT 1")
-                    project_row = cursor.fetchone()
-                    project_id = project_row[0] if project_row else "-sync-project"
-                except Exception:
-                    project_id = "-sync-project"
+                    part = json.loads(prow["data"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                part["messageID"] = mrow["id"]
+                part["sessionID"] = session_id
+                parts.append(part)
+            messages.append({"info": minfo, "parts": parts})
+    finally:
+        conn.close()
 
-                # Generate a slug for the session
-                slug = f"synced-{datetime.now().strftime('%y%m%d%H%M%S')}"
+    return {"info": info, "messages": messages}
 
-                # Generate unique message IDs and timestamps
-                current_time_ms = int(time.time() * 1000)
-
-                # Check if session already exists in database
-                cursor.execute("SELECT id FROM session WHERE id = ?", (new_id,))
-                if cursor.fetchone() is None:
-                    # Read the session file to get content and message count
-                    file_content = ""
-                    try:
-                        with open(claude_session['path'], 'r', encoding='utf-8') as f:
-                            file_content = f.read()
-                    except Exception as e:
-                        pass
-
-                    # Count characters to estimate tokens
-                    total_chars = len(file_content)
-                    estimated_tokens = total_chars // 4
-
-                    # Insert new session with all required fields including tokens
-                    # Use a valid directory path for the workspace
-                    sync_directory = os.path.expanduser('~/.local/share/opencode')
-
-                    cursor.execute("""
-                        INSERT INTO session
-                        (id, project_id, slug, title, version, directory, path, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, model, workspace_id, parent_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        new_id,
-                        project_id,
-                        slug,
-                        title,
-                        "1.0",
-                        sync_directory,  # directory
-                        ".opencode",  # path - relative identifier like existing sessions
-                        0.0,  # cost
-                        estimated_tokens,  # tokens_input
-                        estimated_tokens // 2,  # tokens_output (rough estimate)
-                        0,  # tokens_reasoning
-                        0,  # tokens_cache_read
-                        0,  # tokens_cache_write
-                        current_time_ms,
-                        current_time_ms,
-                        '{"providerID":"claude","modelID":"claude-sonnet-4-20250416"}',  # model
-                        None,  # workspace_id (SQL NULL)
-                        None,  # parent_id (SQL NULL)
-                    ))
-
-                    # Read Claude session messages for database insertion
-                    claude_messages = file_content.strip().split('\n') if file_content else []
-
-                    # Insert each message into Opencode database
-                    for i, line in enumerate(claude_messages):
-                        try:
-                            data = json.loads(line.strip())
-                            if isinstance(data, dict):
-                                # Handle different Claude message formats
-                                role = data.get('type', 'user')
-                                content = None
-
-                                # Extract content from various locations
-                                if 'message' in data:
-                                    msg = data['message']
-                                    if isinstance(msg, dict) and 'content' in msg:
-                                        content = msg['content']
-                                    elif isinstance(msg, str):
-                                        content = msg
-                                elif 'content' in data:
-                                    content = data['content']
-
-                                if content is None:
-                                    continue
-
-                                # Determine role for Opencode (user, assistant, system)
-                                if role == 'user':
-                                    opencode_role = 'user'
-                                elif role == 'assistant':
-                                    opencode_role = 'assistant'
-                                elif role == 'system':
-                                    opencode_role = 'system'
-                                else:
-                                    opencode_role = 'user'  # Default to user for unknown types
-
-                                # Create Opencode message format matching what Opencode expects from session files
-                                opencode_msg = {
-                                    'type': opencode_role,
-                                    'message': content
-                                }
-
-                                msg_data = json.dumps(opencode_msg)
-                                msg_id = f"{new_id}_{i}"
-
-                                cursor.execute("""
-                                    INSERT INTO message (id, session_id, time_created, time_updated, data)
-                                    VALUES (?, ?, ?, ?, ?)
-                                """, (msg_id, new_id, current_time_ms + i * 100, current_time_ms + i * 100, msg_data))
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-
-                conn.commit()
-            except Exception as db_error:
-                print(f"⚠️  Note: Could not update Opencode database: {db_error}")
-            finally:
-                if conn is not None:
-                    conn.close()
-
-        return new_path
-    except Exception as e:
-        print(f"⚠️  Failed to sync Claude session to Opencode: {e}")
-    return None
 
 def sync_opencode_to_claude(opencode_session, claude_base_dir):
-    """Copy an Opencode session (.jsonl file) to Claude as a new session.
-    We'll create a new subdirectory under claude_base_dir with a generated ID,
-    and put the .jsonl file inside as chat.jsonl (to match Claude's expected layout).
+    """Export an opencode session and write it as a Claude Code .jsonl transcript.
+
+    Claude Code expects `<projects>/<slugified-cwd>/<session-id>.jsonl`, so the file is
+    written to a directory named after the session's project directory rather than to a
+    flat `sync_*` folder (which Claude Code does not read).
     """
-    from datetime import datetime
-    # Create a new subdirectory under claude_base_dir
-    new_dir_name = f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{opencode_session['id']}"
-    new_dir_path = os.path.join(claude_base_dir, new_dir_name)
+    session_id = opencode_session["id"]
+    doc = opencode_session_to_export(opencode_session)
+    if not doc:
+        print(f"\u274c  Could not read opencode session {session_id} from the database.")
+        return None
+
+    directory = doc["info"].get("directory") or os.getcwd()
+    # Claude Code names each project directory after the absolute path with every slash
+    # replaced by a dash: /workspace -> -workspace, /srv/app -> -srv-app.
+    slug_dir = directory.strip().replace(os.sep, "-").replace("/", "-") or "-global"
+    new_dir = os.path.join(claude_base_dir, slug_dir)
     try:
-        os.makedirs(new_dir_path, exist_ok=True)
-        # The chat.jsonl file inside this new directory
-        new_chat_file = os.path.join(new_dir_path, "chat.jsonl")
-        # Copy the Opencode session file to this new chat.jsonl file
-        shutil.copy2(opencode_session['path'], new_chat_file)
-        return new_dir_path   # return the directory path (which represents the Claude session)
-    except Exception as e:
-        print(f"⚠️  Failed to sync Opencode session to Claude: {e}")
-    return None
+        os.makedirs(new_dir, exist_ok=True)
+        new_file = os.path.join(new_dir, f"{session_id}.jsonl")
+        with open(new_file, "w", encoding="utf-8") as f:
+            f.write(opencode_export_to_claude_jsonl(doc, session_id))
+        return new_file
+    except OSError as e:
+        print(f"\u26a0\ufe0f  Failed to write Claude session: {e}")
+        return None
+
 
 # ─── Session Selector (using prompt_toolkit) ──────────────────────────────────
 def session_selector(sessions, session_type, favorites):
@@ -695,6 +1059,15 @@ def main():
         print("❌ Prerequisites check failed. Exiting.")
         sys.exit(1)
 
+    # Restore ~/.claude -> .claude_persist so this script sees the same Claude CLI
+    # state as the provider scripts. On a recreated devcontainer the symlink is gone
+    # even though the persisted sessions are still on disk.
+    if not args.claude_location:
+        try:
+            setup_claude_persistence()
+        except Exception as e:
+            print(f"⚠️  Could not restore Claude persistence: {e}")
+
     # Load favorites
     favorites = load_favorites(FAVORITES_CACHE_FILE)
     if favorites is None:
@@ -823,7 +1196,8 @@ def main():
                         if opencode_base is not None:
                             new_path = sync_claude_to_opencode(selected_session, opencode_base)
                             if new_path:
-                                print(f"\n✅ Synced Claude session to Opencode: {new_path}")
+                                print(f"\n✅ Imported into opencode as session: {new_path}")
+                                print("   Restart opencode (or switch sessions) to see it.")
                                 # Optionally, we could add the new session to the opencode_sessions list for immediate viewing
                                 # But we'll just let the user switch view to see it.
                             else:
@@ -834,7 +1208,7 @@ def main():
                         if claude_base is not None:
                             new_path = sync_opencode_to_claude(selected_session, claude_base)
                             if new_path:
-                                print(f"\n✅ Synced Opencode session to Claude: {new_path}")
+                                print(f"\n✅ Exported opencode session to Claude: {new_path}")
                             else:
                                 print(f"\n❌ Failed to sync Opencode session to Claude")
                         else:

@@ -74,6 +74,9 @@ echo "   ✅ Permissions fixed"
 # fi
 # echo "   ✅ RB4 tools ready"
 
+echo "Installing opencode..."
+curl -fsSL https://opencode.ai/install | bash
+
 echo ""
 echo "=========================================="
 echo "✅ Dev container ready!"
