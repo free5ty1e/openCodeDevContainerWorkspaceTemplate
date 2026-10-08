@@ -1162,6 +1162,11 @@ def _force_local_opencode_model(doc):
         info = message.get("info") or {}
         if isinstance(info.get("model"), dict):
             info["model"] = dict(local)
+        # Converters also bake the model into assistant info as flat fields.
+        if "modelID" in info:
+            info["modelID"] = OC_DEFAULT_MODEL
+        if "providerID" in info:
+            info["providerID"] = OC_DEFAULT_PROVIDER
     return doc
 
 
