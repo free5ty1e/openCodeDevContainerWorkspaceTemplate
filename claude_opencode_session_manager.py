@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import random
 import hashlib
+import uuid
 from datetime import datetime
 
 # Import shared library
@@ -76,7 +77,25 @@ OPCODE_SESSIONS_CANDIDATES = [
     ".opencode/sessions",
     ".ai_working/opencode_data"
 ]
+# Pi stores one JSONL file per session under ~/.pi/agent/sessions/<encoded-cwd>/
+# (the cwd is encoded as --path-with-dashes--). Pi has no database.
+PI_SESSIONS_CANDIDATES = [
+    "~/.pi/agent/sessions",
+    "~/.pi/sessions",
+    ".pi/agent/sessions",
+]
 FAVORITES_CACHE_FILE = os.path.expanduser("~/.claude_opencode_session_favorites")
+
+# ─── Harness registry ──────────────────────────────────────────────────────────
+# The session lists the UI cycles through with Left/Right, and the copy targets the
+# user picks from after selecting a session. Order is the on-screen order.
+HARNESSES = ("claude", "opencode", "pi")
+HARNESS_LABELS = {
+    "claude": "Claude Code",
+    "opencode": "opencode",
+    "pi": "Pi",
+}
+
 
 # ─── Opencode session format constants ─────────────────────────────────────────
 # opencode persists sessions in a SQLite database (opencode.db). Message *content*
@@ -124,6 +143,34 @@ def _oc_id(prefix, length=22):
     return f"{prefix}_{tsb}{rnd}"
 
 
+# Namespace for deterministic UUIDs: the same source id always maps to the same
+# destination id, so re-syncing a session updates its counterpart in place instead
+# of piling up duplicate transcripts. Claude and Pi both key sessions by UUID.
+_STABLE_UUID_NS = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://github.com/claude-opencode-session-sync")
+
+
+def _stable_uuid(kind, *parts):
+    """Deterministic UUID v5 for a source identifier.
+
+    Claude's `--resume` accepts only a UUID or an exact session title, and Pi keys
+    session files by UUID, so importing under a foreign id (`ses_...`) produces a
+    session that can never be resumed. Deriving the id keeps re-syncs idempotent.
+    """
+    return str(uuid.uuid5(_STABLE_UUID_NS, ":".join([kind] + [str(p) for p in parts])))
+
+
+def _stable_uuid_or(kind, value):
+    """Preserve values that already are UUIDs, derive one otherwise."""
+    if isinstance(value, str):
+        try:
+            uuid.UUID(value)
+            return value
+        except ValueError:
+            pass
+    return _stable_uuid(kind, value)
+
+
 def _is_meta_text(text):
     """True if this text is a Claude Code harness/system injection, not a real message."""
     if not isinstance(text, str):
@@ -132,6 +179,72 @@ def _is_meta_text(text):
     if not stripped:
         return True
     return stripped.startswith(_CLAUDE_META_PREFIXES)
+
+
+# Operator reads these stamps in Eastern time regardless of the container's TZ.
+IMPORT_TZ_NAME = "America/New_York"
+_TITLE_MAX = 50
+
+
+def _import_stamp(when=None):
+    """Render an import stamp like 'imported 20261006-0313pmEastern'."""
+    import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(IMPORT_TZ_NAME)
+        now = (when or _dt.datetime.now(tz)).astimezone(tz)
+    except Exception:
+        now = _dt.datetime.now(_dt.timezone.utc)
+    return "imported " + now.strftime("%Y%m%d-%I%M%p").lower() + "Eastern"
+
+
+def _stamped_title(title, when=None):
+    """Append the import stamp so a synced session is distinguishable from the original.
+
+    Idempotent: re-syncing an already-synced session must not stack stamps.
+    """
+    base = (title or "").strip() or "Untitled session"
+    if "(imported " in base:
+        return base
+    if len(base) > _TITLE_MAX:
+        base = base[:_TITLE_MAX].rstrip() + "..."
+    return f"{base} ({_import_stamp(when)})"
+
+
+def _derive_claude_title(records, session_id):
+    """Derive a display title for a Claude session from its transcript records.
+
+    Priority matches what the session picker shows: an explicit `custom-title`
+    record wins, otherwise fall back to the most recent real user message.
+
+    User messages store content either as a plain string or as a list of blocks;
+    both shapes are handled (the picker previously only handled plain strings,
+    which is why fresh conversations fell back to a generated id).
+    """
+    fallback = f"Session {session_id}"
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("type") == "custom-title":
+            ct = rec.get("customTitle")
+            if isinstance(ct, str) and ct.strip():
+                return ct.strip()
+    for rec in reversed(records):
+        if not isinstance(rec, dict) or rec.get("type") != "user":
+            continue
+        if rec.get("isSidechain"):
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and not _is_meta_text(content):
+            return content.strip()
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = block.get("text")
+                    if isinstance(t, str) and not _is_meta_text(t):
+                        return t.strip()
+    return fallback
 
 
 def _oc_model(claude_model):
@@ -202,7 +315,11 @@ def claude_to_opencode_export(claude_path, db_path=None, directory=None):
     db_path = db_path or os.path.join(os.path.expanduser("~/.local/share/opencode"), "opencode.db")
     records = read_claude_jsonl(claude_path)
 
-    title = "Imported from Claude Code"
+    # Title comes from the source transcript so the imported session reads the same
+    # as the original in the picker, then carries an import stamp so the copy can be
+    # told apart from the live session.
+    src_id = os.path.splitext(os.path.basename(claude_path))[0]
+    title = _stamped_title(_derive_claude_title(records, src_id))
     session_id = _oc_id("ses")
     messages = []
     parent_mid = None
@@ -213,12 +330,6 @@ def claude_to_opencode_export(claude_path, db_path=None, directory=None):
 
     for rec in records:
         rtype = rec.get("type")
-
-        if rtype == "custom-title":
-            ct = rec.get("customTitle")
-            if isinstance(ct, str) and ct.strip():
-                title = ct.strip()
-            continue
 
         if rtype not in ("user", "assistant"):
             continue
@@ -405,7 +516,7 @@ def opencode_export_to_claude_jsonl(doc, claude_session_id):
     lines = []
     lines.append(json.dumps({
         "type": "custom-title",
-        "customTitle": info.get("title") or "Synced from opencode",
+        "customTitle": _stamped_title(info.get("title") or "Synced from opencode"),
         "sessionId": claude_session_id,
     }))
     directory = info.get("directory") or os.getcwd()
@@ -446,10 +557,10 @@ def opencode_export_to_claude_jsonl(doc, claude_session_id):
         if not blocks:
             continue
 
-        uuid = minfo.get("id") or _oc_id("uuid")
+        msg_uuid = _stable_uuid_or("msg", minfo.get("id") or _oc_id("uuid"))
         created = (minfo.get("time") or {}).get("created")
         message_obj = {
-            "id": uuid,
+            "id": msg_uuid,
             "type": "message",
             "role": role,
             "content": blocks,
@@ -469,16 +580,408 @@ def opencode_export_to_claude_jsonl(doc, claude_session_id):
             "isSidechain": False,
             "type": role,
             "message": message_obj,
-            "uuid": uuid,
+            "uuid": msg_uuid,
             "timestamp": datetime.utcfromtimestamp(created / 1000).isoformat() + "Z" if created else None,
             "userType": "external",
             "cwd": directory,
             "sessionId": claude_session_id,
             "version": info.get("version") or OC_VERSION,
         }))
-        previous_uuid = uuid
+        previous_uuid = msg_uuid
 
     return "\n".join(lines) + "\n"
+
+
+# ─── Pi (earendil-works/pi) session format ─────────────────────────────────────
+# One JSONL file per session under ~/.pi/agent/sessions/--<cwd-with-dashes>--/,
+# named <ISO-timestamp-with-dashes>_<uuid>.jsonl. Each line is an entry carrying
+# type/id/parentId/timestamp, linked into a tree; the last entry in the file is the
+# active leaf. The first line is a `session` header (metadata only, no id/parentId).
+# There is no database. Reference:
+# https://github.com/earendil-works/pi packages/coding-agent/docs/session-format.md
+
+def _pi_cwd_slug(directory):
+    """Encode a cwd the way Pi names its per-project session directory."""
+    resolved = (directory or os.getcwd()).strip()
+    safe = resolved.lstrip("/\\").replace("/", "-").replace("\\", "-").replace(":", "-")
+    return f"--{safe}--"
+
+
+def _pi_file_timestamp(ms=None):
+    """Filename timestamp: ISO 8601 with ':' and '.' replaced by '-'."""
+    import datetime as _dt
+    dt = _dt.datetime.fromtimestamp((ms if ms is not None else time.time() * 1000) / 1000,
+                                    _dt.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H-%M-%S-") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _pi_iso(ms=None):
+    """Entry timestamp: ISO 8601 with milliseconds, as Pi writes it."""
+    import datetime as _dt
+    dt = _dt.datetime.fromtimestamp((ms if ms is not None else time.time() * 1000) / 1000,
+                                    _dt.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _pi_entry_id(used):
+    """8 hex-char entry id, matching Pi's generateId()."""
+    while True:
+        candidate = uuid.uuid4().hex[:8]
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+
+
+def _text_of_content(content):
+    """Flatten a string-or-block-list content value to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                out.append(block.get("text") or "")
+            elif isinstance(block, str):
+                out.append(block)
+        return "".join(out)
+    return ""
+
+
+def _export_message(role, parts, created, cwd, provider=None, model=None, tokens=None):
+    """Build one pivot-format message wrapper."""
+    provider = provider or OC_DEFAULT_PROVIDER
+    model = model or OC_DEFAULT_MODEL
+    if role == "user":
+        info = {
+            "role": "user",
+            "time": {"created": created},
+            "agent": "build",
+            "model": {"providerID": provider, "modelID": model},
+            "summary": {"diffs": []},
+        }
+    else:
+        info = {
+            "role": "assistant",
+            "mode": "build",
+            "agent": "build",
+            "cost": 0,
+            "tokens": tokens or {"input": 0, "output": 0, "reasoning": 0,
+                                 "cache": {"read": 0, "write": 0}},
+            "path": {"cwd": cwd, "root": cwd},
+            "modelID": model,
+            "providerID": provider,
+            "time": {"created": created},
+        }
+    return {"info": info, "parts": parts}
+
+
+def _finalize_export_doc(doc):
+    """Fill in the ids/times opencode's importer requires and bracket assistant turns.
+
+    `opencode import` rejects messages/parts without an `id`, and expects assistant
+    turns to be wrapped in step-start/step-finish parts. Converters that build the
+    pivot doc by hand (rather than reading a real `opencode export`) call this last.
+    """
+    session_id = doc["info"]["id"]
+    default_tokens = {"input": 0, "output": 0, "reasoning": 0,
+                      "cache": {"read": 0, "write": 0}}
+    padded = []
+    prev_mid = None
+    for message in doc.get("messages", []) or []:
+        info = message.get("info", {}) or {}
+        parts = message.get("parts") or []
+        created = (info.get("time") or {}).get("created")
+        if not isinstance(created, int):
+            created = int(time.time() * 1000)
+            info.setdefault("time", {})["created"] = created
+        mid = info.setdefault("id", _oc_id("msg"))
+        info.setdefault("sessionID", session_id)
+        # opencode expects assistant turns to reference the turn they follow.
+        if info.get("role") == "assistant" and prev_mid and "parentID" not in info:
+            info["parentID"] = prev_mid
+        for part in parts:
+            part.setdefault("id", _oc_id("prt"))
+            part.setdefault("messageID", mid)
+            part.setdefault("sessionID", session_id)
+            if part.get("type") in ("text", "reasoning"):
+                part.setdefault("time", {"start": created, "end": created})
+            elif part.get("type") == "tool":
+                part.setdefault("state", {}).setdefault(
+                    "time", {"start": created, "end": created})
+        if info.get("role") == "assistant":
+            has_tool = any(p.get("type") == "tool" for p in parts)
+            padded.append({
+                "info": info,
+                "parts": [{
+                    "type": "step-start", "snapshot": "",
+                    "id": _oc_id("prt"), "sessionID": session_id, "messageID": mid,
+                }] + parts + [{
+                    "type": "step-finish",
+                    "reason": "tool-calls" if has_tool else "stop",
+                    "snapshot": "", "tokens": info.get("tokens") or default_tokens,
+                    "cost": 0, "id": _oc_id("prt"),
+                    "sessionID": session_id, "messageID": mid,
+                }],
+            })
+        else:
+            padded.append({"info": info, "parts": parts})
+        prev_mid = mid
+    doc["messages"] = padded
+    return doc
+
+
+def opencode_export_to_pi_jsonl(doc, pi_id, directory=None):
+    """Convert the pivot export document into a Pi session JSONL transcript."""
+    info = doc.get("info", {}) or {}
+    directory = directory or info.get("directory") or os.getcwd()
+    title = _stamped_title(info.get("title") or "Synced from opencode")
+    created = (info.get("time") or {}).get("created")
+    if not isinstance(created, int):
+        created = int(time.time() * 1000)
+    stamp = _pi_iso(created)
+
+    # Resolve every tool output first: opencode-native sessions carry input and
+    # output on one part, while Claude-origin sessions split them across a
+    # tool_use part and a later tool_result part sharing a callID.
+    tool_output = {}
+    for message in doc.get("messages", []) or []:
+        for part in message.get("parts", []) or []:
+            if part.get("type") != "tool":
+                continue
+            state = part.get("state") or {}
+            out = state.get("output")
+            if isinstance(out, str) and out.strip():
+                tool_output[part.get("callID")] = (out, state.get("status") == "error")
+
+    used = set()
+    lines = [{
+        "type": "session", "version": 3, "id": pi_id,
+        "timestamp": stamp, "cwd": directory,
+    }]
+    # Display name goes first so the resume picker shows the title, and so it can
+    # never end up as the tree leaf (the leaf must be a conversation entry).
+    info_id = _pi_entry_id(used)
+    lines.append({
+        "type": "session_info", "id": info_id, "parentId": None,
+        "timestamp": stamp, "name": title,
+    })
+    prev_id = info_id
+
+    for message in doc.get("messages", []) or []:
+        minfo = message.get("info", {}) or {}
+        role = minfo.get("role")
+        parts = message.get("parts") or []
+        ts = (minfo.get("time") or {}).get("created")
+        if not isinstance(ts, int):
+            ts = created
+        if role == "user":
+            text = "\n".join(p.get("text", "") for p in parts
+                             if p.get("type") == "text" and p.get("text"))
+            if not text.strip():
+                continue
+            eid = _pi_entry_id(used)
+            lines.append({
+                "type": "message", "id": eid, "parentId": prev_id,
+                "timestamp": _pi_iso(ts),
+                "message": {"role": "user", "content": text, "timestamp": ts},
+            })
+            prev_id = eid
+        elif role == "assistant":
+            blocks = []
+            calls = []
+            for part in parts:
+                ptype = part.get("type")
+                if ptype == "text" and (part.get("text") or "").strip():
+                    blocks.append({"type": "text", "text": part["text"]})
+                elif ptype == "reasoning" and (part.get("text") or "").strip():
+                    blocks.append({"type": "thinking", "thinking": part["text"]})
+                elif ptype == "tool":
+                    state = part.get("state") or {}
+                    call_id = part.get("callID") or _oc_id("call")
+                    blocks.append({
+                        "type": "toolCall", "id": call_id,
+                        "name": part.get("tool") or "unknown",
+                        "arguments": state.get("input") if isinstance(state.get("input"), dict) else {},
+                    })
+                    calls.append((call_id, part.get("tool") or "unknown"))
+            if not blocks:
+                continue
+            tokens = minfo.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            input_tokens = int(tokens.get("input") or 0)
+            output_tokens = int(tokens.get("output") or 0)
+            usage = {
+                "input": input_tokens,
+                "output": output_tokens,
+                "cacheRead": int(cache.get("read") or 0),
+                "cacheWrite": int(cache.get("write") or 0),
+                "reasoning": int(tokens.get("reasoning") or 0),
+                "totalTokens": input_tokens + output_tokens,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+            }
+            eid = _pi_entry_id(used)
+            lines.append({
+                "type": "message", "id": eid, "parentId": prev_id,
+                "timestamp": _pi_iso(ts),
+                "message": {
+                    "role": "assistant", "content": blocks, "api": "anthropic-messages",
+                    "provider": minfo.get("providerID") or OC_DEFAULT_PROVIDER,
+                    "model": minfo.get("modelID") or OC_DEFAULT_MODEL,
+                    "usage": usage, "stopReason": "toolUse" if calls else "stop",
+                    "timestamp": ts,
+                },
+            })
+            prev_id = eid
+            # Pi models each tool result as its own entry following the assistant turn.
+            for call_id, name in calls:
+                out, is_error = tool_output.get(call_id, ("", False))
+                if not out:
+                    continue
+                rid = _pi_entry_id(used)
+                lines.append({
+                    "type": "message", "id": rid, "parentId": prev_id,
+                    "timestamp": _pi_iso(ts),
+                    "message": {
+                        "role": "toolResult", "toolCallId": call_id, "toolName": name,
+                        "content": [{"type": "text", "text": out}],
+                        "isError": bool(is_error), "timestamp": ts,
+                    },
+                })
+                prev_id = rid
+
+    return "\n".join(json.dumps(line) for line in lines) + "\n"
+
+
+def _derive_pi_title(records, session_id):
+    """Pi's display name (`session_info`) wins; otherwise the first real user message."""
+    for rec in records:
+        if rec.get("type") == "session_info":
+            name = rec.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    for rec in records:
+        if rec.get("type") != "message":
+            continue
+        msg = rec.get("message") or {}
+        if msg.get("role") != "user":
+            continue
+        text = _text_of_content(msg.get("content"))
+        if text.strip():
+            return text.strip()
+    return f"Session {session_id}"
+
+
+def pi_records_to_opencode_export(records, pi_id, directory=None):
+    """Parse a Pi session transcript into the pivot export document."""
+    header = next((r for r in records if r.get("type") == "session"), {})
+    cwd = header.get("cwd") or directory or os.getcwd()
+    title = _stamped_title(_derive_pi_title(records, pi_id))
+    messages = []
+    parts_by_call = {}
+    tokens = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+    session_model = None
+
+    for rec in records:
+        if rec.get("type") != "message":
+            continue
+        msg = rec.get("message") or {}
+        role = msg.get("role")
+        ts = msg.get("timestamp")
+        if not isinstance(ts, int):
+            ts = int(time.time() * 1000)
+        if role == "user":
+            text = _text_of_content(msg.get("content"))
+            if not text.strip():
+                continue
+            messages.append(_export_message(
+                "user", [{"type": "text", "text": text}], ts, cwd))
+        elif role == "assistant":
+            parts = []
+            for block in msg.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text" and (block.get("text") or "").strip():
+                    parts.append({"type": "text", "text": block["text"]})
+                elif btype == "thinking" and (block.get("thinking") or "").strip():
+                    parts.append({"type": "reasoning", "text": block["thinking"]})
+                elif btype == "toolCall":
+                    call_id = block.get("id") or _oc_id("call")
+                    part = {
+                        "type": "tool", "tool": block.get("name") or "unknown",
+                        "callID": call_id,
+                        "state": {
+                            "status": "completed",
+                            "title": block.get("name") or "unknown",
+                            "metadata": {},
+                            "input": block.get("arguments") if isinstance(block.get("arguments"), dict) else {},
+                            "output": "",
+                        },
+                    }
+                    parts.append(part)
+                    parts_by_call[call_id] = part
+            if not parts:
+                continue
+            usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+            msg_tokens = {
+                "input": int(usage.get("input") or 0),
+                "output": int(usage.get("output") or 0),
+                "reasoning": int(usage.get("reasoning") or 0),
+                "cache": {
+                    "read": int(usage.get("cacheRead") or 0),
+                    "write": int(usage.get("cacheWrite") or 0),
+                },
+            }
+            for key in ("input", "output", "reasoning"):
+                tokens[key] += msg_tokens[key]
+            tokens["cache"]["read"] += msg_tokens["cache"]["read"]
+            tokens["cache"]["write"] += msg_tokens["cache"]["write"]
+            provider = msg.get("provider") or OC_DEFAULT_PROVIDER
+            model = msg.get("model") or OC_DEFAULT_MODEL
+            session_model = session_model or {"providerID": provider, "modelID": model}
+            messages.append(_export_message(
+                "assistant", parts, ts, cwd, provider, model, msg_tokens))
+        elif role == "toolResult":
+            call_id = msg.get("toolCallId")
+            output = _text_of_content(msg.get("content"))
+            part = parts_by_call.get(call_id)
+            if part is not None:
+                # Attach the output to the tool call it belongs to.
+                part["state"]["output"] = output
+                part["state"]["status"] = "error" if msg.get("isError") else "completed"
+            elif output.strip():
+                part = {
+                    "type": "tool", "tool": msg.get("toolName") or "unknown",
+                    "callID": call_id or _oc_id("call"),
+                    "state": {
+                        "status": "error" if msg.get("isError") else "completed",
+                        "title": msg.get("toolName") or "unknown",
+                        "metadata": {}, "input": {}, "output": output,
+                    },
+                }
+                messages.append(_export_message("user", [part], ts, cwd))
+
+    now = int(time.time() * 1000)
+    model = session_model or {"providerID": OC_DEFAULT_PROVIDER, "modelID": OC_DEFAULT_MODEL}
+    return _finalize_export_doc({
+        "info": {
+            "id": _oc_id("ses"),
+            "slug": "pi-import-" + hashlib.md5(pi_id.encode()).hexdigest()[:8],
+            "projectID": "global",
+            "directory": cwd,
+            "path": "",
+            "title": title,
+            "agent": "build",
+            "model": {"id": model["modelID"], "providerID": model["providerID"]},
+            "version": OC_VERSION,
+            "summary": {"additions": 0, "deletions": 0, "files": 0},
+            "cost": 0,
+            "tokens": tokens,
+            "time": {"created": now, "updated": now},
+        },
+        "messages": messages,
+    })
+
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -527,43 +1030,15 @@ def list_sessions(base_dir, session_type):
                 if not os.path.isfile(chat_file):
                     continue
                 modified = os.path.getmtime(chat_file)
-                title = f"Session {session_id}"
+                # Same derivation the exporter uses, so a session's title reads
+                # identically before and after syncing.
                 try:
-                    with open(chat_file, "r", encoding="utf-8") as f:
-                        # Read all lines to find the most recent user message with content
-                        lines = f.readlines()
-                        if lines:
-                            # Check for customTitle in the first line (newer Claude sessions)
-                            try:
-                                first_data = json.loads(lines[0].strip())
-                                if isinstance(first_data, dict) and "customTitle" in first_data and isinstance(first_data["customTitle"], str) and len(first_data["customTitle"].strip()) > 0:
-                                    custom_title = first_data["customTitle"]
-                                    title = custom_title[:50] + ("..." if len(custom_title) > 50 else "")
-                            except (json.JSONDecodeError, IndexError):
-                                pass
-
-                            # If we didn't find a customTitle, scan for user messages
-                            if title == f"Session {session_id}":
-                                # Scan lines in reverse order to find the most recent user message
-                                for line in reversed(lines):
-                                    line = line.strip()
-                                    if not line:
-                                        continue
-                                    try:
-                                        data = json.loads(line)
-                                        if isinstance(data, dict) and data.get("type") == "user" and "message" in data:
-                                            msg = data["message"]
-                                            if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str) and not _is_meta_text(msg["content"]):
-                                                content = msg["content"]
-                                                title = content[:50] + ("..." if len(content) > 50 else "")
-                                                break
-                                            elif isinstance(msg, str) and not _is_meta_text(msg):
-                                                title = msg[:50] + ("..." if len(msg) > 50 else "")
-                                                break
-                                    except (json.JSONDecodeError, KeyError):
-                                        continue
+                    title = _derive_claude_title(
+                        read_claude_jsonl(chat_file), session_id)
                 except Exception:
-                    pass
+                    title = f"Session {session_id}"
+                if len(title) > _TITLE_MAX:
+                    title = title[:_TITLE_MAX].rstrip() + "..."
                 sessions.append({
                     "id": session_id,
                     "path": chat_file,   # the .jsonl file path
@@ -621,6 +1096,38 @@ def list_sessions(base_dir, session_type):
         conn.close()
         return sessions
 
+    elif session_type == 'pi':
+        # Pi layout mirrors Claude's: base dir holds one subdirectory per project
+        # (--<cwd-with-dashes>--) containing one .jsonl per session.
+        for item in os.listdir(base_dir):
+            item_path = os.path.join(base_dir, item)
+            if not os.path.isdir(item_path):
+                continue
+            for fname in os.listdir(item_path):
+                if not fname.endswith(".jsonl"):
+                    continue
+                session_file = os.path.join(item_path, fname)
+                if not os.path.isfile(session_file):
+                    continue
+                # Filename is <ISO-timestamp>_<session-id>.jsonl; the id is a UUID.
+                session_id = fname[:-6].split("_", 1)[-1]
+                records = read_claude_jsonl(session_file)
+                modified = os.path.getmtime(session_file)
+                if not any(r.get("type") == "session" for r in records):
+                    # Not a Pi session file (or truncated); skip it.
+                    continue
+                title = _derive_pi_title(records, session_id)
+                if len(title) > _TITLE_MAX:
+                    title = title[:_TITLE_MAX].rstrip() + "..."
+                sessions.append({
+                    "id": session_id,
+                    "path": session_file,
+                    "modified": modified,
+                    "title": title,
+                })
+        sessions.sort(key=lambda x: x["modified"], reverse=True)
+        return sessions
+
     return sessions
 
 def sync_claude_to_opencode(claude_session, opencode_base_dir):
@@ -636,6 +1143,16 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
     if not doc:
         print("\u26a0\ufe0f  No convertible user/assistant messages found in that Claude session.")
         return None
+
+    return _import_export_into_opencode(doc, opencode_base_dir)
+
+
+def _import_export_into_opencode(doc, opencode_base_dir):
+    """Hand a pivot export document to `opencode import`, returning the new session id.
+
+    Shared by every source harness; `opencode import` does the actual row writes.
+    """
+    db_path = os.path.join(opencode_base_dir, "opencode.db")
 
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
     before_ids = _session_ids(db_path)
@@ -800,6 +1317,24 @@ def opencode_session_to_export(opencode_session):
     return {"info": info, "messages": messages}
 
 
+def _write_export_to_claude(doc, claude_base_dir, claude_id):
+    """Write a pivot export document as a Claude transcript. Returns the file path."""
+    directory = doc["info"].get("directory") or os.getcwd()
+    # Claude Code names each project directory after the absolute path with every slash
+    # replaced by a dash: /workspace -> -workspace, /srv/app -> -srv-app.
+    slug_dir = directory.strip().replace(os.sep, "-").replace("/", "-") or "-global"
+    new_dir = os.path.join(claude_base_dir, slug_dir)
+    try:
+        os.makedirs(new_dir, exist_ok=True)
+        new_file = os.path.join(new_dir, f"{claude_id}.jsonl")
+        with open(new_file, "w", encoding="utf-8") as f:
+            f.write(opencode_export_to_claude_jsonl(doc, claude_id))
+        return new_file
+    except OSError as e:
+        print(f"\u26a0\ufe0f  Failed to write Claude session: {e}")
+        return None
+
+
 def sync_opencode_to_claude(opencode_session, claude_base_dir):
     """Export an opencode session and write it as a Claude Code .jsonl transcript.
 
@@ -813,20 +1348,94 @@ def sync_opencode_to_claude(opencode_session, claude_base_dir):
         print(f"\u274c  Could not read opencode session {session_id} from the database.")
         return None
 
+    # Claude keys sessions by UUID; derive one from the opencode id so the same
+    # source session always maps to the same transcript file.
+    return _write_export_to_claude(doc, claude_base_dir, _stable_uuid("claude", session_id))
+
+
+def _pi_dest_file(pi_base_dir, directory, pi_id):
+    """Resolve the Pi session file for `pi_id`, reusing an existing file on re-sync."""
+    import glob
+    target_dir = os.path.join(pi_base_dir, _pi_cwd_slug(directory))
+    os.makedirs(target_dir, exist_ok=True)
+    existing = glob.glob(os.path.join(target_dir, f"*_{pi_id}.jsonl"))
+    if existing:
+        return existing[0]
+    return os.path.join(target_dir, f"{_pi_file_timestamp()}_{pi_id}.jsonl")
+
+
+def _write_export_to_pi(doc, pi_base_dir, pi_id):
+    """Write a pivot export document as a Pi session file. Returns the file path."""
     directory = doc["info"].get("directory") or os.getcwd()
-    # Claude Code names each project directory after the absolute path with every slash
-    # replaced by a dash: /workspace -> -workspace, /srv/app -> -srv-app.
-    slug_dir = directory.strip().replace(os.sep, "-").replace("/", "-") or "-global"
-    new_dir = os.path.join(claude_base_dir, slug_dir)
     try:
-        os.makedirs(new_dir, exist_ok=True)
-        new_file = os.path.join(new_dir, f"{session_id}.jsonl")
+        new_file = _pi_dest_file(pi_base_dir, directory, pi_id)
         with open(new_file, "w", encoding="utf-8") as f:
-            f.write(opencode_export_to_claude_jsonl(doc, session_id))
+            f.write(opencode_export_to_pi_jsonl(doc, pi_id, directory))
         return new_file
     except OSError as e:
-        print(f"\u26a0\ufe0f  Failed to write Claude session: {e}")
+        print(f"\u26a0\ufe0f  Failed to write Pi session: {e}")
         return None
+
+
+def sync_claude_to_pi(claude_session, pi_base_dir):
+    """Import a Claude Code session into Pi."""
+    doc = claude_to_opencode_export(claude_session["path"])
+    if not doc:
+        print("\u26a0\ufe0f  No convertible messages found in that Claude session.")
+        return None
+    return _write_export_to_pi(doc, pi_base_dir, _stable_uuid("pi", "claude", claude_session["id"]))
+
+
+def sync_opencode_to_pi(opencode_session, pi_base_dir):
+    """Import an opencode session into Pi."""
+    doc = opencode_session_to_export(opencode_session)
+    if not doc:
+        print(f"\u274c  Could not read opencode session {opencode_session['id']} from the database.")
+        return None
+    return _write_export_to_pi(doc, pi_base_dir, _stable_uuid("pi", "opencode", opencode_session["id"]))
+
+
+def sync_pi_to_claude(pi_session, claude_base_dir):
+    """Export a Pi session and write it as a Claude Code .jsonl transcript."""
+    records = read_claude_jsonl(pi_session["path"])
+    doc = pi_records_to_opencode_export(records, pi_session["id"])
+    return _write_export_to_claude(doc, claude_base_dir,
+                                   _stable_uuid("claude", "pi", pi_session["id"]))
+
+
+def sync_pi_to_opencode(pi_session, opencode_base_dir):
+    """Import a Pi session into opencode."""
+    records = read_claude_jsonl(pi_session["path"])
+    doc = pi_records_to_opencode_export(records, pi_session["id"])
+    if not doc["messages"]:
+        print("\u26a0\ufe0f  No convertible messages found in that Pi session.")
+        return None
+    return _import_export_into_opencode(doc, opencode_base_dir)
+
+
+def sync_session(source_type, session, target_type, bases):
+    """Dispatch a copy between any two harnesses.
+
+    `bases` maps harness key -> base directory. Returns the new id/path, or None.
+    """
+    if source_type == target_type:
+        return None
+    if not bases.get(target_type):
+        print(f"\u274c  {HARNESS_LABELS[target_type]} storage location is not set.")
+        return None
+    dispatch = {
+        ("claude", "opencode"): lambda: sync_claude_to_opencode(session, bases["opencode"]),
+        ("claude", "pi"): lambda: sync_claude_to_pi(session, bases["pi"]),
+        ("opencode", "claude"): lambda: sync_opencode_to_claude(session, bases["claude"]),
+        ("opencode", "pi"): lambda: sync_opencode_to_pi(session, bases["pi"]),
+        ("pi", "claude"): lambda: sync_pi_to_claude(session, bases["claude"]),
+        ("pi", "opencode"): lambda: sync_pi_to_opencode(session, bases["opencode"]),
+    }
+    fn = dispatch.get((source_type, target_type))
+    if fn is None:
+        print(f"\u274c  Unsupported sync: {source_type} -> {target_type}")
+        return None
+    return fn()
 
 
 # ─── Session Selector (using prompt_toolkit) ──────────────────────────────────
@@ -899,6 +1508,9 @@ def session_selector(sessions, session_type, favorites):
                 hint_parts.append(f"{items_below} below")
             fragments.append(("class:hint", "  " + " ".join(hint_parts) + "\n"))
 
+        fragments.append(("class:hint",
+                          "  ↑/↓ move · ←/→ switch list · Enter copy · Space favorite · Esc exit\n"))
+
         return fragments
 
     kb = KeyBindings()
@@ -934,7 +1546,7 @@ def session_selector(sessions, session_type, favorites):
 
     @kb.add("left")
     def _(event):
-        result[1] = 'switch_view'
+        result[1] = 'switch_view_back'
         event.app.exit()
 
     @kb.add("right")
@@ -1012,6 +1624,80 @@ def session_selector(sessions, session_type, favorites):
         return None, result[1]
     return None, None
 
+# ─── Target picker ─────────────────────────────────────────────────────────────
+def choose_target(source_type):
+    """Prompt for which harness to copy the selected session into.
+
+    Returns a harness key, or None if the user cancels. The source harness is not
+    offered, since copying a session onto its own list is meaningless.
+    """
+    options = [h for h in HARNESSES if h != source_type]
+    if not options:
+        return None
+
+    from prompt_toolkit import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, HSplit
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.styles import Style
+
+    current = [0]
+    result = [None]
+
+    def get_text():
+        frags = [("class:prompt", "Copy into which harness?   ")]
+        for i, harness in enumerate(options):
+            marker = "▶ " if i == current[0] else "  "
+            cls = "class:current" if i == current[0] else "class:normal"
+            frags.append((cls, f"{marker}{HARNESS_LABELS[harness]}    "))
+        frags.append(("class:hint", "\n  ←/→ choose · Enter copy · Esc cancel"))
+        return frags
+
+    kb = KeyBindings()
+
+    @kb.add("left")
+    @kb.add("up")
+    def _(event):
+        current[0] = (current[0] - 1) % len(options)
+
+    @kb.add("right")
+    @kb.add("down")
+    def _(event):
+        current[0] = (current[0] + 1) % len(options)
+
+    @kb.add("enter")
+    def _(event):
+        result[0] = options[current[0]]
+        event.app.exit()
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        result[0] = None
+        event.app.exit()
+
+    style = Style.from_dict({
+        "current": "reverse",
+        "normal": "",
+        "hint": "italic #888888",
+        "prompt": "bold",
+    })
+    app = Application(
+        layout=Layout(HSplit([Window(
+            content=FormattedTextControl(get_text),
+            height=3, always_hide_cursor=True)])),
+        key_bindings=kb,
+        full_screen=False,
+        style=style,
+    )
+    try:
+        app.run()
+    except Exception:
+        return None
+    return result[0]
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -1028,6 +1714,12 @@ def main():
         type=str,
         default="",
         help="Custom Claude sessions directory (e.g., .claude_persist). Overrides auto-detection.",
+    )
+    parser.add_argument(
+        "--pi-location",
+        type=str,
+        default="",
+        help="Custom Pi sessions directory (e.g., ~/.pi/agent/sessions). Overrides auto-detection.",
     )
     parser.add_argument(
         "--dangerously-skip-permissions",
@@ -1073,7 +1765,7 @@ def main():
     if favorites is None:
         favorites = set()
 
-    # Build candidate lists for Claude and Opencode
+    # Build candidate lists for each harness
     claude_candidates = []
     if args.claude_location:
         claude_candidates.append(args.claude_location)
@@ -1084,19 +1776,39 @@ def main():
         opencode_candidates.append(args.opencode_location)
     opencode_candidates.extend(OPCODE_SESSIONS_CANDIDATES)
 
+    pi_candidates = []
+    if args.pi_location:
+        pi_candidates.append(args.pi_location)
+    pi_candidates.extend(PI_SESSIONS_CANDIDATES)
+
     # Get the base directories for sessions
     claude_base = get_sessions_dir(claude_candidates)
     opencode_base = get_sessions_dir(opencode_candidates)
+    pi_base = get_sessions_dir(pi_candidates)
+    if pi_base is None:
+        # Pi creates its session root on first use; fall back to the standard location
+        # so a copy can be written even before Pi has ever been run.
+        pi_base = os.path.expanduser("~/.pi/agent/sessions")
 
-    # Initial session lists
-    claude_sessions = list_sessions(claude_base, 'claude') if claude_base else []
-    opencode_sessions = list_sessions(opencode_base, 'opencode') if opencode_base else []
+    bases = {"claude": claude_base, "opencode": opencode_base, "pi": pi_base}
 
-    print(f"🔍 Session locations:")
-    print(f"   Claude: {claude_base or 'Not found'}")
-    print(f"   Opencode: {opencode_base or 'Not found'}")
+    def load_all():
+        return {
+            "claude": list_sessions(claude_base, "claude") if claude_base else [],
+            "opencode": list_sessions(opencode_base, "opencode") if opencode_base else [],
+            "pi": list_sessions(pi_base, "pi") if pi_base else [],
+        }
+
+    all_sessions = load_all()
+
+    print("🔍 Session locations:")
+    print(f"   Claude Code: {claude_base or 'Not found'}")
+    print(f"   opencode:    {opencode_base or 'Not found'}")
+    print(f"   Pi:          {pi_base or 'Not found'}")
     print()
-    print(f"Found {len(claude_sessions)} Claude sessions and {len(opencode_sessions)} Opencode sessions.")
+    print("Found " + ", ".join(
+        f"{len(all_sessions[h])} {HARNESS_LABELS[h]}" for h in HARNESSES) + " sessions.")
+    print("Use ←/→ to move between the three lists.")
     print()
     # Pause for the user to see the counts
     try:
@@ -1105,125 +1817,78 @@ def main():
         print("\nExiting...")
         sys.exit(0)
 
-    # Main loop
-    current_view = 0  # 0 for Claude, 1 for Opencode
-    # If the initial view has no sessions, try to switch to the other view if it has sessions
-    if current_view == 0 and not claude_sessions and opencode_sessions:
-        current_view = 1
-    elif current_view == 1 and not opencode_sessions and claude_sessions:
-        current_view = 0
+    # Main loop. current_view indexes HARNESSES; start on a list that has content.
+    current_view = next((i for i, h in enumerate(HARNESSES) if all_sessions[h]), 0)
 
     try:
         while True:
-            # Determine which sessions to show based on current_view
-            if current_view == 0:
-                sessions = claude_sessions
-                session_type = "Claude"
-                base_dir = claude_base
-                other_base_dir = opencode_base
-                other_sessions = opencode_sessions
-                other_type = "Opencode"
-            else:
-                sessions = opencode_sessions
-                session_type = "Opencode"
-                base_dir = opencode_base
-                other_base_dir = claude_base
-                other_sessions = claude_sessions
-                other_type = "Claude"
+            source = HARNESSES[current_view]
+            sessions = all_sessions[source]
+            label = f"{HARNESS_LABELS[source]} · {current_view + 1}/{len(HARNESSES)}"
 
-            # If there are no sessions in the current view, we can still show a message and allow switching
+            # If there are no sessions in the current view, we can still switch lists.
             if not sessions:
-                print(f"\nNo {session_type} sessions found.")
-                if other_sessions:
-                    print(f"Press Left/Right to switch to {other_type} sessions ({len(other_sessions)} found).")
-                else:
-                    print(f"No {other_type} sessions found either.")
-                # Wait for a key press to switch view or exit
+                print(f"\nNo {HARNESS_LABELS[source]} sessions found.")
                 try:
-                    key = input("\nPress Left/Right to switch view, or any other key to exit: ").strip().lower()
-                    if key in ("left", "right"):
-                        current_view = 1 - current_view
-                        continue
-                    else:
-                        break
+                    input("Press Enter to switch to the next list, or Ctrl-C to exit: ")
                 except (EOFError, KeyboardInterrupt):
                     break
+                current_view = (current_view + 1) % len(HARNESSES)
+                continue
 
             # Show the selector for the current view
-            selected_session, action = session_selector(sessions, session_type, favorites)
+            selected_session, action = session_selector(sessions, label, favorites)
 
             if action == 'exit':
                 break
             elif action == 'switch_view':
-                current_view = 1 - current_view
-                # When switching view, we might want to reset the selection index? The selector will start at top.
+                current_view = (current_view + 1) % len(HARNESSES)
+                continue
+            elif action == 'switch_view_back':
+                current_view = (current_view - 1) % len(HARNESSES)
                 continue
             elif action == 'toggle_favorite':
-                # Toggle favorite for the selected session (if any)
                 if selected_session is not None:
                     session_id = selected_session["id"]
                     if session_id in favorites:
                         favorites.discard(session_id)
                     else:
                         favorites.add(session_id)
-                    # Save favorites immediately
                     save_favorites(favorites, FAVORITES_CACHE_FILE)
-                    # We'll redraw the list to show the updated favorite status
-                    continue
-                else:
-                    # No session selected, just redraw
-                    continue
+                continue
             elif action == 'sync':
-                if selected_session is not None:
-                    # Show confirmation
-                    from_to = f"{session_type} → {other_type}"
-                    sync_msg = f"About to sync {session_type} session: '{selected_session['title']}' (ID: {selected_session['id']}) to {other_type} as a new session."
-                    print(f"\n{sync_msg}")
-                    try:
-                        if args.accept_all_defaults:
-                            # Auto-decline when using --accept-all-defaults
-                            print("Sync declined (--accept-all-defaults).")
-                            continue
-                        answer = input("Sync this session? [y/N]: ").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        print("\nSync declined.")
-                        continue
-                    if answer != 'y':
-                        print("Sync declined.")
-                        continue
-                    # Proceed with sync
-                    if current_view == 0:  # viewing Claude, sync to Opencode
-                        if opencode_base is not None:
-                            new_path = sync_claude_to_opencode(selected_session, opencode_base)
-                            if new_path:
-                                print(f"\n✅ Imported into opencode as session: {new_path}")
-                                print("   Restart opencode (or switch sessions) to see it.")
-                                # Optionally, we could add the new session to the opencode_sessions list for immediate viewing
-                                # But we'll just let the user switch view to see it.
-                            else:
-                                print(f"\n❌ Failed to sync Claude session to Opencode")
-                        else:
-                            print(f"\n❌ Opencode sessions directory not set")
-                    else:  # viewing Opencode, sync to Claude
-                        if claude_base is not None:
-                            new_path = sync_opencode_to_claude(selected_session, claude_base)
-                            if new_path:
-                                print(f"\n✅ Exported opencode session to Claude: {new_path}")
-                            else:
-                                print(f"\n❌ Failed to sync Opencode session to Claude")
-                        else:
-                            print(f"\n❌ Claude sessions directory not set")
-                    # Save favorites after any change (sync doesn't change favorites, but we save anyway)
-                    save_favorites(favorites, FAVORITES_CACHE_FILE)
-                    # Pause briefly to let the user see the message
-                    time.sleep(1.5)
-                    # After syncing, we can optionally refresh the other side's list if we want to show it immediately.
-                    # For simplicity, we'll just continue and let the user switch view to see the new session.
+                if selected_session is None:
                     continue
+                target = choose_target(source)
+                if target is None:
+                    print("\nCopy cancelled.")
+                    continue
+                print(f"\nCopy {HARNESS_LABELS[source]} session "
+                      f"'{selected_session['title']}' (ID: {selected_session['id']}) "
+                      f"into {HARNESS_LABELS[target]} as a new session.")
+                try:
+                    if args.accept_all_defaults:
+                        print("Copy declined (--accept-all-defaults).")
+                        continue
+                    answer = input("Proceed? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nCopy declined.")
+                    continue
+                if answer != 'y':
+                    print("Copy declined.")
+                    continue
+                # Proceed with the copy
+                new_ref = sync_session(source, selected_session, target, bases)
+                if new_ref:
+                    print(f"\n✅ Copied into {HARNESS_LABELS[target]}: {new_ref}")
+                    # Refresh so the new session appears without a restart.
+                    all_sessions = load_all()
                 else:
-                    # No session selected, just redraw
-                    continue
-            # If action is None (just moved highlight), we just redraw the list in the next loop iteration.
+                    print(f"\n❌ Failed to copy into {HARNESS_LABELS[target]}.")
+                save_favorites(favorites, FAVORITES_CACHE_FILE)
+                time.sleep(1.5)
+                continue
+            # If action is None (just moved highlight), we redraw on the next iteration.
 
     except KeyboardInterrupt:
         print("\n👋 Interrupted. Exiting...")
