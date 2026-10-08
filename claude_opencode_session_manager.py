@@ -1147,11 +1147,30 @@ def sync_claude_to_opencode(claude_session, opencode_base_dir):
     return _import_export_into_opencode(doc, opencode_base_dir)
 
 
+def _force_local_opencode_model(doc):
+    """Point an import document at opencode's own default model.
+
+    Transcripts copied from Claude/Pi carry the source harness's provider and model
+    (e.g. z-ai/glm-5.3, poolside/laguna-s-2.1:free). opencode resolves those through
+    its Console gateway when the session is resumed, which is blocked outside the app
+    ("OpenCode's free tier can only be used from within OpenCode"). Rewriting both the
+    session and every message to the local default makes any import resumable here.
+    """
+    local = {"providerID": OC_DEFAULT_PROVIDER, "modelID": OC_DEFAULT_MODEL}
+    doc["info"]["model"] = {"id": OC_DEFAULT_MODEL, "providerID": OC_DEFAULT_PROVIDER}
+    for message in doc.get("messages", []) or []:
+        info = message.get("info") or {}
+        if isinstance(info.get("model"), dict):
+            info["model"] = dict(local)
+    return doc
+
+
 def _import_export_into_opencode(doc, opencode_base_dir):
     """Hand a pivot export document to `opencode import`, returning the new session id.
 
     Shared by every source harness; `opencode import` does the actual row writes.
     """
+    _force_local_opencode_model(doc)
     db_path = os.path.join(opencode_base_dir, "opencode.db")
 
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
