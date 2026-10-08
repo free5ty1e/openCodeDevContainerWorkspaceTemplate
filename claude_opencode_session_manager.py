@@ -126,21 +126,30 @@ _CLAUDE_META_PREFIXES = (
 )
 
 
-def _oc_id(prefix, length=22):
-    """Generate an opencode-style identifier.
+_OC_ID_LAST_MS = 0
+_OC_ID_COUNTER = 0
 
-    opencode ids are `<prefix>_<12 chars of ms-timestamp in base32><random base32>`,
-    which makes them lexicographically sortable by creation time. Matching that shape
-    keeps imported sessions ordered correctly alongside native ones.
+
+def _oc_id(prefix):
+    """Generate an opencode identifier exactly as the opencode client does.
+
+    opencode identifiers are `<prefix>_<12 hex chars of timestamp+counter><14
+    chars from base62>`. The hex part encodes `Date.now() * 0x1000 + counter`
+    (ascending, low 48 bits) as 6 bytes. The Console free tier validates the
+    shape of the session id, so imported sessions MUST use genuinely-formed ids
+    or continuation fails with `FreeTierError`; this mirrors the client scheme.
     """
-    ts = int(time.time() * 1000)
-    tsb = ""
-    t = ts
-    for _ in range(12):
-        tsb = OC_ID_ALPHABET[t % 32] + tsb
-        t //= 32
-    rnd = "".join(random.choice(OC_ID_ALPHABET) for _ in range(max(0, length - 12)))
-    return f"{prefix}_{tsb}{rnd}"
+    global _OC_ID_LAST_MS, _OC_ID_COUNTER
+    now = int(time.time() * 1000)
+    if now != _OC_ID_LAST_MS:
+        _OC_ID_LAST_MS = now
+        _OC_ID_COUNTER = 0
+    _OC_ID_COUNTER += 1
+    current = (now * 0x1000 + _OC_ID_COUNTER) & 0xFFFFFFFFFFFF
+    time_part = "".join(
+        f"{(current >> (40 - 8 * i)) & 0xFF:02x}" for i in range(6))
+    rnd = "".join(random.choice(OC_ID_ALPHABET) for _ in range(14))
+    return f"{prefix}_{time_part}{rnd}"
 
 
 # Namespace for deterministic UUIDs: the same source id always maps to the same
