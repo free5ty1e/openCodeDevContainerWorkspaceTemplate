@@ -1780,7 +1780,7 @@ def main():
     print("=" * 60)
     print()
 
-    if not ensure_prerequisites(args):
+    if not ensure_prerequisites(args, require_pi=False):
         print("❌ Prerequisites check failed. Exiting.")
         sys.exit(1)
 

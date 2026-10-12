@@ -501,6 +501,33 @@ def install_package(pkg_name, pip_name=None, force=False):
     return False
 
 
+
+def ensure_pi_cli(args=None):
+    """Ensure the pi CLI is available (global or via npx)."""
+    print("  🔍 Checking for pi CLI...")
+    if shutil.which("pi"):
+        print("  ✅ pi CLI found on PATH")
+        return True
+    try:
+        result = subprocess.run(
+            ["npx", "--yes", "@earendil-works/pi-coding-agent", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            print("  ✅ pi CLI available via npx")
+            return True
+        else:
+            print("  ❌ Failed to verify pi CLI via npx")
+            print("     " + result.stderr.strip().replace("\n", "\n     ")[:200])
+    except Exception as e:
+        print(f"  ❌ Error checking pi CLI: {e}")
+    print("     Install with: npm i -g @earendil-works/pi-coding-agent")
+    print("     or use npx which is handled automatically")
+    return False
+
+
 # ─── Cache Management ──────────────────────────────────────────────────────
 
 def read_cache(cache_file, default=None, as_int=False, as_set=False):
@@ -1002,7 +1029,7 @@ def _check_and_prompt_upgrade(package_name, display_name, current_version, args)
     """Check for available upgrade and prompt user if available.
     Returns True if upgrade was performed or not needed, False if failed."""
     # If --accept-all-defaults, skip upgrade check
-    if args and args.accept_all_defaults:
+    if args and getattr(args, "accept_all_defaults", False):
         return True
 
     latest_version = _get_latest_npm_version(package_name)
@@ -1213,15 +1240,53 @@ def ensure_native_extensions_healthy(args=None):
     return not still
 
 
-def ensure_prerequisites(args=None):
-    """Ensure litellm (with the proxy extras), prompt_toolkit, and the claude CLI are available."""
+def ensure_prerequisites(args=None, require_pi=False):
+    """Ensure litellm (with the proxy extras), prompt_toolkit, and the appropriate CLI tools are available."""
     print("🔍 Checking prerequisites...")
     ok = True
     ok &= ensure_native_extensions_healthy(args)
     ok &= ensure_litellm(args)
     ok &= ensure_prompt_toolkit(args)
-    ok &= ensure_claude_cli(args)
+    req_pi = False
+    if require_pi:
+        req_pi = True
+    try:
+        if args and getattr(args, "require_pi", False):
+            req_pi = True
+    except Exception:
+        req_pi = require_pi
+    if req_pi:
+        ok &= ensure_pi_cli(args)
+    else:
+        ok &= ensure_claude_cli(args)
     return ok
+
+
+
+def ensure_pi_cli(args=None):
+    """Ensure the pi CLI is available (global or via npx)."""
+    print("  🔍 Checking for pi CLI...")
+    if shutil.which("pi"):
+        print("  ✅ pi CLI found on PATH")
+        return True
+    try:
+        result = subprocess.run(
+            ["npx", "--yes", "@earendil-works/pi-coding-agent", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            print("  ✅ pi CLI available via npx")
+            return True
+        else:
+            print("  ❌ Failed to verify pi CLI via npx")
+            print("     " + result.stderr.strip().replace("\n", "\n     ")[:200])
+    except Exception as e:
+        print(f"  ❌ Error checking pi CLI: {e}")
+    print("     Install with: npm i -g @earendil-works/pi-coding-agent")
+    print("     or use npx which is handled automatically")
+    return False
 
 
 # ─── Cache Management (Extended) ────────────────────────────────────────────
