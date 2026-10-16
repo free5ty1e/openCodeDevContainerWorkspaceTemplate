@@ -316,7 +316,7 @@ def read_claude_jsonl(path):
     return records
 
 
-def claude_to_opencode_export(claude_path, db_path=None, directory=None):
+def claude_to_opencode_export(claude_path, db_path=None, directory=None, max_messages=0):
     """Build an opencode export-format document (the shape `opencode import` accepts).
 
     Returns a dict: {"info": {...}, "messages": [{"info": {...}, "parts": [...]}]}
@@ -467,6 +467,29 @@ def claude_to_opencode_export(claude_path, db_path=None, directory=None):
 
     if not messages:
         return None
+
+    if max_messages and max_messages > 0 and len(messages) > max_messages:
+        messages = messages[-max_messages:]
+        # Recompute parent chain and tokens for trimmed set
+        parent_mid = None
+        tokens_new = {"input": 0, "output": 0, "reasoning": 0,
+                      "cache": {"read": 0, "write": 0}}
+        for m in messages:
+            m["info"]["parentID"] = parent_mid
+            t = m["info"].get("tokens") or {}
+            for k in ("input", "output", "reasoning"):
+                try:
+                    tokens_new[k] += int(t.get(k) or 0)
+                except Exception:
+                    pass
+            tc = t.get("cache") or {}
+            for k in ("read", "write"):
+                try:
+                    tokens_new["cache"][k] += int(tc.get(k) or 0)
+                except Exception:
+                    pass
+            parent_mid = m["info"]["id"]
+        tokens = tokens_new
 
     # opencode brackets assistant turns with step-start / step-finish parts.
     wrapped = []
@@ -1139,16 +1162,10 @@ def list_sessions(base_dir, session_type):
 
     return sessions
 
-def sync_claude_to_opencode(claude_session, opencode_base_dir):
-    """Import a Claude Code session into opencode.
-
-    Builds an opencode export-format document and hands it to `opencode import`,
-    which writes the `session` / `message` / `part` rows itself. Returns the new
-    opencode session id, or None on failure.
-    """
+def sync_claude_to_opencode(claude_session, opencode_base_dir, max_messages=0):
+    """Import a Claude Code session into opencode."""
     db_path = os.path.join(opencode_base_dir, "opencode.db")
-
-    doc = claude_to_opencode_export(claude_session['path'], db_path=db_path)
+    doc = claude_to_opencode_export(claude_session['path'], db_path=db_path, max_messages=max_messages)
     if not doc:
         print("\u26a0\ufe0f  No convertible user/assistant messages found in that Claude session.")
         return None
@@ -1410,9 +1427,9 @@ def _write_export_to_pi(doc, pi_base_dir, pi_id):
         return None
 
 
-def sync_claude_to_pi(claude_session, pi_base_dir):
+def sync_claude_to_pi(claude_session, pi_base_dir, max_messages=0):
     """Import a Claude Code session into Pi."""
-    doc = claude_to_opencode_export(claude_session["path"])
+    doc = claude_to_opencode_export(claude_session["path"], max_messages=max_messages)
     if not doc:
         print("\u26a0\ufe0f  No convertible messages found in that Claude session.")
         return None
@@ -1446,7 +1463,7 @@ def sync_pi_to_opencode(pi_session, opencode_base_dir):
     return _import_export_into_opencode(doc, opencode_base_dir)
 
 
-def sync_session(source_type, session, target_type, bases):
+def sync_session(source_type, session, target_type, bases, args=None):
     """Dispatch a copy between any two harnesses.
 
     `bases` maps harness key -> base directory. Returns the new id/path, or None.
@@ -1457,8 +1474,8 @@ def sync_session(source_type, session, target_type, bases):
         print(f"\u274c  {HARNESS_LABELS[target_type]} storage location is not set.")
         return None
     dispatch = {
-        ("claude", "opencode"): lambda: sync_claude_to_opencode(session, bases["opencode"]),
-        ("claude", "pi"): lambda: sync_claude_to_pi(session, bases["pi"]),
+        ("claude", "opencode"): lambda: sync_claude_to_opencode(session, bases["opencode"], max_messages=getattr(args, "max_messages", 0) if args else 0),
+        ("claude", "pi"): lambda: sync_claude_to_pi(session, bases["pi"], max_messages=getattr(args, "max_messages", 0) if args else 0),
         ("opencode", "claude"): lambda: sync_opencode_to_claude(session, bases["claude"]),
         ("opencode", "pi"): lambda: sync_opencode_to_pi(session, bases["pi"]),
         ("pi", "claude"): lambda: sync_pi_to_claude(session, bases["claude"]),
@@ -1767,6 +1784,12 @@ def main():
         help="Clear the cached API key and prompt again",
     )
     parser.add_argument(
+        "--max-messages",
+        type=int,
+        default=0,
+        help="Limit number of messages to export (keep last N messages when exporting from Claude)",
+    )
+    parser.add_argument(
         "--accept-all-defaults",
         action="store_true",
         default=False,
@@ -1911,7 +1934,7 @@ def main():
                     print("Copy declined.")
                     continue
                 # Proceed with the copy
-                new_ref = sync_session(source, selected_session, target, bases)
+                new_ref = sync_session(source, selected_session, target, bases, args)
                 if new_ref:
                     print(f"\n✅ Copied into {HARNESS_LABELS[target]}: {new_ref}")
                     # Refresh so the new session appears without a restart.
